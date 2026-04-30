@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# venvs / editor
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ez-rag local state
+**/.ezrag/
+**/conversations/
+benchmark/_workspace/
+benchmark/reports/*.json
+
+# benchmark corpora caches (re-downloaded on demand)
+benchmark/corpus/
+ez-rag-test/
+my-rag/
+
+# logs
+*.log
+
+# Hugging Face / ONNX caches if symlinked locally
+.fastembed_cache/
+fastembed_cache/
+
+# OS-level cache files
+.DS_Store
+desktop.ini
+
+# Bulk debug screenshots — keep only the curated ones in docs/screenshots/
+_screenshots/

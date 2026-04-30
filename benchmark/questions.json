@@ -1,0 +1,82 @@
+{
+  "_comment": "Curated Q/A pairs for ez-rag benchmark. 'gold_substrings' are case-insensitive substrings that any correct answer must contain; 'gold_doc_id' identifies the corpus document the answer should come from.",
+  "questions": [
+    {
+      "id": "q01",
+      "question": "Who are the authors of the paper 'Attention Is All You Need'?",
+      "gold_doc_id": "attention-is-all-you-need",
+      "gold_substrings": ["Vaswani"],
+      "any_of": [["Shazeer"], ["Parmar"], ["Uszkoreit"]]
+    },
+    {
+      "id": "q02",
+      "question": "What is the model architecture proposed in 'Attention Is All You Need'?",
+      "gold_doc_id": "attention-is-all-you-need",
+      "gold_substrings": ["Transformer"]
+    },
+    {
+      "id": "q03",
+      "question": "What does 'BERT' stand for?",
+      "gold_doc_id": "bert-paper",
+      "gold_substrings": ["Bidirectional Encoder Representations from Transformers"]
+    },
+    {
+      "id": "q04",
+      "question": "What two pre-training tasks does BERT use?",
+      "gold_doc_id": "bert-paper",
+      "gold_substrings": ["masked"],
+      "any_of": [["next sentence"], ["NSP"]]
+    },
+    {
+      "id": "q05",
+      "question": "In the original RAG paper, what are the two main RAG variants introduced?",
+      "gold_doc_id": "rag-paper",
+      "gold_substrings": ["RAG"],
+      "any_of": [["Sequence", "Token"], ["RAG-Sequence", "RAG-Token"]]
+    },
+    {
+      "id": "q06",
+      "question": "What retriever does the original RAG paper use?",
+      "gold_doc_id": "rag-paper",
+      "gold_substrings": ["DPR"]
+    },
+    {
+      "id": "q07",
+      "question": "According to Wikipedia, what does 'retrieval-augmented generation' do?",
+      "gold_doc_id": "wikipedia-rag",
+      "gold_substrings": ["retriev"],
+      "any_of": [["external"], ["knowledge"]]
+    },
+    {
+      "id": "q08",
+      "question": "What is the opening sentence of 'Pride and Prejudice'?",
+      "gold_doc_id": "gutenberg-pride-and-prejudice",
+      "gold_substrings": ["truth universally acknowledged"]
+    },
+    {
+      "id": "q09",
+      "question": "How many articles does the US Constitution have?",
+      "gold_doc_id": "us-constitution",
+      "gold_substrings": ["seven"],
+      "any_of": [["7"], ["seven"]]
+    },
+    {
+      "id": "q10",
+      "question": "What is the standard deduction concept described in IRS Form 1040 instructions?",
+      "gold_doc_id": "irs-form-1040-instructions",
+      "gold_substrings": ["standard deduction"]
+    },
+    {
+      "id": "q11",
+      "question": "According to the Wikipedia article, what is a Transformer in deep learning?",
+      "gold_doc_id": "wikipedia-transformer",
+      "gold_substrings": ["attention"]
+    },
+    {
+      "id": "q12",
+      "question": "What text appears in the synthetic screenshot used to test OCR?",
+      "gold_doc_id": "synthetic-screenshot",
+      "gold_substrings": ["EZ-RAG OCR BENCHMARK"]
+    }
+  ]
+}

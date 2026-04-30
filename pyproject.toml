@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ez-rag"
+version = "0.1.0"
+description = "Drop documents in a folder, chat with them. Local, free, cross-platform RAG."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "ez-rag" }]
+keywords = ["rag", "llm", "ollama", "ocr", "local", "offline"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "platformdirs>=4.2",
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "tomli>=2.0; python_version<'3.11'",
+    "pypdf>=4.0",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.1",
+    "fastembed>=0.3",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+ocr = ["rapidocr-onnxruntime>=1.2", "Pillow>=10.0", "pytesseract>=0.3.10", "pypdfium2>=4.20"]
+gui = ["flet>=0.21"]
+llm = ["llama-cpp-python>=0.2.85"]
+all = ["ez-rag[ocr,gui,llm]"]
+
+[project.scripts]
+ez-rag = "ez_rag.cli:app"
+ez-rag-gui = "ez_rag_gui.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ez_rag", "gui/ez_rag_gui"]
