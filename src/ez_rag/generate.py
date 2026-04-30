@@ -93,6 +93,29 @@ def detect_backend(cfg: Config) -> str:
 
 # ----- answering -------------------------------------------------------------
 
+def apply_query_modifiers(question: str, cfg: Config) -> str:
+    """Wrap a user question with optional prefix / suffix / negatives.
+
+    Honored by both retrieval (the augmented text is what the dense embedder
+    sees) and generation (it ends up in the user message). Returns the bare
+    question unchanged if the toggle is off or no modifiers are configured.
+    """
+    if not getattr(cfg, "apply_query_modifiers", True):
+        return question
+    parts = []
+    pre = (getattr(cfg, "query_prefix", "") or "").strip()
+    suf = (getattr(cfg, "query_suffix", "") or "").strip()
+    neg = (getattr(cfg, "query_negatives", "") or "").strip()
+    if pre:
+        parts.append(pre)
+    parts.append(question)
+    if suf:
+        parts.append(suf)
+    if neg:
+        parts.append(f"Avoid: {neg}")
+    return "\n\n".join(parts)
+
+
 def _build_user_prompt(question: str, hits: list[Hit]) -> str:
     if not hits:
         return question
@@ -281,6 +304,104 @@ def _llm_complete(cfg: Config, prompt: str, max_tokens: int = 200) -> str:
         return ""
     finally:
         cfg.max_tokens = saved_max
+
+
+# ----- agent provider dispatcher --------------------------------------------
+# A separate path used by agentic retrieval. Always non-streaming, used for
+# short reflection/query-rewrite calls.
+
+def agent_complete(cfg: Config, messages: list[dict], max_tokens: int = 300) -> str:
+    """Dispatch to the agent provider (same / openai / anthropic).
+
+    'same' reuses the local Ollama or llama.cpp backend that's powering chat.
+    'openai' hits an OpenAI-compatible endpoint (works for OpenAI, Groq,
+    Together, Fireworks, Anyscale, …).
+    'anthropic' hits api.anthropic.com.
+
+    Returns "" on any failure rather than raising — agentic retrieval should
+    degrade to plain retrieval, not crash the chat.
+    """
+    provider = (getattr(cfg, "agent_provider", "same") or "same").lower()
+    api_key = (getattr(cfg, "agent_api_key", "") or "").strip()
+    model = (getattr(cfg, "agent_model", "") or "").strip()
+
+    try:
+        if provider == "openai" and api_key:
+            return _openai_complete(cfg, messages, max_tokens, model)
+        if provider == "anthropic" and api_key:
+            return _anthropic_complete(cfg, messages, max_tokens, model)
+    except Exception:
+        return ""
+
+    # Fallback: same model that powers chat.
+    backend = detect_backend(cfg)
+    if backend == "none":
+        return ""
+    saved_max = cfg.max_tokens
+    saved_model = cfg.llm_model
+    try:
+        cfg.max_tokens = max_tokens
+        if model:
+            cfg.llm_model = model
+        if backend == "ollama":
+            return _ollama_chat(cfg, messages)
+        return _llamacpp_chat(cfg, messages)
+    except Exception:
+        return ""
+    finally:
+        cfg.max_tokens = saved_max
+        cfg.llm_model = saved_model
+
+
+def _openai_complete(cfg: Config, messages: list[dict], max_tokens: int, model: str) -> str:
+    base = (getattr(cfg, "agent_base_url", "") or "https://api.openai.com/v1").rstrip("/")
+    key = cfg.agent_api_key.strip()
+    r = httpx.post(
+        f"{base}/chat/completions",
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"},
+        json={
+            "model": model or "gpt-4o-mini",
+            "messages": messages,
+            "temperature": cfg.temperature,
+            "max_tokens": max_tokens,
+        },
+        timeout=120.0,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def _anthropic_complete(cfg: Config, messages: list[dict], max_tokens: int, model: str) -> str:
+    # Anthropic wants the system prompt out-of-band.
+    system_text = ""
+    body_msgs: list[dict] = []
+    for m in messages:
+        if m.get("role") == "system":
+            system_text = (system_text + "\n" + m.get("content", "")).strip()
+        else:
+            body_msgs.append({"role": m["role"], "content": m["content"]})
+    r = httpx.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": cfg.agent_api_key.strip(),
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model or "claude-haiku-4-5-20251001",
+            "system": system_text or None,
+            "messages": body_msgs,
+            "max_tokens": max_tokens,
+            "temperature": cfg.temperature,
+        },
+        timeout=120.0,
+    )
+    r.raise_for_status()
+    data = r.json()
+    parts = data.get("content", []) or []
+    return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
 
 
 def generate_hyde(query: str, cfg: Config) -> str:

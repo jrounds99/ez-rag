@@ -30,8 +30,9 @@ from ez_rag.models import (
     fmt_size, fmt_vram_gb, is_embed_capable, list_ollama_models,
     pull_ollama_model, search_library, vram_fit,
 )
+from ez_rag.generate import apply_query_modifiers
 from ez_rag.parsers import supported_extensions
-from ez_rag.retrieve import hybrid_search, smart_retrieve
+from ez_rag.retrieve import agentic_retrieve, hybrid_search, smart_retrieve
 from ez_rag.workspace import Workspace, find_workspace
 
 
@@ -83,6 +84,34 @@ TIP = {
                       "When OFF, the question goes straight to the LLM with no "
                       "retrieval. Useful for A/B testing how much the corpus "
                       "actually helps.",
+    "modifier_toggle": "Apply your configured query prefix / suffix / negatives "
+                      "to this question. Configure them in Settings → Query "
+                      "modifiers.",
+    "agentic":        "Agentic retrieval — the LLM looks at the initial hits "
+                      "and (if needed) generates 1–2 follow-up search queries "
+                      "to fill in gaps. Slower but often catches things plain "
+                      "retrieval misses. Uses your local model by default; "
+                      "configure an API key/provider below to use a different "
+                      "model just for the agent steps.",
+    "agent_provider": "Where the agent calls go: 'same' uses the chat model. "
+                      "'openai' hits any OpenAI-compatible endpoint (OpenAI, "
+                      "Groq, Together, Fireworks, vLLM, …). 'anthropic' hits "
+                      "api.anthropic.com.",
+    "agent_model":    "Model name for agent calls. Blank = use the chat "
+                      "model. For OpenAI: e.g. gpt-4o-mini. For Anthropic: "
+                      "e.g. claude-haiku-4-5-20251001.",
+    "agent_api_key":  "API key for the agent provider. Stored in plaintext "
+                      "in this workspace's config.toml — keep the workspace "
+                      "private.",
+    "agent_base_url": "OpenAI-compatible base URL. Default is OpenAI's. "
+                      "Examples: https://api.groq.com/openai/v1, "
+                      "https://api.together.xyz/v1.",
+    "query_prefix":   "Text added BEFORE every question (when the chat-tab "
+                      "toggle is on). Useful for persona / role priming.",
+    "query_suffix":   "Text added AFTER every question. Useful for output "
+                      "formatting instructions.",
+    "query_negatives":"Things the model should avoid. Appended as 'Avoid: …' "
+                      "to every question.",
 
     # Files tab
     "add_files":      "Copy files from anywhere on disk into this workspace's "
@@ -682,6 +711,25 @@ def build_chat_view(state: AppState, *, refresh_status,
         size=12, color=ON_SURFACE_DIM, weight=ft.FontWeight.W_600,
     )
 
+    # Per-query "apply modifiers" checkbox for the chat composer
+    modifier_check = ft.Checkbox(
+        value=state.cfg.apply_query_modifiers,
+        active_color=ACCENT,
+        label="Modifiers",
+        label_style=ft.TextStyle(size=11, color=ON_SURFACE_DIM),
+        tooltip=TIP["modifier_toggle"],
+    )
+
+    def on_modifier_toggle(e):
+        state.cfg.apply_query_modifiers = bool(e.control.value)
+        if state.ws is not None:
+            try:
+                state.cfg.save(state.ws.config_path)
+            except Exception:
+                pass
+
+    modifier_check.on_change = on_modifier_toggle
+
     def on_rag_toggle(e):
         state.cfg.use_rag = bool(e.control.value)
         rag_label.value = (
@@ -927,16 +975,35 @@ def build_chat_view(state: AppState, *, refresh_status,
 
         def worker():
             try:
+                # Apply prefix/suffix/negatives if the per-query toggle is on
+                effective_q = apply_query_modifiers(text, state.cfg)
+
                 # Honor the "Use corpus" toggle. When OFF we skip embedding +
-                # retrieval entirely, sending the question straight to the LLM
-                # with no context.
+                # retrieval entirely, sending the question straight to the LLM.
                 if state.cfg.use_rag:
                     embedder = make_embedder(state.cfg)
                     idx = Index(state.ws.meta_db_path, embed_dim=embedder.dim)
-                    # smart_retrieve honors hybrid / rerank / hyde / multi_query
-                    hits = smart_retrieve(
-                        query=text, embedder=embedder, index=idx, cfg=state.cfg,
-                    )
+
+                    def agent_status(msg):
+                        # Surface agent steps in the streaming bubble while we
+                        # wait for retrieval to complete.
+                        assistant.text = f"_{msg}…_"
+                        update_streaming_assistant(assistant)
+
+                    if state.cfg.agentic:
+                        hits = agentic_retrieve(
+                            query=effective_q, embedder=embedder, index=idx,
+                            cfg=state.cfg, status_cb=agent_status,
+                        )
+                        # Clear the temporary status text — chat_answer will
+                        # populate the real reply.
+                        assistant.text = ""
+                        update_streaming_assistant(assistant)
+                    else:
+                        hits = smart_retrieve(
+                            query=effective_q, embedder=embedder,
+                            index=idx, cfg=state.cfg,
+                        )
                 else:
                     hits = []
                 assistant.citations = hits
@@ -957,7 +1024,7 @@ def build_chat_view(state: AppState, *, refresh_status,
                         )
                     else:
                         ans = chat_answer(
-                            history=history, latest_question=text,
+                            history=history, latest_question=effective_q,
                             hits=hits, cfg=state.cfg, stream=False,
                         )
                         assistant.text = ans.text  # type: ignore
@@ -966,7 +1033,7 @@ def build_chat_view(state: AppState, *, refresh_status,
                     state.stop_flag = False
                     last_render = 0.0
                     for kind, piece in chat_answer(
-                        history=history, latest_question=text,
+                        history=history, latest_question=effective_q,
                         hits=hits, cfg=state.cfg, stream=True,
                     ):  # type: ignore
                         if state.stop_flag:
@@ -1007,22 +1074,28 @@ def build_chat_view(state: AppState, *, refresh_status,
 
     composer = ft.Container(
         padding=ft.padding.only(left=20, right=20, top=10, bottom=16),
-        content=ft.Container(
-            bgcolor=SURFACE_DARK,
-            border=ft.border.all(1, "#262938"),
-            border_radius=14,
-            padding=ft.padding.only(left=14, right=8, top=4, bottom=4),
-            content=ft.Row(
-                [
-                    input_field,
-                    ft.Container(
-                        content=ft.Row([stop_btn, send_btn], spacing=4),
-                        padding=ft.padding.only(top=4, bottom=4),
-                    ),
-                ],
-                vertical_alignment=ft.CrossAxisAlignment.END,
+        content=ft.Column([
+            ft.Container(
+                bgcolor=SURFACE_DARK,
+                border=ft.border.all(1, "#262938"),
+                border_radius=14,
+                padding=ft.padding.only(left=14, right=8, top=4, bottom=4),
+                content=ft.Row(
+                    [
+                        input_field,
+                        ft.Container(
+                            content=ft.Row([stop_btn, send_btn], spacing=4),
+                            padding=ft.padding.only(top=4, bottom=4),
+                        ),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.END,
+                ),
             ),
-        ),
+            ft.Row([
+                ft.Container(expand=True),
+                modifier_check,
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        ], spacing=4, tight=True),
     )
 
     chat_toolbar = ft.Container(
@@ -1596,6 +1669,44 @@ def build_settings_view(state: AppState, *, refresh_status):
     )
     use_corpus = ft.Switch(label="Use corpus (RAG)", value=True,
                            active_color=ACCENT, tooltip=TIP["use_corpus"])
+    agentic_sw = ft.Switch(label="Agentic mode", value=False,
+                           active_color=ACCENT, tooltip=TIP["agentic"])
+
+    # Agent provider config
+    agent_provider_dd = ft.Dropdown(
+        label="Agent provider", value="same", width=200, dense=True,
+        options=[ft.dropdown.Option(o) for o in ("same", "openai", "anthropic")],
+        tooltip=TIP["agent_provider"],
+    )
+    agent_model_field = ft.TextField(
+        label="Agent model (blank = chat model)", value="", width=320, dense=True,
+        tooltip=TIP["agent_model"],
+    )
+    agent_api_key_field = ft.TextField(
+        label="API key", value="", width=320, dense=True, password=True,
+        can_reveal_password=True, tooltip=TIP["agent_api_key"],
+    )
+    agent_base_url_field = ft.TextField(
+        label="Base URL (OpenAI-compat)", value="https://api.openai.com/v1",
+        width=400, dense=True, tooltip=TIP["agent_base_url"],
+    )
+
+    # Query modifiers
+    query_prefix_field = ft.TextField(
+        label="Query prefix", value="", width=440, dense=True,
+        multiline=True, min_lines=1, max_lines=4,
+        tooltip=TIP["query_prefix"],
+    )
+    query_suffix_field = ft.TextField(
+        label="Query suffix", value="", width=440, dense=True,
+        multiline=True, min_lines=1, max_lines=4,
+        tooltip=TIP["query_suffix"],
+    )
+    query_negatives_field = ft.TextField(
+        label="Negative traits (Avoid: …)", value="", width=440, dense=True,
+        multiline=True, min_lines=1, max_lines=4,
+        tooltip=TIP["query_negatives"],
+    )
     enable_ocr = ft.Switch(label="OCR images / scanned PDFs", value=True,
                            active_color=ACCENT, tooltip=TIP["enable_ocr"])
     contextual = ft.Switch(label="Contextual Retrieval (slower ingest, better recall)",
@@ -2139,6 +2250,14 @@ def build_settings_view(state: AppState, *, refresh_status):
         context_window_field.value = str(c.context_window)
         use_mmr_sw.value = c.use_mmr
         mmr_lambda_field.value = str(c.mmr_lambda)
+        agentic_sw.value = c.agentic
+        agent_provider_dd.value = c.agent_provider
+        agent_model_field.value = c.agent_model
+        agent_api_key_field.value = c.agent_api_key
+        agent_base_url_field.value = c.agent_base_url
+        query_prefix_field.value = c.query_prefix
+        query_suffix_field.value = c.query_suffix
+        query_negatives_field.value = c.query_negatives
         use_corpus.value = c.use_rag
         enable_ocr.value = c.enable_ocr
         contextual.value = c.enable_contextual
@@ -2179,6 +2298,14 @@ def build_settings_view(state: AppState, *, refresh_status):
                 c.mmr_lambda = max(0.0, min(1.0, float(mmr_lambda_field.value or 0.5)))
             except ValueError:
                 pass
+            c.agentic = bool(agentic_sw.value)
+            c.agent_provider = agent_provider_dd.value or "same"
+            c.agent_model = (agent_model_field.value or "").strip()
+            c.agent_api_key = (agent_api_key_field.value or "").strip()
+            c.agent_base_url = (agent_base_url_field.value or "").strip()
+            c.query_prefix = query_prefix_field.value or ""
+            c.query_suffix = query_suffix_field.value or ""
+            c.query_negatives = query_negatives_field.value or ""
             c.use_rag = bool(use_corpus.value)
             c.enable_ocr = bool(enable_ocr.value)
             c.enable_contextual = bool(contextual.value)
@@ -2227,8 +2354,8 @@ def build_settings_view(state: AppState, *, refresh_status):
                             ft.Row([top_k, hybrid, rerank], spacing=14,
                                    wrap=True,
                                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                            ft.Row([use_hyde_sw, multi_query_sw], spacing=14,
-                                   wrap=True,
+                            ft.Row([use_hyde_sw, multi_query_sw, agentic_sw],
+                                   spacing=14, wrap=True,
                                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
                             ft.Row([context_window_field, use_mmr_sw,
                                     mmr_lambda_field], spacing=14,
@@ -2262,6 +2389,31 @@ def build_settings_view(state: AppState, *, refresh_status):
                             ollama_embed_model,
                             browse_embed_btn,
                             embed_model,
+                        ),
+                    ),
+                ],
+                spacing=14,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            ),
+            ft.Row(
+                [
+                    ft.Container(
+                        expand=1,
+                        content=section_card(
+                            "AGENT (used when 'Agentic mode' is ON)",
+                            agent_provider_dd,
+                            agent_model_field,
+                            agent_api_key_field,
+                            agent_base_url_field,
+                        ),
+                    ),
+                    ft.Container(
+                        expand=1,
+                        content=section_card(
+                            "QUERY MODIFIERS (toggle in chat composer)",
+                            query_prefix_field,
+                            query_suffix_field,
+                            query_negatives_field,
                         ),
                     ),
                 ],

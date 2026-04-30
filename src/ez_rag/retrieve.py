@@ -13,7 +13,9 @@ import numpy as np
 
 from .config import Config
 from .embed import DEFAULT_RERANKER, Embedder, cosine_top_k, rerank_hits
-from .generate import generate_hyde, generate_query_variations
+from .generate import (
+    agent_complete, detect_backend, generate_hyde, generate_query_variations,
+)
 from .index import Hit, Index
 
 
@@ -218,6 +220,99 @@ def smart_retrieve(
     if getattr(cfg, "context_window", 0) > 0:
         candidates = expand_with_neighbors(candidates, index, cfg.context_window)
     return candidates
+
+
+# ============================================================================
+# Agentic retrieval — iterate retrieve → reflect → maybe re-search
+# ============================================================================
+
+def agentic_retrieve(
+    *,
+    query: str,
+    embedder: Embedder,
+    index: Index,
+    cfg: Config,
+    status_cb=None,
+) -> list[Hit]:
+    """Brute-force agentic retrieval. The LLM looks at the initial hits and,
+    if they're insufficient, generates 1-2 follow-up queries; their results
+    are fused with RRF; the final list is reranked once.
+
+    `status_cb(message)` is invoked at each step so UIs can show progress.
+    """
+
+    def emit(msg: str):
+        if status_cb:
+            try:
+                status_cb(msg)
+            except Exception:
+                pass
+
+    emit("agent · initial retrieval")
+    initial = smart_retrieve(query=query, embedder=embedder,
+                             index=index, cfg=cfg)
+    backend = detect_backend(cfg)
+
+    iterations = max(0, getattr(cfg, "agent_max_iterations", 2))
+    if iterations == 0 or backend == "none":
+        return initial
+
+    accumulated: dict[int, Hit] = {h.chunk_id: h for h in initial}
+    rank_maps: list[dict[int, int]] = [
+        {h.chunk_id: i + 1 for i, h in enumerate(initial)}
+    ]
+
+    for step in range(iterations):
+        ctx_summary = "\n".join(
+            f"[{i+1}] ({h.path}) {h.text[:200].strip()}…"
+            for i, h in enumerate(list(accumulated.values())[:6])
+        )
+        prompt = (
+            "You are helping a search engine find passages that answer a "
+            "user's question.\n\n"
+            f"User question: {query}\n\n"
+            f"Already retrieved (top so far):\n{ctx_summary or '(none)'}\n\n"
+            "If the passages clearly contain the answer, output exactly:\n"
+            "  SUFFICIENT\n\n"
+            "Otherwise, output 1 or 2 short alternative search queries that "
+            "would surface missing information. ONE per line. No numbering, "
+            "no explanation, no quotes.\n"
+        )
+        emit(f"agent · reflecting (step {step + 1}/{iterations})")
+        response = agent_complete(cfg, [{"role": "user", "content": prompt}],
+                                  max_tokens=200)
+        if not response or response.strip().split()[:1] == ["SUFFICIENT"] \
+                or "SUFFICIENT" in response.upper().split()[:3]:
+            break
+        new_qs = []
+        for line in response.split("\n"):
+            s = line.strip().strip("-•*0123456789. ").strip('"').strip("'")
+            if s and s.lower() != query.lower() and "SUFFICIENT" not in s.upper():
+                new_qs.append(s)
+            if len(new_qs) >= 2:
+                break
+        if not new_qs:
+            break
+        emit(f"agent · refining: {', '.join(q[:30] + '…' for q in new_qs)}")
+        for q in new_qs:
+            sub = smart_retrieve(query=q, embedder=embedder,
+                                 index=index, cfg=cfg)
+            for h in sub:
+                accumulated.setdefault(h.chunk_id, h)
+            rank_maps.append({h.chunk_id: i + 1 for i, h in enumerate(sub)})
+
+    # Fuse all rankings, then rerank once with the original query.
+    fused = _rrf(*rank_maps)
+    sorted_ids = [cid for cid, _ in
+                  sorted(fused.items(), key=lambda kv: -kv[1])]
+    candidates = [accumulated[cid] for cid in sorted_ids
+                  if cid in accumulated]
+
+    if cfg.rerank and len(candidates) > 1:
+        emit("agent · final rerank")
+        candidates = rerank_hits(query, candidates[:max(30, cfg.top_k * 4)],
+                                 top_k=cfg.top_k)
+    return candidates[:cfg.top_k]
 
 
 def _rrf(*ranks: dict[int, int], k: int = 60) -> dict[int, float]:

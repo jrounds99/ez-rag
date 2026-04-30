@@ -18,10 +18,12 @@ from rich.table import Table
 
 from .config import Config
 from .embed import make_embedder
-from .generate import answer as gen_answer, detect_backend
+from .generate import (
+    answer as gen_answer, apply_query_modifiers, detect_backend,
+)
 from .index import Index
 from .ingest import ingest
-from .retrieve import hybrid_search, smart_retrieve
+from .retrieve import agentic_retrieve, hybrid_search, smart_retrieve
 from .workspace import Workspace, find_workspace, require_workspace
 
 
@@ -228,22 +230,29 @@ def ask(
     ws = require_workspace()
     cfg = ws.load_config()
     use_rag = cfg.use_rag and not no_rag
+    effective_q = apply_query_modifiers(question, cfg)
     if use_rag:
         embedder = make_embedder(cfg)
         idx = Index(ws.meta_db_path, embed_dim=embedder.dim)
-        # smart_retrieve honors cfg.hybrid / rerank / use_hyde / multi_query.
-        # The --top-k flag overrides cfg.top_k for this single call.
         saved_k, saved_hybrid = cfg.top_k, cfg.hybrid
         cfg.top_k = top_k
         if no_hybrid:
             cfg.hybrid = False
         try:
-            hits = smart_retrieve(query=question, embedder=embedder,
-                                  index=idx, cfg=cfg)
+            if cfg.agentic:
+                hits = agentic_retrieve(
+                    query=effective_q, embedder=embedder, index=idx, cfg=cfg,
+                    status_cb=lambda m: console.print(f"[dim]· {m}[/]"),
+                )
+            else:
+                hits = smart_retrieve(query=effective_q, embedder=embedder,
+                                      index=idx, cfg=cfg)
         finally:
             cfg.top_k, cfg.hybrid = saved_k, saved_hybrid
     else:
         hits = []
+    # The augmented question is what the LLM should see too.
+    question = effective_q
     if json:
         out = {
             "question": question,
@@ -331,12 +340,21 @@ def chat(
             continue
         if q in ("/exit", "/quit", ":q"):
             return
+        effective_q = apply_query_modifiers(q, cfg)
         saved_k = cfg.top_k
         cfg.top_k = top_k
         try:
-            hits = smart_retrieve(query=q, embedder=embedder, index=idx, cfg=cfg)
+            if cfg.agentic:
+                hits = agentic_retrieve(
+                    query=effective_q, embedder=embedder, index=idx, cfg=cfg,
+                    status_cb=lambda m: console.print(f"[dim]· {m}[/]"),
+                )
+            else:
+                hits = smart_retrieve(query=effective_q, embedder=embedder,
+                                      index=idx, cfg=cfg)
         finally:
             cfg.top_k = saved_k
+        q = effective_q
         if not hits:
             console.print("[yellow]no matches[/]")
             continue

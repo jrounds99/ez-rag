@@ -41,6 +41,16 @@ class Config:
     use_mmr: bool = False              # diversify retrieved chunks via MMR
     mmr_lambda: float = 0.5            # 1.0 = pure relevance, 0.0 = pure diversity
 
+    # Agentic retrieval — LLM-driven iterative search.
+    # When ON, the LLM evaluates the initial retrieval and (if needed) generates
+    # follow-up queries; results are fused with RRF + reranked once at the end.
+    agentic: bool = False              # single on/off — sane defaults below
+    agent_max_iterations: int = 2      # retrieve→reflect cycles
+    agent_provider: str = "same"       # same | openai | anthropic
+    agent_model: str = ""              # blank = use cfg.llm_model
+    agent_api_key: str = ""            # for openai / anthropic
+    agent_base_url: str = "https://api.openai.com/v1"  # OpenAI-compatible endpoint
+
     # Generation
     max_tokens: int = 4096
     temperature: float = 0.2
@@ -48,6 +58,13 @@ class Config:
     # Server
     serve_host: str = "127.0.0.1"
     serve_port: int = 11533
+
+    # Query modifiers — applied to every question when the chat-tab toggle
+    # is on (it mirrors `apply_query_modifiers`).
+    apply_query_modifiers: bool = True
+    query_prefix: str = ""             # text prepended to each question
+    query_suffix: str = ""             # text appended
+    query_negatives: str = ""          # added as "Avoid: …" constraint
 
     extra: dict[str, Any] = field(default_factory=dict)
 

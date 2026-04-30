@@ -143,6 +143,74 @@ question and check:
 - **Benchmark** — `python benchmark/rag_compare.py` runs a curated Q-set
   through both modes and prints accuracy + timing.
 
+## Agentic mode
+
+A single ON/OFF toggle that turns plain retrieval into an iterative
+retrieve → reflect → re-search loop:
+
+1. Run the normal retrieval pipeline (hybrid + rerank, plus whatever else
+   you've enabled).
+2. The LLM looks at the top hits and decides: *sufficient* or *not?*
+3. If not sufficient, it generates 1–2 alternative search queries.
+4. We retrieve for each alternative, fuse all results with RRF, and rerank
+   once with the original question.
+
+It's deliberately brute-force — no fancy framework, no fixed taxonomy of
+question types. The LLM just gets to ask for more if the first try isn't
+good enough.
+
+**Cost.** Adds ≥ 1 short LLM call per cycle (default 2 cycles). On a 32B
+local model that's ~10–20 s of overhead. On a hosted small model
+(GPT-4o-mini, Claude Haiku) it's ~1–3 s.
+
+**Where the agent's calls go.** Three providers:
+
+- `same` *(default)* — uses the chat model. No setup. Quality is bounded by
+  whatever's powering chat.
+- `openai` — any OpenAI-compatible endpoint. Set `agent_api_key` and
+  optionally `agent_base_url` to point at OpenAI / Groq / Together /
+  Fireworks / vLLM / etc. `agent_model` defaults to `gpt-4o-mini`.
+- `anthropic` — direct to api.anthropic.com. `agent_model` defaults to
+  `claude-haiku-4-5-20251001`.
+
+Useful when your local model is slow but you want a smarter agent step:
+flip the chat model to a fast 3B for streaming answers, set the agent
+provider to a hosted small model for the reflection.
+
+**When to enable.** When plain retrieval seems to be giving you adjacent-
+but-not-quite-right passages, especially on big or messy corpora. If
+hybrid+rerank already nails the answer, agentic adds latency for nothing.
+
+## Query modifiers
+
+Persistent prefix / suffix / negative-traits text that wraps every question
+when the chat-tab **Modifiers** checkbox is on. Edited in
+**Settings → Query modifiers**, applied at composer time.
+
+Format used:
+
+```
+{prefix}
+
+{your question}
+
+{suffix}
+
+Avoid: {negatives}
+```
+
+Used for both retrieval (the embedder sees the augmented text) and the LLM
+call (the augmented text becomes the user message). Toggle off the
+checkbox in the chat composer to skip them per-query.
+
+Examples:
+
+| Use case | Prefix | Suffix | Negatives |
+|---|---|---|---|
+| D&D rules expert persona | "You are a D&D 5e rules expert." | "Cite the rulebook and page if possible." | "homebrew, opinions" |
+| Concise output | (empty) | "Answer in 2 sentences max." | "lists, headings" |
+| Legal disclaimer | (empty) | "End with: 'This is not legal advice.'" | (empty) |
+
 ## Choosing a recipe
 
 | Use case | Recipe |

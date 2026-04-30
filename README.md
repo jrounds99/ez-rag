@@ -115,6 +115,8 @@ question → [HyDE]? → [multi-query]? → hybrid (BM25 + dense, RRF)
 | **MMR** | ☐ | retrieved chunks are redundant / near-duplicates |
 | **Context window (±N neighbors)** | ☐ | narrative or long-form docs |
 | **Contextual Retrieval** *(at ingest)* | ☐ | technical / structured docs (~49 % fewer retrieval failures, but slow ingest) |
+| **Agentic mode** | ☐ | LLM iteratively reflects + re-searches when initial hits look weak. Uses your chat model by default; OpenAI / Anthropic / OpenAI-compat supported as upgrades |
+| **Query modifiers** *(prefix · suffix · negatives)* | ☐ | persistent persona / formatting / "avoid X" wrappers around every question. Per-query checkbox in the chat composer |
 | **Use corpus** | ✅ | toggle OFF in the Chat tab to A/B compare model-only vs RAG-augmented |
 
 Defaults are tuned for "drop docs, get good answers." See `ez-rag help retrieval` or the GUI's Help (?) for the empirical config matrix and when to flip what.
