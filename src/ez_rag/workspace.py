@@ -121,6 +121,74 @@ class Workspace:
         return dest
 
     @classmethod
+    def create_named(
+        cls,
+        name: str,
+        parent_dir: Path,
+        *,
+        source_folders: list[Path] | None = None,
+        clear_default: bool = True,
+    ) -> "Workspace":
+        """Create a new named workspace under `parent_dir/<slug(name)>/`.
+
+        - `source_folders`: each folder is recursively scanned for supported
+          file types and copied into the new docs/.
+        - `clear_default`: if True (default), starts with an empty docs/.
+          When False, any pre-existing files in the target docs/ are kept.
+
+        Returns the new initialized Workspace. Raises FileExistsError if
+        a workspace with this name already exists at this parent.
+        """
+        from .parsers import supported_extensions
+
+        slug = "".join(c if c.isalnum() or c in " ._-" else "-" for c in name).strip()
+        slug = slug.replace("  ", " ").strip("-_. ") or "rag"
+        target = (parent_dir / slug).resolve()
+        if (target / WORKSPACE_MARKER / "config.toml").exists():
+            raise FileExistsError(
+                f"A workspace already exists at {target}. "
+                "Pick a different name or open it directly."
+            )
+        target.mkdir(parents=True, exist_ok=True)
+        ws = cls(target)
+        ws.initialize()
+
+        if clear_default:
+            for child in ws.docs_dir.iterdir():
+                if child.is_file():
+                    try:
+                        child.unlink()
+                    except OSError:
+                        pass
+
+        copied = 0
+        if source_folders:
+            allowed = supported_extensions()
+            seen_names: set[str] = set()
+            for folder in source_folders:
+                folder = Path(folder)
+                if not folder.is_dir():
+                    continue
+                for f in folder.rglob("*"):
+                    if not f.is_file():
+                        continue
+                    if f.suffix.lower() not in allowed:
+                        continue
+                    # Avoid name collisions across folders by prefixing
+                    # the parent folder name when needed.
+                    dest_name = f.name
+                    if dest_name in seen_names:
+                        dest_name = f"{folder.name}__{f.name}"
+                    seen_names.add(dest_name)
+                    try:
+                        import shutil
+                        shutil.copy2(f, ws.docs_dir / dest_name)
+                        copied += 1
+                    except Exception:
+                        pass
+        return ws
+
+    @classmethod
     def import_archive(cls, archive: Path, into: Path) -> "Workspace":
         """Extract a zip produced by `export_archive()` into a NEW workspace
         directory. Refuses to overwrite an existing initialized workspace."""

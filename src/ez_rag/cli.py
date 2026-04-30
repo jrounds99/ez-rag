@@ -93,7 +93,7 @@ def ingest_cmd(
     force: bool = typer.Option(False, "--force", help="Reingest even if file unchanged"),
     watch: bool = typer.Option(False, "--watch", help="Watch docs/ and reingest on change"),
     flavor_seconds: int = typer.Option(
-        15, "--flavor-seconds",
+        5, "--flavor-seconds",
         help="Print a sample of the chunk being processed every N seconds (0 = off)",
     ),
 ):

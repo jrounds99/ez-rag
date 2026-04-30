@@ -67,6 +67,13 @@ TIP = {
     # Header
     "open_workspace": "Open or create a different workspace folder. Each "
                       "workspace has its own docs/, index, and config.",
+    "new_rag":        "Create a new named RAG: pick a name, a parent folder, "
+                      "and one or more source folders to import documents "
+                      "from. Each RAG is a self-contained workspace with its "
+                      "own index — switch between them via the dropdown.",
+    "rag_dropdown":   "Switch between recently-opened RAGs. Each is a "
+                      "self-contained workspace. Use '+ New RAG…' to create "
+                      "another one.",
     "files_pill":     "Files indexed in this workspace and total number of "
                       "embedded text chunks.",
     "backend_pill":   "Active LLM backend and model. Click Settings to change.",
@@ -566,14 +573,72 @@ def citation_chip(idx: int, hit, on_click) -> ft.Container:
 # Header
 # ============================================================================
 
-def build_header(state: AppState, *, on_open_workspace, refresh_status):
+def build_header(state: AppState, *, on_open_workspace, on_create_rag,
+                 on_pick_workspace, refresh_status):
     workspace_text = ft.Text("(no workspace)", size=14, color=ON_SURFACE_DIM)
     backend_pill = status_pill("offline", DANGER)
     backend_pill.tooltip = TIP["backend_pill"]
     files_pill = status_pill("0 files", ACCENT)
     files_pill.tooltip = TIP["files_pill"]
+
+    # Recent-RAGs dropdown — switch between named workspaces, plus an action
+    # item to spawn the create-RAG overlay.
+    NEW_RAG_KEY = "__new_rag__"
+    OPEN_FOLDER_KEY = "__open_folder__"
+    rag_dropdown = ft.Dropdown(
+        label="RAG",
+        width=240,
+        dense=True,
+        tooltip=TIP["rag_dropdown"],
+        options=[],
+    )
+
+    def refresh_rag_dropdown():
+        opts: list[ft.dropdown.Option] = []
+        seen = set()
+        if state.ws is not None:
+            cur = str(state.ws.root)
+            opts.append(ft.dropdown.Option(
+                key=cur, text=f"● {state.ws.root.name}",
+            ))
+            seen.add(cur)
+        for p in load_recents():
+            sp = str(p)
+            if sp in seen:
+                continue
+            seen.add(sp)
+            opts.append(ft.dropdown.Option(key=sp, text=p.name))
+        opts.append(ft.dropdown.Option(key=NEW_RAG_KEY,
+                                       text="+ New RAG…"))
+        opts.append(ft.dropdown.Option(key=OPEN_FOLDER_KEY,
+                                       text="+ Open existing folder…"))
+        rag_dropdown.options = opts
+        if state.ws is not None:
+            rag_dropdown.value = str(state.ws.root)
+
+    def on_rag_changed(e):
+        v = e.control.value
+        if v == NEW_RAG_KEY:
+            # Reset to current workspace value visually, then open wizard.
+            rag_dropdown.value = (str(state.ws.root) if state.ws else "")
+            state.page.update()
+            on_create_rag()
+        elif v == OPEN_FOLDER_KEY:
+            rag_dropdown.value = (str(state.ws.root) if state.ws else "")
+            state.page.update()
+            on_open_workspace(None)
+        elif v and (state.ws is None or str(state.ws.root) != v):
+            on_pick_workspace(Path(v))
+
+    rag_dropdown.on_change = on_rag_changed
+
+    btn_new_rag = ft.IconButton(
+        icon=ft.Icons.AUTO_AWESOME,
+        tooltip=TIP["new_rag"],
+        on_click=lambda _: on_create_rag(),
+    )
     btn_open = ft.OutlinedButton(
-        "Open workspace",
+        "Open folder",
         icon=ft.Icons.FOLDER_OPEN,
         on_click=on_open_workspace,
         tooltip=TIP["open_workspace"],
@@ -626,6 +691,8 @@ def build_header(state: AppState, *, on_open_workspace, refresh_status):
                 ft.Container(expand=True),
                 files_pill,
                 backend_pill,
+                rag_dropdown,
+                btn_new_rag,
                 btn_open,
                 btn_help,
                 btn_about,
@@ -636,6 +703,7 @@ def build_header(state: AppState, *, on_open_workspace, refresh_status):
     )
 
     def update():
+        refresh_rag_dropdown()
         if state.ws is None:
             workspace_text.value = "(no workspace)"
             workspace_text.color = ON_SURFACE_DIM
@@ -1427,8 +1495,23 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
         ingest_snippet_card.visible = False
         state.page.update()
 
-        last_log_path = {"v": ""}
-        last_snippet_t = {"v": 0.0}
+        # Shared state between progress callback, watchdog, and worker.
+        ingest_state = {
+            "last_log_path": "",
+            "last_snippet_t": 0.0,
+            "last_bytes_change_t": time.monotonic(),
+            "last_bytes": 0,
+            "last_stall_log_t": 0.0,
+            "stall_severity": 0,         # 0=ok, 1=slow, 2=stalled
+            "current_prog": None,        # latest IngestProgress snapshot
+            "started_at": time.monotonic(),
+            "running": True,
+        }
+
+        SNIPPET_REFRESH_S = 5     # snippet card refresh cadence
+        SLOW_THRESHOLD_S = 15     # no progress for this long → log "slow"
+        STALL_THRESHOLD_S = 60    # → log "stalled" warning
+        WATCHDOG_TICK_S = 1       # how often the heartbeat runs
 
         def fmt_bytes(n: int) -> str:
             n = float(n)
@@ -1445,8 +1528,33 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                 return f"{int(s/3600)}h{int((s%3600)/60):02d}m"
             return f"{int(s/60)}:{int(s%60):02d}"
 
+        def fmt_meta_line(prog, *, override_elapsed: float | None = None,
+                           extra: str = "") -> str:
+            elapsed = override_elapsed if override_elapsed is not None else prog.elapsed_s
+            return (
+                f"{prog.files_done}/{prog.files_total} files  ·  "
+                f"{fmt_bytes(prog.bytes_done)} / {fmt_bytes(prog.bytes_total)}  ·  "
+                f"{fmt_bytes(int(prog.rate_bps))}/s  ·  "
+                f"elapsed {fmt_eta(elapsed)}  ·  ETA {fmt_eta(prog.eta_s)}  ·  "
+                f"{prog.chunks_done} chunks  ·  index {fmt_bytes(prog.db_bytes)}"
+                + (f"  ·  {extra}" if extra else "")
+            )
+
         def progress_cb(prog):
-            # Determinate progress bar (bytes-based)
+            # Track whether bytes_done advanced (for stall detection)
+            if prog.bytes_done > ingest_state["last_bytes"]:
+                ingest_state["last_bytes"] = prog.bytes_done
+                ingest_state["last_bytes_change_t"] = time.monotonic()
+                # Reset stall severity — we're moving again
+                if ingest_state["stall_severity"] > 0:
+                    ingest_log.controls.append(ft.Text(
+                        f"  ▶ resumed: {Path(prog.current_path).name}",
+                        size=11, color=SUCCESS, font_family="monospace",
+                    ))
+                    ingest_state["stall_severity"] = 0
+            ingest_state["current_prog"] = prog
+
+            # Bar
             if prog.bytes_total > 0:
                 ingest_progress.value = min(1.0, prog.bytes_pct)
             ingest_status.value = (
@@ -1454,16 +1562,11 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                 if prog.current_path
                 else prog.status
             )
-            ingest_meta.value = (
-                f"{prog.files_done}/{prog.files_total} files  ·  "
-                f"{fmt_bytes(prog.bytes_done)} / {fmt_bytes(prog.bytes_total)}  ·  "
-                f"{fmt_bytes(int(prog.rate_bps))}/s  ·  ETA {fmt_eta(prog.eta_s)}  ·  "
-                f"{prog.chunks_done} chunks  ·  index {fmt_bytes(prog.db_bytes)}"
-            )
+            ingest_meta.value = fmt_meta_line(prog)
 
-            # Append a one-line log entry only on file transitions
-            if prog.current_path and prog.current_path != last_log_path["v"]:
-                last_log_path["v"] = prog.current_path
+            # File-transition log line
+            if prog.current_path and prog.current_path != ingest_state["last_log_path"]:
+                ingest_state["last_log_path"] = prog.current_path
                 ingest_log.controls.append(
                     ft.Text(
                         f"{prog.status[:18]:>18}  {Path(prog.current_path).name}",
@@ -1472,19 +1575,72 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                     )
                 )
 
-            # Show a snippet card every ~15 s while parsing/embedding
+            # Snippet card every ~5 s
             now = time.monotonic()
             if (prog.snippet and
-                    (now - last_snippet_t["v"]) >= 15.0):
+                    (now - ingest_state["last_snippet_t"]) >= SNIPPET_REFRESH_S):
                 page_str = f"  ·  page {prog.page}" if prog.page else ""
                 ingest_snippet_path.value = (
                     f"{Path(prog.current_path).name}{page_str}"
                 )
                 ingest_snippet_text.value = "“" + prog.snippet + "…”"
                 ingest_snippet_card.visible = True
-                last_snippet_t["v"] = now
+                ingest_state["last_snippet_t"] = now
 
             state.page.update()
+
+        def watchdog():
+            """Ticks every WATCHDOG_TICK_S seconds, regardless of whether the
+            ingest pipeline emitted progress. Updates the elapsed display
+            (real-time clock feel) and logs slow/stalled warnings."""
+            while ingest_state["running"]:
+                time.sleep(WATCHDOG_TICK_S)
+                if not ingest_state["running"]:
+                    break
+                prog = ingest_state["current_prog"]
+                if prog is None:
+                    continue
+                now = time.monotonic()
+                live_elapsed = now - ingest_state["started_at"]
+                since_change = now - ingest_state["last_bytes_change_t"]
+
+                stall_msg = ""
+                if since_change >= STALL_THRESHOLD_S:
+                    stall_msg = f"⚠ stalled ({int(since_change)}s)"
+                    severity = 2
+                elif since_change >= SLOW_THRESHOLD_S:
+                    stall_msg = f"⏳ slow ({int(since_change)}s)"
+                    severity = 1
+                else:
+                    severity = 0
+
+                # Update the meta line with the live elapsed time
+                ingest_meta.value = fmt_meta_line(
+                    prog, override_elapsed=live_elapsed, extra=stall_msg,
+                )
+
+                # Log the slow/stall transition once per severity escalation,
+                # then every 30 s while it persists.
+                if severity > 0 and (
+                    severity > ingest_state["stall_severity"]
+                    or (now - ingest_state["last_stall_log_t"]) >= 30.0
+                ):
+                    file = Path(prog.current_path).name if prog.current_path else "—"
+                    color = WARNING if severity == 1 else DANGER
+                    label = "slow" if severity == 1 else "stalled"
+                    ingest_log.controls.append(ft.Text(
+                        f"  {'⏳' if severity == 1 else '⚠'} {label}: "
+                        f"{file} — {int(since_change)}s with no byte progress "
+                        f"(status: {prog.status[:30]})",
+                        size=11, color=color, font_family="monospace",
+                    ))
+                    ingest_state["last_stall_log_t"] = now
+                    ingest_state["stall_severity"] = severity
+
+                try:
+                    state.page.update()
+                except Exception:
+                    pass
 
         def worker():
             try:
@@ -1508,11 +1664,15 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
             except Exception as ex:
                 ingest_status.value = f"Failed: {ex}"
             finally:
+                ingest_state["running"] = False
                 ingest_progress.visible = False
                 refresh_files()
                 refresh_status()
                 state.page.update()
 
+        # Watchdog as a plain thread (not page.run_thread) so the periodic
+        # tick doesn't compete with worker for the same context.
+        threading.Thread(target=watchdog, daemon=True).start()
         state.page.run_thread(worker)
 
     ingest_card = section_card(
@@ -2609,6 +2769,210 @@ def build_welcome(state: AppState, *, on_open_workspace):
 # Toast helper
 # ============================================================================
 
+def open_create_rag_overlay(
+    page: ft.Page,
+    *,
+    on_created,                 # callable(Path) — receives the new workspace path
+    default_parent: Path | None = None,
+) -> None:
+    """A modal that lets the user create a named RAG by picking N source
+    folders. Each folder's supported files are copied into the new
+    workspace's docs/. The user picks a base parent dir + name; we slug it.
+    """
+    parent = default_parent or (Path.home() / "ez-rag-workspaces")
+
+    overlay_ref: dict = {}
+    def close_it(_=None):
+        ov = overlay_ref.get("overlay")
+        if ov is None:
+            return
+        ov.visible = False
+        try:
+            if ov in page.overlay:
+                page.overlay.remove(ov)
+            for picker in (parent_picker, source_picker):
+                if picker in page.services:
+                    page.services.remove(picker)
+        except Exception:
+            pass
+        page.update()
+
+    name_field = ft.TextField(
+        label="RAG name", hint_text="e.g. D&D rulebooks",
+        value="", expand=True, dense=True,
+        border_color="#2A2D3D",
+        focused_border_color=ACCENT,
+        cursor_color=ACCENT,
+    )
+    parent_field = ft.TextField(
+        label="Parent folder (will create a subfolder named after the RAG)",
+        value=str(parent), expand=True, dense=True,
+        border_color="#2A2D3D", focused_border_color=ACCENT,
+    )
+    parent_picker = ft.FilePicker()
+    source_picker = ft.FilePicker()
+    page.services.append(parent_picker)
+    page.services.append(source_picker)
+
+    def pick_parent(_):
+        async def _do():
+            picked = await parent_picker.get_directory_path(
+                dialog_title="Where should this RAG live?",
+            )
+            if picked:
+                parent_field.value = picked
+                page.update()
+        page.run_task(_do)
+
+    sources: list[Path] = []
+    sources_col = ft.Column([], spacing=4, tight=True)
+
+    def render_sources():
+        sources_col.controls.clear()
+        if not sources:
+            sources_col.controls.append(ft.Text(
+                "No source folders yet — click 'Add folder…' to import documents.",
+                size=12, color=ON_SURFACE_DIM, italic=True,
+            ))
+        else:
+            for i, p in enumerate(sources):
+                row = ft.Row([
+                    ft.Icon(ft.Icons.FOLDER, size=16, color=ACCENT),
+                    ft.Text(str(p), size=12, color=ON_SURFACE, expand=True,
+                            no_wrap=False),
+                    ft.IconButton(
+                        icon=ft.Icons.CLOSE, icon_size=14,
+                        tooltip="Remove",
+                        on_click=(lambda idx=i: lambda _: (
+                            sources.pop(idx), render_sources(), page.update()
+                        ))(i),
+                    ),
+                ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=8)
+                sources_col.controls.append(row)
+        page.update()
+
+    def add_source(_):
+        async def _do():
+            picked = await source_picker.get_directory_path(
+                dialog_title="Pick a folder of documents",
+            )
+            if picked:
+                p = Path(picked)
+                if p not in sources:
+                    sources.append(p)
+                    render_sources()
+        page.run_task(_do)
+
+    blank_check = ft.Checkbox(
+        value=True,
+        active_color=ACCENT,
+        label="Start with an empty docs/ (recommended)",
+        label_style=ft.TextStyle(size=12, color=ON_SURFACE_DIM),
+    )
+
+    status_line = ft.Text("", size=12, color=ON_SURFACE_DIM)
+    create_btn = ft.FilledButton(
+        "Create RAG", icon=ft.Icons.AUTO_AWESOME,
+        bgcolor=ACCENT, color="#FFFFFF",
+    )
+    cancel_btn = ft.TextButton("Cancel", on_click=close_it)
+
+    render_sources()
+
+    def do_create(_):
+        nm = (name_field.value or "").strip()
+        if not nm:
+            status_line.value = "Pick a name for the RAG first."
+            page.update()
+            return
+        prnt = (parent_field.value or "").strip()
+        if not prnt:
+            status_line.value = "Pick a parent folder first."
+            page.update()
+            return
+        try:
+            ws = Workspace.create_named(
+                name=nm,
+                parent_dir=Path(prnt),
+                source_folders=sources,
+                clear_default=bool(blank_check.value),
+            )
+        except FileExistsError as e:
+            status_line.value = str(e)
+            page.update()
+            return
+        except Exception as e:
+            status_line.value = f"Error: {e}"
+            page.update()
+            return
+        status_line.value = f"Created {ws.root.name} — opening…"
+        page.update()
+        close_it()
+        on_created(ws.root)
+
+    create_btn.on_click = do_create
+
+    title_row = ft.Row([
+        ft.Icon(ft.Icons.AUTO_AWESOME, color=ACCENT),
+        ft.Text("Create a new RAG", size=18, weight=ft.FontWeight.W_700,
+                color=ON_SURFACE),
+        ft.Container(expand=True),
+        ft.IconButton(icon=ft.Icons.CLOSE, on_click=close_it,
+                      tooltip="Close"),
+    ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=10)
+
+    panel = ft.Container(
+        bgcolor=SURFACE_DARK,
+        border=ft.border.all(1, "#262938"),
+        border_radius=14,
+        padding=20,
+        width=720,
+        content=ft.Column([
+            title_row,
+            ft.Divider(color="#262938"),
+            name_field,
+            ft.Row([parent_field,
+                    ft.OutlinedButton("Browse…", icon=ft.Icons.FOLDER_OPEN,
+                                      on_click=pick_parent)],
+                   vertical_alignment=ft.CrossAxisAlignment.END, spacing=8),
+            ft.Container(height=8),
+            ft.Text("SOURCE FOLDERS", size=11, weight=ft.FontWeight.W_700,
+                    color=ON_SURFACE_DIM),
+            ft.Container(
+                padding=ft.padding.symmetric(horizontal=12, vertical=10),
+                bgcolor=BG_DARK,
+                border=ft.border.all(1, "#222637"),
+                border_radius=8,
+                content=sources_col,
+            ),
+            ft.Row([
+                ft.OutlinedButton("Add folder…", icon=ft.Icons.CREATE_NEW_FOLDER,
+                                  on_click=add_source),
+                ft.Container(expand=True),
+                blank_check,
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Divider(color="#262938"),
+            status_line,
+            ft.Row([
+                ft.Container(expand=True),
+                cancel_btn,
+                create_btn,
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=8),
+        ], spacing=10, tight=True),
+    )
+
+    overlay = ft.Container(
+        expand=True, visible=True,
+        bgcolor=ft.Colors.with_opacity(0.55, "#000000"),
+        alignment=ft.Alignment.CENTER,
+        on_click=close_it,
+        content=ft.Container(on_click=lambda e: None, content=panel),
+    )
+    overlay_ref["overlay"] = overlay
+    page.overlay.append(overlay)
+    page.update()
+
+
 def open_info_overlay(page: ft.Page, *, title: str, body_md: str,
                       icon=None, accent: str = ACCENT) -> None:
     """Open a centered modal showing markdown content (Help, Credits, etc.).
@@ -2769,9 +3133,17 @@ def app(page: ft.Page):
         if "fn" in refresh_files_cb:
             refresh_files_cb["fn"]()
 
+    def on_create_rag_action(_=None):
+        open_create_rag_overlay(
+            page,
+            on_created=lambda new_path: set_workspace_path(new_path),
+        )
+
     header_bar, update_header = build_header(
         state,
         on_open_workspace=lambda _=None: on_open_workspace(),
+        on_create_rag=on_create_rag_action,
+        on_pick_workspace=set_workspace_path,
         refresh_status=refresh_status,
     )
     refresh_status_cb["fn"] = update_header
