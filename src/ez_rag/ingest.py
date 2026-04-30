@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -18,6 +18,48 @@ from .workspace import Workspace
 
 PARSER_VERSION = "1"
 CHUNKER_VERSION = "2"  # bumped for contextual retrieval support
+
+
+# ============================================================================
+# Progress reporting
+# ============================================================================
+
+@dataclass
+class IngestProgress:
+    """Snapshot emitted by `ingest()` so UIs can render rich progress."""
+    # Current event
+    current_path: str = ""
+    status: str = ""               # "parsing" | "embedding" | "ok" | "skipped" | "error"
+    page: int | None = None
+    snippet: str = ""              # 200-char preview of current/last chunk
+
+    # Run-so-far totals (file-level granularity)
+    files_done: int = 0
+    files_total: int = 0
+    bytes_done: int = 0            # bytes of fully-processed files
+    bytes_total: int = 0
+    chunks_done: int = 0
+
+    # Timing / rate
+    elapsed_s: float = 0.0
+    eta_s: float | None = None     # remaining seconds, None until rate is known
+    rate_bps: float = 0.0          # processed bytes per second (rolling)
+
+    # Index growth
+    db_bytes: int = 0              # current size of meta.sqlite on disk
+
+    @property
+    def bytes_pct(self) -> float:
+        return (self.bytes_done / self.bytes_total) if self.bytes_total > 0 else 0.0
+
+    @property
+    def files_pct(self) -> float:
+        return (self.files_done / self.files_total) if self.files_total > 0 else 0.0
+
+
+# Backward-compat: progress callbacks may take either (path, status)
+# or a single IngestProgress.
+ProgressCb = Callable[..., None]
 
 
 @dataclass
@@ -57,6 +99,28 @@ def _walk_docs(docs_dir: Path) -> list[Path]:
     return sorted(out)
 
 
+def _emit(progress: ProgressCb | None, snap: IngestProgress) -> None:
+    """Send a progress snapshot. Tolerates both signatures —
+    `progress(IngestProgress)` and the legacy `progress(path, status)`."""
+    if progress is None:
+        return
+    try:
+        progress(snap)
+    except TypeError:
+        progress(snap.current_path, snap.status)
+
+
+def _db_size(path: Path) -> int:
+    total = 0
+    for sib in (path, path.with_suffix(path.suffix + "-wal"),
+                path.with_suffix(path.suffix + "-shm")):
+        try:
+            total += sib.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
 def ingest(
     ws: Workspace,
     *,
@@ -75,13 +139,36 @@ def ingest(
     docs_dir.mkdir(parents=True, exist_ok=True)
     files = _walk_docs(docs_dir)
     stats.files_seen = len(files)
+    bytes_total = sum(p.stat().st_size for p in files)
+
+    bytes_done = 0
+    files_done = 0
+    chunks_done = 0
+
+    def snapshot(*, current_path: str = "", status: str = "",
+                 page: int | None = None, snippet: str = "") -> IngestProgress:
+        elapsed = time.perf_counter() - t0
+        rate = (bytes_done / elapsed) if elapsed > 0 and bytes_done > 0 else 0.0
+        eta = ((bytes_total - bytes_done) / rate) if rate > 0 else None
+        return IngestProgress(
+            current_path=current_path, status=status, page=page,
+            snippet=snippet,
+            files_done=files_done, files_total=len(files),
+            bytes_done=bytes_done, bytes_total=bytes_total,
+            chunks_done=chunks_done,
+            elapsed_s=elapsed, eta_s=eta, rate_bps=rate,
+            db_bytes=_db_size(ws.meta_db_path),
+        )
+
+    # Initial emission so UIs can size the bar.
+    _emit(progress, snapshot(status="starting"))
 
     present_rel: set[str] = set()
     for path in files:
         rel = str(path.relative_to(ws.root))
         present_rel.add(rel)
+        file_size = path.stat().st_size
         try:
-            stat = path.stat()
             sha = file_sha256(path)
             existing = index.file_state(rel)
             if (
@@ -90,19 +177,22 @@ def ingest(
                 and existing.sha256 == sha
             ):
                 stats.files_skipped_unchanged += 1
-                if progress:
-                    progress(rel, "unchanged")
+                bytes_done += file_size
+                files_done += 1
+                _emit(progress, snapshot(current_path=rel, status="unchanged"))
                 continue
-            if progress:
-                progress(rel, "parsing")
+            _emit(progress, snapshot(current_path=rel, status="parsing"))
             parser = get_parser(path)
             if parser is None:
                 stats.files_unsupported += 1
+                bytes_done += file_size
+                files_done += 1
                 continue
             sections = parser(path)
             if not sections:
-                if progress:
-                    progress(rel, "empty")
+                bytes_done += file_size
+                files_done += 1
+                _emit(progress, snapshot(current_path=rel, status="empty"))
                 continue
             chunks = chunk_sections(
                 sections,
@@ -110,23 +200,31 @@ def ingest(
                 overlap_tokens=cfg.chunk_overlap,
             )
             if not chunks:
-                if progress:
-                    progress(rel, "no chunks")
+                bytes_done += file_size
+                files_done += 1
+                _emit(progress, snapshot(current_path=rel, status="no chunks"))
                 continue
-            # Optional Anthropic-style Contextual Retrieval: prepend a
-            # 1-sentence chunk-context summary BEFORE embedding. We embed
-            # the augmented text but DO NOT alter chunk.text (so the
-            # original passage still displays/cites cleanly).
+            # Pick a representative snippet (early-mid chunk) for live display.
+            sample = chunks[min(len(chunks) - 1, len(chunks) // 2)]
+            snippet = (sample.text or "").strip().replace("\n", " ")[:240]
+
+            # Optional Anthropic-style Contextual Retrieval.
             embed_texts = [c.text for c in chunks]
             if cfg.enable_contextual and detect_backend(cfg) != "none":
-                if progress:
-                    progress(rel, f"contextualizing {len(chunks)} chunks")
+                _emit(progress, snapshot(
+                    current_path=rel,
+                    status=f"contextualizing {len(chunks)} chunks",
+                    page=sample.page, snippet=snippet,
+                ))
                 full_text = "\n\n".join(s.text for s in sections)
                 embed_texts = [
                     contextualize_chunk(c.text, full_text, cfg) for c in chunks
                 ]
-            if progress:
-                progress(rel, f"embedding {len(chunks)} chunks")
+            _emit(progress, snapshot(
+                current_path=rel,
+                status=f"embedding {len(chunks)} chunks",
+                page=sample.page, snippet=snippet,
+            ))
             vecs = embedder.embed(embed_texts)
             rows = []
             for c, v in zip(chunks, vecs):
@@ -134,26 +232,35 @@ def ingest(
             index.replace_file(
                 path=rel,
                 sha256=sha,
-                bytes_=stat.st_size,
-                mtime=stat.st_mtime,
+                bytes_=file_size,
+                mtime=path.stat().st_mtime,
                 parser_version=PARSER_VERSION,
                 chunker_version=CHUNKER_VERSION,
                 embedder=embedder.name,
                 chunks=rows,
             )
             stats.chunks_added += len(rows)
+            chunks_done += len(rows)
             if existing is None:
                 stats.files_new += 1
             else:
                 stats.files_changed += 1
-            if progress:
-                progress(rel, f"ok ({len(rows)} chunks)")
+            bytes_done += file_size
+            files_done += 1
+            _emit(progress, snapshot(
+                current_path=rel,
+                status=f"ok ({len(rows)} chunks)",
+                page=sample.page, snippet=snippet,
+            ))
         except Exception as e:
             stats.files_errored += 1
             stats.errors.append((str(path), repr(e)))
-            if progress:
-                progress(str(path), f"ERROR: {e}")
+            bytes_done += file_size
+            files_done += 1
+            _emit(progress, snapshot(current_path=rel,
+                                     status=f"ERROR: {e}"))
 
     stats.files_removed = index.delete_missing(present_rel)
     stats.seconds = time.perf_counter() - t0
+    _emit(progress, snapshot(status="done"))
     return stats

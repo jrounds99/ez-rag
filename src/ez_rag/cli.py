@@ -90,34 +90,89 @@ def status():
 def ingest_cmd(
     force: bool = typer.Option(False, "--force", help="Reingest even if file unchanged"),
     watch: bool = typer.Option(False, "--watch", help="Watch docs/ and reingest on change"),
+    flavor_seconds: int = typer.Option(
+        15, "--flavor-seconds",
+        help="Print a sample of the chunk being processed every N seconds (0 = off)",
+    ),
 ):
     """Parse, chunk, embed everything in ./docs/."""
+    import time as _time
+
     ws = require_workspace()
     cfg = ws.load_config()
 
     def run_once():
+        from rich.progress import (
+            BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
+            TextColumn, TimeElapsedColumn, TimeRemainingColumn,
+        )
+
+        def fmt_bytes(n: int) -> str:
+            for unit in ("B", "KB", "MB", "GB"):
+                if n < 1024 or unit == "GB":
+                    return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+                n /= 1024
+            return f"{n:.1f} GB"
+
+        last_flavor_t = [0.0]
+        last_path = [""]
+
         with Progress(
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description:<48}"),
+            BarColumn(bar_width=30),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TextColumn("{task.fields[bytes_str]}"),
+            TextColumn("•"),
             TimeElapsedColumn(),
+            TextColumn("ETA"),
+            TimeRemainingColumn(),
             console=console,
+            transient=False,
         ) as bar:
-            task = bar.add_task("ingesting", total=None)
-            seen = {"n": 0}
-            def progress(path: str, status: str):
-                seen["n"] += 1
-                bar.update(task, description=f"{Path(path).name[:40]:<40} {status}",
-                           completed=seen["n"])
-            stats = ingest(ws, cfg=cfg, force=force, progress=progress)
+            task = bar.add_task(
+                "ingesting", total=1, completed=0,
+                bytes_str="0 B / 0 B",
+            )
+
+            def cb(prog):
+                # Update bar
+                if prog.files_total > 0:
+                    bar.update(
+                        task, total=prog.files_total,
+                        completed=prog.files_done,
+                        description=(
+                            f"{Path(prog.current_path).name[:40] if prog.current_path else '…':<40} "
+                            f"{prog.status[:8]:<8}"
+                        ),
+                        bytes_str=(
+                            f"{fmt_bytes(prog.bytes_done)} / "
+                            f"{fmt_bytes(prog.bytes_total)}  "
+                            f"db {fmt_bytes(prog.db_bytes)}"
+                        ),
+                    )
+                # Periodic flavor blurb
+                now = _time.monotonic()
+                if (flavor_seconds > 0 and prog.snippet and
+                        (now - last_flavor_t[0]) >= flavor_seconds and
+                        prog.current_path != last_path[0]):
+                    page = f" p.{prog.page}" if prog.page else ""
+                    bar.console.print(
+                        f"\n[dim]── {prog.current_path}{page} ──[/]"
+                    )
+                    snip = prog.snippet[:200].replace("\n", " ").strip()
+                    bar.console.print(f"[italic dim]   {snip}…[/]\n")
+                    last_flavor_t[0] = now
+                    last_path[0] = prog.current_path
+
+            stats = ingest(ws, cfg=cfg, force=force, progress=cb)
         _print_ingest_stats(stats)
 
     run_once()
     if not watch:
         return
 
-    # Simple polling watch (no extra dep)
-    import time
     last_mtimes: dict[str, float] = {}
     console.print("[dim]watching docs/ — Ctrl-C to stop[/]")
     try:
@@ -131,7 +186,7 @@ def ingest_cmd(
                         changed = True
             if changed:
                 run_once()
-            time.sleep(2.0)
+            _time.sleep(2.0)
     except KeyboardInterrupt:
         console.print("\nstopped.")
 
@@ -378,6 +433,48 @@ def reindex():
     cfg = ws.load_config()
     stats = ingest(ws, cfg=cfg, force=True)
     _print_ingest_stats(stats)
+
+
+@app.command()
+def export(
+    out: Path = typer.Argument(
+        Path("ez-rag-export.zip"),
+        help="Destination .zip path",
+    ),
+):
+    """Export this workspace's vector index + config to a portable .zip.
+
+    The archive contains config.toml + meta.sqlite (and WAL/SHM if present).
+    Caches and model files are intentionally excluded. Re-import elsewhere
+    with `ez-rag import <archive> <new-workspace-path>`.
+    """
+    ws = require_workspace()
+    size_before = ws.index_size_bytes()
+    dest = ws.export_archive(out)
+    out_size = dest.stat().st_size
+    table = Table(show_header=False, box=None)
+    table.add_row("workspace", str(ws.root))
+    table.add_row("index size", f"{size_before:,} bytes")
+    table.add_row("archive", str(dest.resolve()))
+    table.add_row("archive size", f"{out_size:,} bytes")
+    console.print(Panel(table, title="exported", border_style="green"))
+
+
+@app.command("import")
+def import_cmd(
+    archive: Path = typer.Argument(..., exists=True,
+                                   help="A .zip produced by `ez-rag export`"),
+    into: Path = typer.Argument(..., help="Path to create the new workspace at"),
+):
+    """Restore a previously-exported workspace archive into a new directory."""
+    ws = Workspace.import_archive(archive, into)
+    console.print(Panel.fit(
+        f"[green]Restored to [bold]{ws.root}[/bold].[/]\n\n"
+        f"  cd {ws.root}\n"
+        f"  ez-rag status",
+        title="import",
+        border_style="green",
+    ))
 
 
 @app.command("help")

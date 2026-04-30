@@ -1169,7 +1169,27 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
         value=0, color=ACCENT, bgcolor="#262938", visible=False,
     )
     ingest_status = ft.Text("", size=12, color=ON_SURFACE_DIM)
-    ingest_log = ft.ListView(spacing=2, padding=8, height=140, auto_scroll=True)
+    ingest_meta = ft.Text(
+        "", size=11, color=ON_SURFACE_DIM, weight=ft.FontWeight.W_500,
+    )  # files / bytes / ETA / db size line
+    ingest_snippet_path = ft.Text(
+        "", size=11, color=ACCENT, weight=ft.FontWeight.W_700,
+    )
+    ingest_snippet_text = ft.Text(
+        "", size=12, color=ON_SURFACE_DIM, italic=True, max_lines=4,
+    )
+    ingest_snippet_card = ft.Container(
+        visible=False,
+        padding=ft.padding.symmetric(horizontal=12, vertical=10),
+        bgcolor="#13151E",
+        border=ft.border.all(1, "#1E2130"),
+        border_radius=8,
+        content=ft.Column([
+            ingest_snippet_path,
+            ingest_snippet_text,
+        ], spacing=4, tight=True),
+    )
+    ingest_log = ft.ListView(spacing=2, padding=8, height=120, auto_scroll=True)
 
     def add_files_clicked(_):
         if state.ws is None:
@@ -1330,20 +1350,73 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
         ingest_progress.visible = True
         ingest_progress.value = None
         ingest_status.value = "Starting…"
+        ingest_meta.value = ""
+        ingest_snippet_card.visible = False
         state.page.update()
 
-        def progress_cb(path: str, status: str):
-            ingest_log.controls.append(
-                ft.Text(f"{status:>14}  {Path(path).name}", size=11,
-                        color=ON_SURFACE_DIM, font_family="monospace"),
+        last_log_path = {"v": ""}
+        last_snippet_t = {"v": 0.0}
+
+        def fmt_bytes(n: int) -> str:
+            n = float(n)
+            for unit in ("B", "KB", "MB", "GB"):
+                if n < 1024 or unit == "GB":
+                    return f"{n:.1f} {unit}" if unit != "B" else f"{n:.0f} {unit}"
+                n /= 1024
+            return f"{n:.1f} GB"
+
+        def fmt_eta(s):
+            if s is None or s <= 0:
+                return "—"
+            if s >= 3600:
+                return f"{int(s/3600)}h{int((s%3600)/60):02d}m"
+            return f"{int(s/60)}:{int(s%60):02d}"
+
+        def progress_cb(prog):
+            # Determinate progress bar (bytes-based)
+            if prog.bytes_total > 0:
+                ingest_progress.value = min(1.0, prog.bytes_pct)
+            ingest_status.value = (
+                f"{prog.status} — {Path(prog.current_path).name}"
+                if prog.current_path
+                else prog.status
             )
-            ingest_status.value = f"{status} — {Path(path).name}"
+            ingest_meta.value = (
+                f"{prog.files_done}/{prog.files_total} files  ·  "
+                f"{fmt_bytes(prog.bytes_done)} / {fmt_bytes(prog.bytes_total)}  ·  "
+                f"{fmt_bytes(int(prog.rate_bps))}/s  ·  ETA {fmt_eta(prog.eta_s)}  ·  "
+                f"{prog.chunks_done} chunks  ·  index {fmt_bytes(prog.db_bytes)}"
+            )
+
+            # Append a one-line log entry only on file transitions
+            if prog.current_path and prog.current_path != last_log_path["v"]:
+                last_log_path["v"] = prog.current_path
+                ingest_log.controls.append(
+                    ft.Text(
+                        f"{prog.status[:18]:>18}  {Path(prog.current_path).name}",
+                        size=11, color=ON_SURFACE_DIM,
+                        font_family="monospace",
+                    )
+                )
+
+            # Show a snippet card every ~15 s while parsing/embedding
+            now = time.monotonic()
+            if (prog.snippet and
+                    (now - last_snippet_t["v"]) >= 15.0):
+                page_str = f"  ·  page {prog.page}" if prog.page else ""
+                ingest_snippet_path.value = (
+                    f"{Path(prog.current_path).name}{page_str}"
+                )
+                ingest_snippet_text.value = "“" + prog.snippet + "…”"
+                ingest_snippet_card.visible = True
+                last_snippet_t["v"] = now
+
             state.page.update()
 
         def worker():
-            t0 = time.perf_counter()
             try:
-                stats = ingest(state.ws, cfg=state.cfg, force=force, progress=progress_cb)
+                stats = ingest(state.ws, cfg=state.cfg, force=force,
+                               progress=progress_cb)
                 ingest_status.value = (
                     f"Done · {stats.files_new} new · "
                     f"{stats.files_changed} changed · "
@@ -1365,6 +1438,7 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                 ingest_progress.visible = False
                 refresh_files()
                 refresh_status()
+                state.page.update()
 
         state.page.run_thread(worker)
 
@@ -1381,6 +1455,8 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
         ], spacing=10),
         ingest_progress,
         ingest_status,
+        ingest_meta,
+        ingest_snippet_card,
         ft.Container(
             content=ingest_log,
             bgcolor=BG_DARK,
