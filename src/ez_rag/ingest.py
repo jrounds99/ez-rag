@@ -12,6 +12,7 @@ from .config import Config
 from .embed import Embedder, make_embedder
 from .generate import contextualize_chunk, detect_backend
 from .index import Index, file_sha256
+from .models import unload_ollama_model
 from .parsers import ParsedSection, get_parser, supported_extensions
 from .workspace import Workspace
 
@@ -149,6 +150,18 @@ def ingest(
 
     # Pre-ingest narration so the UI never looks frozen during setup.
     _emit(progress, _early_snap("starting…"))
+
+    # Optional: unload the chat LLM from VRAM so embedding has the whole GPU.
+    # Only safe when contextual retrieval is OFF (otherwise we need the LLM
+    # for per-chunk context summaries).
+    if (getattr(cfg, "unload_llm_during_ingest", True)
+            and not cfg.enable_contextual
+            and detect_backend(cfg) == "ollama"):
+        _emit(progress, _early_snap(
+            f"unloading {cfg.llm_model} to free VRAM"
+        ))
+        unload_ollama_model(cfg.llm_url, cfg.llm_model)
+
     _emit(progress, _early_snap("loading embedder (downloads on first use)"))
     embedder = make_embedder(cfg)
     _emit(progress, _early_snap(f"embedder ready ({embedder.name}, {embedder.dim}d)"))
@@ -252,7 +265,7 @@ def ingest(
             # Embed in mini-batches so the UI updates during long embedding
             # passes (big PDFs with hundreds of chunks). For tiny files this
             # is still effectively a single call.
-            BATCH = 16
+            BATCH = max(1, getattr(cfg, "embed_batch_size", 16))
             import numpy as np
             vec_chunks = []
             for i in range(0, len(embed_texts), BATCH):

@@ -226,3 +226,71 @@ def require_workspace(start: Path | None = None) -> Workspace:
             "Not inside an ez-rag workspace. Run `ez-rag init .` to create one."
         )
     return ws
+
+
+# ============================================================================
+# Global config — settings that apply across all workspaces
+# ============================================================================
+# Stored at ~/.ezrag/global.toml. Currently just the default RAGs folder.
+
+GLOBAL_CONFIG_DIR = Path.home() / ".ezrag"
+GLOBAL_CONFIG_PATH = GLOBAL_CONFIG_DIR / "global.toml"
+DEFAULT_RAGS_DIR = Path.home() / "ez-rag-workspaces"
+
+
+def _read_global() -> dict:
+    if not GLOBAL_CONFIG_PATH.exists():
+        return {}
+    try:
+        return tomllib.loads(GLOBAL_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_global(d: dict) -> None:
+    GLOBAL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for k, v in d.items():
+        if isinstance(v, str):
+            lines.append(f'{k} = "{v}"')
+        elif isinstance(v, bool):
+            lines.append(f"{k} = {'true' if v else 'false'}")
+        else:
+            lines.append(f"{k} = {v}")
+    GLOBAL_CONFIG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def get_default_rags_dir() -> Path:
+    """Where 'New RAG' creates workspaces by default. User-changeable via
+    `set_default_rags_dir()` or the GUI's Storage settings card."""
+    g = _read_global()
+    p = g.get("default_rags_dir")
+    if p:
+        return Path(p).expanduser()
+    return DEFAULT_RAGS_DIR
+
+
+def set_default_rags_dir(path: Path) -> None:
+    g = _read_global()
+    g["default_rags_dir"] = str(Path(path).expanduser())
+    _write_global(g)
+
+
+def list_managed_rags(path: Path | None = None) -> list[Workspace]:
+    """All initialized workspaces under `path` (defaults to the global RAGs dir).
+    Sorted by directory mtime descending so the freshest is first."""
+    base = (path or get_default_rags_dir()).expanduser()
+    if not base.is_dir():
+        return []
+    out: list[Workspace] = []
+    try:
+        for child in base.iterdir():
+            if not child.is_dir():
+                continue
+            ws = Workspace(child)
+            if ws.is_initialized():
+                out.append(ws)
+    except OSError:
+        return []
+    out.sort(key=lambda w: w.root.stat().st_mtime, reverse=True)
+    return out

@@ -29,6 +29,11 @@ class Config:
     ocr_provider: str = "auto"          # "auto" | "rapidocr" | "tesseract" | "none"
     enable_contextual: bool = False     # Anthropic-style chunk context (slower, better recall)
 
+    # Ingest performance — flip these on for big corpora
+    unload_llm_during_ingest: bool = True   # frees VRAM if contextual is OFF
+    parallel_workers: int = 1               # parser/chunker process pool (1 = sequential)
+    embed_batch_size: int = 16              # bigger = faster on a strong GPU
+
     # Retrieval
     use_rag: bool = True               # off = ask the LLM directly
     top_k: int = 8

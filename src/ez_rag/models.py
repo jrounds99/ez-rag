@@ -121,6 +121,25 @@ def pull_ollama_model(url: str, tag: str) -> Iterator[dict]:
                 continue
 
 
+def unload_ollama_model(url: str, tag: str, *, timeout: float = 10.0) -> bool:
+    """Ask Ollama to evict `tag` from VRAM. We POST a no-op generate request
+    with `keep_alive: 0`, which tells Ollama to unload as soon as the call
+    returns. Returns True on a 2xx response, False on any error.
+
+    Useful before a long ingest: the chat model isn't doing anything during
+    embedding, and unloading frees VRAM the OS can use for parsing/OCR.
+    """
+    try:
+        r = httpx.post(
+            url.rstrip("/") + "/api/generate",
+            json={"model": tag, "prompt": "", "keep_alive": 0, "stream": False},
+            timeout=timeout,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def delete_ollama_model(url: str, tag: str) -> bool:
     try:
         r = httpx.request(

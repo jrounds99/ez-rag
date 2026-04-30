@@ -33,7 +33,10 @@ from ez_rag.models import (
 from ez_rag.generate import apply_query_modifiers
 from ez_rag.parsers import supported_extensions
 from ez_rag.retrieve import agentic_retrieve, hybrid_search, smart_retrieve
-from ez_rag.workspace import Workspace, find_workspace
+from ez_rag.workspace import (
+    Workspace, find_workspace,
+    get_default_rags_dir, set_default_rags_dir, list_managed_rags,
+)
 
 
 # ============================================================================
@@ -119,6 +122,21 @@ TIP = {
                       "formatting instructions.",
     "query_negatives":"Things the model should avoid. Appended as 'Avoid: …' "
                       "to every question.",
+    "unload_llm":     "Before ingest starts, ask Ollama to evict the chat "
+                      "LLM from VRAM. The embedder is small and doesn't need "
+                      "the whole GPU. Auto-skipped if Contextual Retrieval "
+                      "is ON (we need the LLM loaded for per-chunk summaries).",
+    "embed_batch":    "How many chunks to embed per call. Bigger = faster "
+                      "throughput on a strong GPU, more memory in flight. "
+                      "16 is a balanced default; on a 5090 you can comfortably "
+                      "go to 64.",
+    "parallel_workers": "Reserved for future parallel parsing. Currently "
+                      "no effect; leave at 1.",
+    "default_rags_dir": "Where 'New RAG' creates workspaces by default. "
+                      "Each RAG you create here also shows up in the RAG "
+                      "dropdown automatically.",
+    "manage_rags":    "Browse, open, export, or delete every RAG stored in "
+                      "the default folder.",
 
     # Files tab
     "add_files":      "Copy files from anywhere on disk into this workspace's "
@@ -602,12 +620,20 @@ def build_header(state: AppState, *, on_open_workspace, on_create_rag,
                 key=cur, text=f"● {state.ws.root.name}",
             ))
             seen.add(cur)
+        # 1) recents (most recently opened)
         for p in load_recents():
             sp = str(p)
             if sp in seen:
                 continue
             seen.add(sp)
             opts.append(ft.dropdown.Option(key=sp, text=p.name))
+        # 2) every RAG present in the default RAGs folder
+        for w in list_managed_rags():
+            sp = str(w.root)
+            if sp in seen:
+                continue
+            seen.add(sp)
+            opts.append(ft.dropdown.Option(key=sp, text=w.root.name))
         opts.append(ft.dropdown.Option(key=NEW_RAG_KEY,
                                        text="+ New RAG…"))
         opts.append(ft.dropdown.Option(key=OPEN_FOLDER_KEY,
@@ -1797,12 +1823,79 @@ def _model_dropdown_options(
     return options
 
 
-def build_settings_view(state: AppState, *, refresh_status):
+def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
     page = state.page
 
     # Local FilePicker for choosing a GGUF file
     gguf_picker = ft.FilePicker()
     page.services.append(gguf_picker)
+    rags_dir_picker = ft.FilePicker()
+    page.services.append(rags_dir_picker)
+
+    def _build_storage_card(_state: AppState) -> ft.Control:
+        path_text = ft.Text(
+            str(get_default_rags_dir()),
+            size=12, color=ACCENT, weight=ft.FontWeight.W_600,
+            selectable=True,
+        )
+
+        def refresh_path():
+            path_text.value = str(get_default_rags_dir())
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        def pick_dir(_):
+            async def _do():
+                p = await rags_dir_picker.get_directory_path(
+                    dialog_title="Where should new RAGs live?",
+                )
+                if p:
+                    set_default_rags_dir(Path(p))
+                    refresh_path()
+                    _toast(page, f"Default RAGs folder → {p}")
+            page.run_task(_do)
+
+        def open_in_explorer(_):
+            try:
+                import subprocess
+                p = get_default_rags_dir()
+                p.mkdir(parents=True, exist_ok=True)
+                if os.name == "nt":
+                    os.startfile(p)  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(["xdg-open", str(p)])
+            except Exception as ex:
+                _toast(page, f"Open failed: {ex}")
+
+        def manage_rags(_):
+            open_manage_rags_overlay(
+                page,
+                on_open_workspace=on_pick_workspace,
+                on_change=refresh_path,
+            )
+
+        return section_card(
+            "STORAGE",
+            ft.Row([
+                ft.Icon(ft.Icons.FOLDER_OPEN, size=16, color=ACCENT),
+                ft.Text("Default RAGs folder:", size=11,
+                        color=ON_SURFACE_DIM, weight=ft.FontWeight.W_700),
+            ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            path_text,
+            ft.Row([
+                ft.OutlinedButton("Change…", icon=ft.Icons.EDIT,
+                                  on_click=pick_dir,
+                                  tooltip=TIP["default_rags_dir"]),
+                ft.OutlinedButton("Open in Explorer", icon=ft.Icons.OPEN_IN_NEW,
+                                  on_click=open_in_explorer),
+                ft.FilledButton("Manage RAGs…", icon=ft.Icons.STORAGE,
+                                on_click=manage_rags,
+                                bgcolor=ACCENT, color="#FFFFFF",
+                                tooltip=TIP["manage_rags"]),
+            ], spacing=8, wrap=True),
+        )
 
     chunk_size = ft.TextField(label="Chunk size (tokens)", value="512",
                               width=180, dense=True, tooltip=TIP["chunk_size"])
@@ -1831,6 +1924,14 @@ def build_settings_view(state: AppState, *, refresh_status):
     )
     use_corpus = ft.Switch(label="Use corpus (RAG)", value=True,
                            active_color=ACCENT, tooltip=TIP["use_corpus"])
+    unload_llm_sw = ft.Switch(
+        label="Unload LLM during ingest",
+        value=True, active_color=ACCENT, tooltip=TIP["unload_llm"],
+    )
+    embed_batch_field = ft.TextField(
+        label="Embed batch size", value="16", width=160, dense=True,
+        tooltip=TIP["embed_batch"],
+    )
     agentic_sw = ft.Switch(label="Agentic mode", value=False,
                            active_color=ACCENT, tooltip=TIP["agentic"])
 
@@ -2420,6 +2521,8 @@ def build_settings_view(state: AppState, *, refresh_status):
         query_prefix_field.value = c.query_prefix
         query_suffix_field.value = c.query_suffix
         query_negatives_field.value = c.query_negatives
+        unload_llm_sw.value = c.unload_llm_during_ingest
+        embed_batch_field.value = str(c.embed_batch_size)
         use_corpus.value = c.use_rag
         enable_ocr.value = c.enable_ocr
         contextual.value = c.enable_contextual
@@ -2468,6 +2571,11 @@ def build_settings_view(state: AppState, *, refresh_status):
             c.query_prefix = query_prefix_field.value or ""
             c.query_suffix = query_suffix_field.value or ""
             c.query_negatives = query_negatives_field.value or ""
+            c.unload_llm_during_ingest = bool(unload_llm_sw.value)
+            try:
+                c.embed_batch_size = max(1, int(embed_batch_field.value or 16))
+            except ValueError:
+                pass
             c.use_rag = bool(use_corpus.value)
             c.enable_ocr = bool(enable_ocr.value)
             c.enable_contextual = bool(contextual.value)
@@ -2577,6 +2685,31 @@ def build_settings_view(state: AppState, *, refresh_status):
                             query_suffix_field,
                             query_negatives_field,
                         ),
+                    ),
+                ],
+                spacing=14,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            ),
+            ft.Row(
+                [
+                    ft.Container(
+                        expand=1,
+                        content=section_card(
+                            "INGEST PERFORMANCE",
+                            unload_llm_sw,
+                            ft.Row([embed_batch_field],
+                                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                            ft.Text(
+                                "Higher batch sizes use more memory but ingest "
+                                "faster on a strong GPU. Unloading the chat LLM "
+                                "is auto-skipped when Contextual Retrieval is on.",
+                                size=11, color=ON_SURFACE_DIM, italic=True,
+                            ),
+                        ),
+                    ),
+                    ft.Container(
+                        expand=1,
+                        content=_build_storage_card(state),
                     ),
                 ],
                 spacing=14,
@@ -2771,6 +2904,194 @@ def build_welcome(state: AppState, *, on_open_workspace):
 # Toast helper
 # ============================================================================
 
+def open_manage_rags_overlay(
+    page: ft.Page,
+    *,
+    on_open_workspace,
+    on_change=None,
+) -> None:
+    """A panel that lists every RAG in the default folder with Open / Export
+    / Delete actions, plus an Import-zip button to drop a previously-exported
+    archive into the folder as a new RAG."""
+    overlay_ref: dict = {}
+
+    def close_it(_=None):
+        ov = overlay_ref.get("overlay")
+        if ov is None:
+            return
+        ov.visible = False
+        try:
+            if ov in page.overlay:
+                page.overlay.remove(ov)
+            for picker in (zip_picker,):
+                if picker in page.services:
+                    page.services.remove(picker)
+        except Exception:
+            pass
+        page.update()
+
+    rows_col = ft.Column([], spacing=6, scroll=ft.ScrollMode.AUTO)
+    info_text = ft.Text("", size=12, color=ON_SURFACE_DIM)
+    zip_picker = ft.FilePicker()
+    page.services.append(zip_picker)
+
+    def fmt_bytes(n: int) -> str:
+        n = float(n)
+        for unit in ("B", "KB", "MB", "GB"):
+            if n < 1024 or unit == "GB":
+                return f"{n:.1f} {unit}" if unit != "B" else f"{n:.0f} {unit}"
+            n /= 1024
+        return f"{n:.1f} GB"
+
+    def refresh_rows():
+        rags = list_managed_rags()
+        rows_col.controls.clear()
+        if not rags:
+            rows_col.controls.append(ft.Text(
+                f"No RAGs found in {get_default_rags_dir()}.\n"
+                "Create one with the ⨁ icon in the header, or change the "
+                "Default RAGs folder in Settings → Storage.",
+                size=12, color=ON_SURFACE_DIM, italic=True,
+            ))
+            info_text.value = ""
+            page.update()
+            return
+        info_text.value = (
+            f"{len(rags)} RAG(s) in {get_default_rags_dir()}"
+        )
+        for ws in rags:
+            from ez_rag.index import read_stats
+            stats = read_stats(ws.meta_db_path) or {}
+            n_files = stats.get("files", 0)
+            n_chunks = stats.get("chunks", 0)
+            idx_size = ws.index_size_bytes()
+
+            def make_open(p):
+                return lambda _: (close_it(), on_open_workspace(p))
+
+            def make_export(w=ws):
+                async def _do():
+                    out_path = await zip_picker.save_file(
+                        dialog_title=f"Export {w.root.name} as…",
+                        file_name=f"{w.root.name}.zip",
+                        allowed_extensions=["zip"],
+                    )
+                    if not out_path:
+                        return
+                    try:
+                        dest = w.export_archive(Path(out_path))
+                        _toast(page, f"Exported → {dest.name} "
+                                     f"({dest.stat().st_size:,} bytes)")
+                    except Exception as ex:
+                        _toast(page, f"Export failed: {ex}")
+                return lambda _: page.run_task(_do)
+
+            def make_delete(w=ws):
+                def _delete(_):
+                    try:
+                        import shutil
+                        shutil.rmtree(w.root)
+                        _toast(page, f"Deleted {w.root.name}")
+                        refresh_rows()
+                        if on_change:
+                            on_change()
+                    except Exception as ex:
+                        _toast(page, f"Delete failed: {ex}")
+                return _delete
+
+            row = ft.Container(
+                padding=ft.padding.symmetric(horizontal=12, vertical=10),
+                bgcolor=SURFACE_DARK_HI,
+                border=ft.border.all(1, "#262938"),
+                border_radius=10,
+                content=ft.Row([
+                    ft.Icon(ft.Icons.FOLDER, size=18, color=ACCENT),
+                    ft.Column([
+                        ft.Text(ws.root.name, size=13,
+                                weight=ft.FontWeight.W_700, color=ON_SURFACE),
+                        ft.Text(
+                            f"{n_files} files · {n_chunks} chunks · "
+                            f"index {fmt_bytes(idx_size)}",
+                            size=11, color=ON_SURFACE_DIM,
+                        ),
+                    ], spacing=2, tight=True, expand=True),
+                    ft.OutlinedButton("Open", icon=ft.Icons.PLAY_ARROW,
+                                      on_click=make_open(ws.root)),
+                    ft.OutlinedButton("Export", icon=ft.Icons.DOWNLOAD,
+                                      on_click=make_export()),
+                    ft.OutlinedButton("Delete", icon=ft.Icons.DELETE,
+                                      on_click=make_delete()),
+                ], spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            )
+            rows_col.controls.append(row)
+        page.update()
+
+    def import_zip(_):
+        async def _do():
+            files = await zip_picker.pick_files(
+                dialog_title="Pick a .zip exported from ez-rag",
+                allowed_extensions=["zip"],
+            )
+            if not files:
+                return
+            arc = Path(files[0].path)
+            target_parent = get_default_rags_dir()
+            into = target_parent / arc.stem
+            if into.exists():
+                into = target_parent / f"{arc.stem}-imported"
+            try:
+                target_parent.mkdir(parents=True, exist_ok=True)
+                Workspace.import_archive(arc, into)
+                _toast(page, f"Imported → {into.name}")
+                refresh_rows()
+                if on_change:
+                    on_change()
+            except Exception as ex:
+                _toast(page, f"Import failed: {ex}")
+        page.run_task(_do)
+
+    title_row = ft.Row([
+        ft.Icon(ft.Icons.STORAGE, color=ACCENT),
+        ft.Text("Manage RAGs", size=18, weight=ft.FontWeight.W_700,
+                color=ON_SURFACE),
+        ft.Container(expand=True),
+        ft.OutlinedButton("Import .zip…", icon=ft.Icons.UPLOAD_FILE,
+                          on_click=import_zip),
+        ft.IconButton(icon=ft.Icons.REFRESH, on_click=lambda _: refresh_rows(),
+                      tooltip="Re-scan default folder"),
+        ft.IconButton(icon=ft.Icons.CLOSE, on_click=close_it,
+                      tooltip="Close"),
+    ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=8)
+
+    panel = ft.Container(
+        bgcolor=SURFACE_DARK,
+        border=ft.border.all(1, "#262938"),
+        border_radius=14,
+        padding=20,
+        width=820,
+        height=600,
+        content=ft.Column([
+            title_row,
+            info_text,
+            ft.Divider(color="#262938"),
+            ft.Container(content=rows_col, expand=True),
+        ], spacing=10, expand=True),
+    )
+
+    overlay = ft.Container(
+        expand=True, visible=True,
+        bgcolor=ft.Colors.with_opacity(0.55, "#000000"),
+        alignment=ft.Alignment.CENTER,
+        on_click=close_it,
+        content=ft.Container(on_click=lambda e: None, content=panel),
+    )
+    overlay_ref["overlay"] = overlay
+    page.overlay.append(overlay)
+    refresh_rows()
+    page.update()
+
+
 def open_create_rag_overlay(
     page: ft.Page,
     *,
@@ -2781,7 +3102,7 @@ def open_create_rag_overlay(
     folders. Each folder's supported files are copied into the new
     workspace's docs/. The user picks a base parent dir + name; we slug it.
     """
-    parent = default_parent or (Path.home() / "ez-rag-workspaces")
+    parent = default_parent or get_default_rags_dir()
 
     overlay_ref: dict = {}
     def close_it(_=None):
@@ -3166,6 +3487,7 @@ def app(page: ft.Page):
     )
     settings_view, load_settings = build_settings_view(
         state, refresh_status=refresh_status,
+        on_pick_workspace=set_workspace_path,
     )
     load_settings_cb = {"fn": load_settings}
     doctor_view, refresh_doctor = build_doctor_view(state)
