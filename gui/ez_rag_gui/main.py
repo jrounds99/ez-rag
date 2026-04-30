@@ -1508,10 +1508,10 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
             "running": True,
         }
 
-        SNIPPET_REFRESH_S = 5     # snippet card refresh cadence
-        SLOW_THRESHOLD_S = 15     # no progress for this long → log "slow"
-        STALL_THRESHOLD_S = 60    # → log "stalled" warning
-        WATCHDOG_TICK_S = 1       # how often the heartbeat runs
+        SNIPPET_REFRESH_S = 3     # snippet card refresh cadence
+        SLOW_THRESHOLD_S = 10     # no progress for this long → log "slow"
+        STALL_THRESHOLD_S = 45    # → log "stalled" warning
+        WATCHDOG_TICK_S = 0.5     # how often the heartbeat runs
 
         def fmt_bytes(n: int) -> str:
             n = float(n)
@@ -1670,9 +1670,11 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                 refresh_status()
                 state.page.update()
 
-        # Watchdog as a plain thread (not page.run_thread) so the periodic
-        # tick doesn't compete with worker for the same context.
-        threading.Thread(target=watchdog, daemon=True).start()
+        # Both run via page.run_thread — Flet 0.84 silently drops
+        # page.update() calls made from a vanilla threading.Thread context,
+        # which would freeze the meta line / stall warnings here. The
+        # underlying executor handles >1 concurrent thread fine.
+        state.page.run_thread(watchdog)
         state.page.run_thread(worker)
 
     ingest_card = section_card(

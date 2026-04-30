@@ -132,18 +132,42 @@ def ingest(
     stats = IngestStats()
     t0 = time.perf_counter()
 
+    bytes_done = 0
+    files_done = 0
+    chunks_done = 0
+
+    def _early_snap(status: str, files_total: int = 0, bytes_total: int = 0) -> IngestProgress:
+        elapsed = time.perf_counter() - t0
+        return IngestProgress(
+            status=status,
+            files_done=files_done, files_total=files_total,
+            bytes_done=bytes_done, bytes_total=bytes_total,
+            chunks_done=chunks_done,
+            elapsed_s=elapsed,
+            db_bytes=_db_size(ws.meta_db_path),
+        )
+
+    # Pre-ingest narration so the UI never looks frozen during setup.
+    _emit(progress, _early_snap("starting…"))
+    _emit(progress, _early_snap("loading embedder (downloads on first use)"))
     embedder = make_embedder(cfg)
+    _emit(progress, _early_snap(f"embedder ready ({embedder.name}, {embedder.dim}d)"))
+    _emit(progress, _early_snap("opening vector index"))
     index = Index(ws.meta_db_path, embed_dim=embedder.dim)
+    _emit(progress, _early_snap("scanning docs/"))
 
     docs_dir = ws.docs_dir
     docs_dir.mkdir(parents=True, exist_ok=True)
     files = _walk_docs(docs_dir)
     stats.files_seen = len(files)
+    _emit(progress, _early_snap(
+        f"found {len(files)} files — measuring", files_total=len(files),
+    ))
     bytes_total = sum(p.stat().st_size for p in files)
-
-    bytes_done = 0
-    files_done = 0
-    chunks_done = 0
+    _emit(progress, _early_snap(
+        f"{len(files)} files · {bytes_total/1e6:.1f} MB to process",
+        files_total=len(files), bytes_total=bytes_total,
+    ))
 
     def snapshot(*, current_path: str = "", status: str = "",
                  page: int | None = None, snippet: str = "") -> IngestProgress:
@@ -225,7 +249,25 @@ def ingest(
                 status=f"embedding {len(chunks)} chunks",
                 page=sample.page, snippet=snippet,
             ))
-            vecs = embedder.embed(embed_texts)
+            # Embed in mini-batches so the UI updates during long embedding
+            # passes (big PDFs with hundreds of chunks). For tiny files this
+            # is still effectively a single call.
+            BATCH = 16
+            import numpy as np
+            vec_chunks = []
+            for i in range(0, len(embed_texts), BATCH):
+                batch = embed_texts[i : i + BATCH]
+                vec_chunks.append(np.asarray(embedder.embed(batch),
+                                             dtype=np.float32))
+                if len(embed_texts) > BATCH:
+                    _emit(progress, snapshot(
+                        current_path=rel,
+                        status=f"embedding {min(i + BATCH, len(embed_texts))}"
+                               f"/{len(embed_texts)} chunks",
+                        page=sample.page, snippet=snippet,
+                    ))
+            vecs = np.concatenate(vec_chunks, axis=0) if vec_chunks else \
+                   np.zeros((0, embedder.dim), dtype=np.float32)
             rows = []
             for c, v in zip(chunks, vecs):
                 rows.append((c.ord, c.page, c.section, c.text, _tokenize(c.text), v))
