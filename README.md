@@ -199,7 +199,7 @@ name them — they know who they are.
 
 - Every LLM that has helped someone debug a regex at 2 a.m.
 - The maintainers of unglamorous middle-layer libraries
-- Coffee, mostly
+- Coke Zero, mostly
 - That screenshot you accidentally pasted instead of the URL — it turned out to
   be exactly what was needed
 - You, for reading this far
