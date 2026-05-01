@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ez_rag.parsers import _text_looks_garbled
+from ez_rag.parsers import _collapse_table_runs, _text_looks_garbled
 
 
 PASS, FAIL = [], []
@@ -106,6 +106,61 @@ def main():
     check("whitespace -> False", _text_looks_garbled("   \n\n  ") is False, "")
     check("None-style 'no text' -> False",
           _text_looks_garbled(None or "") is False, "")
+
+    print("\n[9] table-column flattening (the 'No, No, No' case) collapses")
+    # Reproduces the screenshot: a "Ritual" column extracted as a sequence
+    # of identical short lines. This is what we want to compress.
+    sample9 = (
+        "The Spells table lists the new spells.\n"
+        "Ritual\n"
+        + "No\n" * 18
+        + "Yes\n"
+        + "No\n" * 5
+    )
+    out9 = _collapse_table_runs(sample9)
+    check("18× 'No' run collapsed to single line",
+          "No (×18)" in out9, f"got:\n{out9}")
+    check("intervening 'Yes' preserved",
+          "Yes" in out9, "")
+    # The trailing 5× 'No' is below the threshold (need 6+) — left alone
+    n_lone_no = sum(1 for line in out9.split("\n") if line.strip() == "No")
+    check("sub-threshold run NOT collapsed",
+          n_lone_no == 5, f"expected 5 standalone 'No' lines; got {n_lone_no}\n{out9}")
+
+    print("\n[10] long-line repetition is NOT collapsed (only short cells)")
+    sample10 = (
+        "The quick brown fox jumps over the lazy dog.\n" * 8
+    )
+    out10 = _collapse_table_runs(sample10)
+    check("long-line repetition left alone",
+          "(×" not in out10, f"unexpectedly collapsed: {out10!r}")
+
+    print("\n[11] sub-threshold short-line repetition is NOT collapsed")
+    sample11 = "OK\nOK\nOK\nOK\n"   # 4 reps — under the 6 threshold
+    out11 = _collapse_table_runs(sample11)
+    check("4× short-line repetition left alone",
+          "(×" not in out11, f"unexpectedly collapsed: {out11!r}")
+
+    print("\n[12] mixed page with one bad column doesn't lose normal prose")
+    sample12 = (
+        "Border collies are remarkably intelligent dogs.\n"
+        "They were bred for herding sheep.\n"
+        "Ritual\n"
+        + "No\n" * 10 +
+        "Their stare is called the eye.\n"
+    )
+    out12 = _collapse_table_runs(sample12)
+    check("normal prose preserved across collapsed run",
+          "Border collies" in out12 and "stare is called" in out12,
+          f"got:\n{out12}")
+    check("the run was collapsed",
+          "No (×10)" in out12, "")
+
+    print("\n[13] empty / single-line input — no crashes")
+    check("empty -> empty",
+          _collapse_table_runs("") == "", "")
+    check("single line -> unchanged",
+          _collapse_table_runs("just one line") == "just one line", "")
 
     print(f"\n=== Garbled-detector summary: {len(PASS)} pass, {len(FAIL)} fail ===")
     if FAIL:

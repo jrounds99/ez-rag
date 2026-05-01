@@ -45,10 +45,59 @@ def supported_extensions() -> set[str]:
 
 # ----- helpers ---------------------------------------------------------------
 
+def _collapse_table_runs(text: str) -> str:
+    """Collapse pathological table-column-flattening runs.
+
+    PDFs are 2D, but text extraction serializes them to 1D. When a table
+    has many rows with the same short value in one column (e.g. a Spells
+    table where most spells have Ritual=No), extraction often produces:
+
+        Ritual
+        No
+        No
+        No
+        No
+        ...   (× 47 more)
+
+    Without context (spell name / school / level), each "No" is
+    meaningless — but it competes for chunk space and pollutes
+    retrieval. Detect runs of 6+ identical short (≤ 12 char) lines and
+    collapse to "<value> (×N)" so the table column is acknowledged
+    once but doesn't dominate.
+
+    Conservative thresholds — won't touch normal repetition like a
+    poem refrain or a few sequential bullet points.
+    """
+    if not text:
+        return text
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        # Only consider short non-empty lines as "column-cell candidates"
+        if stripped and len(stripped) <= 12:
+            j = i + 1
+            while j < len(lines) and lines[j].strip() == stripped:
+                j += 1
+            run = j - i
+            if run >= 6:
+                # Preserve any leading whitespace from the first line so
+                # bulleted/indented content still looks consistent.
+                lead = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
+                out.append(f"{lead}{stripped} (×{run})")
+                i = j
+                continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def _normalize(text: str) -> str:
     text = text.replace("\x00", "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
+    text = _collapse_table_runs(text)
     return text.strip()
 
 
