@@ -1,0 +1,10 @@
+# Runtime deps for the exported ez-rag chatbot.
+# Pinned to known-working ranges. Install with `pip install -r requirements.txt`.
+numpy>=1.26
+httpx>=0.27
+fastembed>=0.5
+tomli>=2.0; python_version<"3.11"
+# Used only when PDF source files are bundled — allows clicking a citation
+# chip to render the cited PDF page on the fly. ~30 MB install. The server
+# degrades gracefully if it's missing.
+pypdfium2>=4.20

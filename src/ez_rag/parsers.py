@@ -66,13 +66,20 @@ def parse_text(path: Path) -> list[ParsedSection]:
 # ----- PDF -------------------------------------------------------------------
 
 @register(".pdf")
-def parse_pdf(path: Path) -> list[ParsedSection]:
+def parse_pdf(path: Path, on_progress=None) -> list[ParsedSection]:
+    """Parse a PDF page-by-page.
+
+    `on_progress(page, total, ocr=False)` — if given, called after each page
+    so callers can surface live progress for big PDFs (which can otherwise
+    block for minutes with no UI feedback).
+    """
     try:
         from pypdf import PdfReader  # type: ignore
     except ImportError as e:
         raise RuntimeError("pypdf not installed; required for PDF parsing") from e
     sections: list[ParsedSection] = []
     reader = PdfReader(str(path))
+    total = len(reader.pages)
     page_texts: list[str] = []
     for i, page in enumerate(reader.pages, start=1):
         try:
@@ -82,18 +89,23 @@ def parse_pdf(path: Path) -> list[ParsedSection]:
         page_texts.append(t)
         if t.strip():
             sections.append(ParsedSection(text=_normalize(t), page=i))
+        if on_progress:
+            try:
+                on_progress(i, total, ocr=False)
+            except Exception:
+                pass
 
     # If we extracted almost nothing, the PDF is likely scanned. Fall back to
     # OCR over rendered pages, lazily importing OCR + a renderer.
     total_chars = sum(len(t) for t in page_texts)
-    if total_chars < 50 * max(1, len(reader.pages)):
-        ocr_sections = _ocr_pdf_pages(path)
+    if total_chars < 50 * max(1, total):
+        ocr_sections = _ocr_pdf_pages(path, on_progress=on_progress)
         if ocr_sections:
             return ocr_sections
     return sections
 
 
-def _ocr_pdf_pages(path: Path) -> list[ParsedSection]:
+def _ocr_pdf_pages(path: Path, on_progress=None) -> list[ParsedSection]:
     """Render PDF pages to images and OCR them. Returns [] if deps missing."""
     try:
         from pypdf import PdfReader  # noqa: F401  (already required)
@@ -107,13 +119,19 @@ def _ocr_pdf_pages(path: Path) -> list[ParsedSection]:
     from .ocr import ocr_image  # local import to avoid circular at top
     sections: list[ParsedSection] = []
     pdf = pdfium.PdfDocument(str(path))
-    for i in range(len(pdf)):
+    total = len(pdf)
+    for i in range(total):
         page = pdf[i]
         bitmap = page.render(scale=2.0)
         pil = bitmap.to_pil()
         text = ocr_image(pil) or ""
         if text.strip():
             sections.append(ParsedSection(text=_normalize(text), page=i + 1, meta={"ocr": True}))
+        if on_progress:
+            try:
+                on_progress(i + 1, total, ocr=True)
+            except Exception:
+                pass
     return sections
 
 

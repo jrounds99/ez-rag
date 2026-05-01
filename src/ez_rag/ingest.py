@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .chapters import detect_chapters
 from .chunker import Chunk, chunk_sections
 from .config import Config
 from .embed import Embedder, make_embedder
@@ -129,13 +130,25 @@ def ingest(
     force: bool = False,
     progress: ProgressCb | None = None,
 ) -> IngestStats:
+    # ★ FIRST EMIT — happens within microseconds of the call so the UI's
+    # "Starting…" placeholder never sits there for more than one frame.
+    # We pass None for ws-derived size so it's truly cheap.
+    t0 = time.perf_counter()
+    if progress is not None:
+        try:
+            progress(IngestProgress(status="ez-rag ingest waking up…"))
+        except TypeError:
+            try: progress("", "ez-rag ingest waking up…")
+            except Exception: pass
+
     cfg = cfg or ws.load_config()
     stats = IngestStats()
-    t0 = time.perf_counter()
 
     bytes_done = 0
     files_done = 0
     chunks_done = 0
+    chunks_in_progress = 0
+    file_bytes_in_progress = 0
 
     def _early_snap(status: str, files_total: int = 0, bytes_total: int = 0) -> IngestProgress:
         elapsed = time.perf_counter() - t0
@@ -148,51 +161,202 @@ def ingest(
             db_bytes=_db_size(ws.meta_db_path),
         )
 
-    # Pre-ingest narration so the UI never looks frozen during setup.
-    _emit(progress, _early_snap("starting…"))
+    # ----- "Still working" heartbeat for slow blocking phases ------------
+    # Some setup phases (fastembed first-run weight download, big-PDF
+    # parse, etc.) block for 10-90 seconds inside a single library call
+    # we can't instrument. This heartbeat thread runs in parallel and
+    # emits a friendly "still loading X — Ns elapsed" message every 2s
+    # until told to stop. Stops cleanly via the stop_evt flag.
+    import threading as _t
 
-    # Optional: unload the chat LLM from VRAM so embedding has the whole GPU.
-    # Only safe when contextual retrieval is OFF (otherwise we need the LLM
-    # for per-chunk context summaries).
-    if (getattr(cfg, "unload_llm_during_ingest", True)
-            and not cfg.enable_contextual
-            and detect_backend(cfg) == "ollama"):
-        _emit(progress, _early_snap(
-            f"unloading {cfg.llm_model} to free VRAM"
-        ))
+    def _start_heartbeat(label_fn, stop_evt):
+        """label_fn() → current message; called every 2s with elapsed."""
+        def _beat():
+            n = 0
+            while not stop_evt.wait(2.0):
+                n += 1
+                try:
+                    msg = label_fn(n * 2)
+                    _emit(progress, _early_snap(msg))
+                except Exception:
+                    break
+        thr = _t.Thread(target=_beat, daemon=True)
+        thr.start()
+        return thr
+
+    # ----- Pre-ingest narration ------------------------------------------
+    _emit(progress, _early_snap(
+        "checking which backend you're configured for "
+        "(Ollama / llama.cpp / none)…"
+    ))
+    backend_t0 = time.perf_counter()
+    backend = detect_backend(cfg)
+    backend_dt = time.perf_counter() - backend_t0
+    if backend == "ollama":
+        backend_blurb = (
+            f"  ↪ Ollama is alive at {cfg.llm_url} "
+            f"(probed in {backend_dt*1000:.0f}ms)"
+        )
+    elif backend == "llama-cpp":
+        backend_blurb = "  ↪ llama-cpp-python detected"
+    else:
+        backend_blurb = (
+            "  ↪ no LLM backend reachable — that's fine if Contextual "
+            "Retrieval is off (chat will just have no LLM)"
+        )
+    _emit(progress, _early_snap(backend_blurb))
+
+    will_unload = (
+        getattr(cfg, "unload_llm_during_ingest", True)
+        and not cfg.enable_contextual
+        and backend == "ollama"
+    )
+    will_contextualize = cfg.enable_contextual and backend != "none"
+    SETUP_STEPS = (1 if will_unload else 0) + 4
+    step = [0]
+
+    def _step_msg(label: str) -> str:
+        step[0] += 1
+        return f"[{step[0]}/{SETUP_STEPS}] {label}"
+
+    plan_bits = [
+        f"backend={backend}",
+        f"embedder={cfg.embedder_model if cfg.embedder_provider == 'fastembed' else cfg.ollama_embed_model}",
+        f"contextual={'ON' if cfg.enable_contextual else 'off'}",
+        f"chunk_size={cfg.chunk_size}",
+        f"top_k={cfg.top_k}",
+    ]
+    if will_contextualize:
+        plan_bits.append("⚠ slow: 1 LLM call per chunk")
+    _emit(progress, _early_snap(
+        f"plan · {' · '.join(plan_bits)}"
+    ))
+
+    if will_unload:
+        t = time.perf_counter()
+        _emit(progress, _early_snap(_step_msg(
+            f"unloading chat LLM '{cfg.llm_model}' from VRAM "
+            "(frees ~22 GB for the embedder)…"
+        )))
         unload_ollama_model(cfg.llm_url, cfg.llm_model)
+        _emit(progress, _early_snap(
+            f"  ↪ unloaded in {time.perf_counter() - t:.1f}s"
+        ))
 
-    _emit(progress, _early_snap("loading embedder (downloads on first use)"))
-    embedder = make_embedder(cfg)
-    _emit(progress, _early_snap(f"embedder ready ({embedder.name}, {embedder.dim}d)"))
-    _emit(progress, _early_snap("opening vector index"))
+    # Embedder load — the most likely place to actually be slow on
+    # first run (fastembed downloads ONNX weights). Heartbeat thread
+    # emits "still loading…  Ns elapsed" every 2s.
+    t = time.perf_counter()
+    is_fastembed = (
+        cfg.embedder_provider == "fastembed"
+        or (cfg.embedder_provider == "auto" and backend != "ollama")
+    )
+    if is_fastembed:
+        emb_label = cfg.embedder_model
+        _emit(progress, _early_snap(_step_msg(
+            f"loading embedder '{emb_label}' into RAM "
+            "(if first run, downloading ~150 MB-1 GB of ONNX weights "
+            "from HuggingFace — be patient)…"
+        )))
+    else:
+        emb_label = cfg.ollama_embed_model
+        _emit(progress, _early_snap(_step_msg(
+            f"loading embedder '{emb_label}' on Ollama — "
+            "weights load to GPU VRAM…"
+        )))
+    stop_evt = _t.Event()
+    _start_heartbeat(
+        lambda secs: (
+            f"  ↪ still loading '{emb_label}'… {secs}s elapsed "
+            "(this is normal on first run)"
+        ),
+        stop_evt,
+    )
+    try:
+        embedder = make_embedder(cfg)
+    finally:
+        stop_evt.set()
+    _emit(progress, _early_snap(
+        f"  ↪ embedder ready in {time.perf_counter() - t:.1f}s — "
+        f"{embedder.name} produces {embedder.dim}-dimensional vectors"
+    ))
+
+    t = time.perf_counter()
+    _emit(progress, _early_snap(_step_msg(
+        "opening vector index (SQLite + FTS5)…"
+    )))
     index = Index(ws.meta_db_path, embed_dim=embedder.dim)
-    _emit(progress, _early_snap("scanning docs/"))
+    db_size = _db_size(ws.meta_db_path)
+    _emit(progress, _early_snap(
+        f"   ↪ done in {time.perf_counter() - t:.1f}s — "
+        f"existing index: {db_size/1e6:.1f} MB on disk"
+    ))
 
+    t = time.perf_counter()
+    _emit(progress, _early_snap(_step_msg(
+        f"scanning {ws.docs_dir.name}/ for supported file types…"
+    )))
     docs_dir = ws.docs_dir
     docs_dir.mkdir(parents=True, exist_ok=True)
     files = _walk_docs(docs_dir)
     stats.files_seen = len(files)
     _emit(progress, _early_snap(
-        f"found {len(files)} files — measuring", files_total=len(files),
+        f"   ↪ done in {time.perf_counter() - t:.1f}s — "
+        f"found {len(files)} ingestible file(s)"
     ))
+
+    t = time.perf_counter()
+    _emit(progress, _early_snap(_step_msg(
+        "measuring file sizes & extension breakdown…"
+    )))
     bytes_total = sum(p.stat().st_size for p in files)
+    # Quick ext breakdown so user knows what's coming
+    ext_counts: dict[str, int] = {}
+    for p in files:
+        ext_counts[p.suffix.lower()] = ext_counts.get(p.suffix.lower(), 0) + 1
+    breakdown = ", ".join(
+        f"{n} {e or '(no ext)'}" for e, n in
+        sorted(ext_counts.items(), key=lambda kv: -kv[1])
+    ) or "no files"
     _emit(progress, _early_snap(
-        f"{len(files)} files · {bytes_total/1e6:.1f} MB to process",
+        f"   ↪ {len(files)} files · {bytes_total/1e6:.1f} MB total · "
+        f"{breakdown}"
+    ))
+
+    # Big-batch warnings — give the user a heads-up if this run will be slow
+    if will_contextualize and len(files) > 5:
+        _emit(progress, _early_snap(
+            f"⚠ Contextual Retrieval is ON: ~1 LLM call per chunk × "
+            f"{len(files)} files. Expect this to take a long time. "
+            "Cancel and disable Contextual Retrieval if that's not what you want."
+        ))
+    if backend == "none":
+        _emit(progress, _early_snap(
+            "ℹ no LLM detected — chat will fall back to retrieval-only "
+            "passage display. Ingest doesn't need an LLM unless Contextual "
+            "Retrieval is on."
+        ))
+
+    _emit(progress, _early_snap(
+        "starting per-file processing…",
         files_total=len(files), bytes_total=bytes_total,
     ))
 
     def snapshot(*, current_path: str = "", status: str = "",
                  page: int | None = None, snippet: str = "") -> IngestProgress:
         elapsed = time.perf_counter() - t0
-        rate = (bytes_done / elapsed) if elapsed > 0 and bytes_done > 0 else 0.0
-        eta = ((bytes_total - bytes_done) / rate) if rate > 0 else None
+        # Mid-file in-flight numbers feed the headline bar so it never
+        # sits at "0 chunks / 0 B" while a giant file is still grinding.
+        live_bytes = bytes_done + file_bytes_in_progress
+        live_chunks = chunks_done + chunks_in_progress
+        rate = (live_bytes / elapsed) if elapsed > 0 and live_bytes > 0 else 0.0
+        eta = ((bytes_total - live_bytes) / rate) if rate > 0 else None
         return IngestProgress(
             current_path=current_path, status=status, page=page,
             snippet=snippet,
             files_done=files_done, files_total=len(files),
-            bytes_done=bytes_done, bytes_total=bytes_total,
-            chunks_done=chunks_done,
+            bytes_done=live_bytes, bytes_total=bytes_total,
+            chunks_done=live_chunks,
             elapsed_s=elapsed, eta_s=eta, rate_bps=rate,
             db_bytes=_db_size(ws.meta_db_path),
         )
@@ -225,38 +389,130 @@ def ingest(
                 bytes_done += file_size
                 files_done += 1
                 continue
-            sections = parser(path)
+
+            # Throttled per-page callback — keeps the UI alive on big PDFs
+            # without spamming page.update() for every page of a 200pp book.
+            last_emit_t = [time.perf_counter()]
+
+            def page_cb(page_idx: int, total_pages: int, ocr: bool = False) -> None:
+                now = time.perf_counter()
+                # Throttle to ~10 fps (was 5) so tickers feel live, but
+                # always emit on the last page so the final state lands.
+                if (now - last_emit_t[0]) < 0.1 and page_idx != total_pages:
+                    return
+                last_emit_t[0] = now
+                label = "OCR'ing" if ocr else "parsing"
+                # Include rate + ETA so the user can see we're not stuck
+                # on a hard page (some pages take 5-10× as long as others).
+                elapsed = now - parse_started[0]
+                rate = page_idx / elapsed if elapsed > 0 else 0.0
+                eta_s = ((total_pages - page_idx) / rate) if rate > 0 else 0.0
+                eta_str = (f" · ETA {int(eta_s)}s"
+                           if 0 < eta_s < 9999 else "")
+                _emit(progress, snapshot(
+                    current_path=rel,
+                    status=(f"{label} page {page_idx}/{total_pages} "
+                            f"({rate:.1f} pg/s{eta_str})"),
+                    page=page_idx,
+                ))
+
+            # Tracked separately from last_emit_t so the rate calc is
+            # measured from the start of THIS parse, not the throttle.
+            parse_started = [time.perf_counter()]
+
+            parse_t0 = time.perf_counter()
+            try:
+                sections = parser(path, on_progress=page_cb)
+            except TypeError:
+                # Parser predates the on_progress kwarg — call without it.
+                sections = parser(path)
+            parse_s = time.perf_counter() - parse_t0
             if not sections:
                 bytes_done += file_size
                 files_done += 1
-                _emit(progress, snapshot(current_path=rel, status="empty"))
+                _emit(progress, snapshot(
+                    current_path=rel,
+                    status=f"empty — parser found no extractable text "
+                           f"({parse_s:.1f}s)",
+                ))
                 continue
+            # After parse completes, give the user a "what we got" line so
+            # they can see the file actually had content before chunking
+            # starts. Useful for big PDFs that took minutes to parse.
+            sec_summary = f"{len(sections)} section(s)"
+            if any(s.page is not None for s in sections):
+                pages = sorted({s.page for s in sections if s.page is not None})
+                sec_summary += f" across pages {pages[0]}–{pages[-1]}"
+            _emit(progress, snapshot(
+                current_path=rel,
+                status=(f"parsed in {parse_s:.1f}s — {sec_summary} · "
+                        f"chunking @ ~{cfg.chunk_size} tokens "
+                        f"(overlap {cfg.chunk_overlap})…"),
+            ))
+
+            chunk_t0 = time.perf_counter()
             chunks = chunk_sections(
                 sections,
                 chunk_tokens=cfg.chunk_size,
                 overlap_tokens=cfg.chunk_overlap,
             )
+            chunk_s = time.perf_counter() - chunk_t0
             if not chunks:
                 bytes_done += file_size
                 files_done += 1
                 _emit(progress, snapshot(current_path=rel, status="no chunks"))
                 continue
+            _emit(progress, snapshot(
+                current_path=rel,
+                status=(f"chunked in {chunk_s:.2f}s — {len(chunks)} chunks "
+                        f"to embed"),
+            ))
             # Pick a representative snippet (early-mid chunk) for live display.
             sample = chunks[min(len(chunks) - 1, len(chunks) // 2)]
             snippet = (sample.text or "").strip().replace("\n", " ")[:240]
 
             # Optional Anthropic-style Contextual Retrieval.
+            # Contextualization is the slowest possible phase (1 LLM call
+            # per chunk × hundreds of chunks). Track in-flight chunks +
+            # bytes so the headline counters tick smoothly while it runs.
             embed_texts = [c.text for c in chunks]
             if cfg.enable_contextual and detect_backend(cfg) != "none":
-                _emit(progress, snapshot(
-                    current_path=rel,
-                    status=f"contextualizing {len(chunks)} chunks",
-                    page=sample.page, snippet=snippet,
-                ))
                 full_text = "\n\n".join(s.text for s in sections)
-                embed_texts = [
-                    contextualize_chunk(c.text, full_text, cfg) for c in chunks
-                ]
+                ctx_t0 = time.perf_counter()
+                ctx_texts: list[str] = []
+                for ci, c in enumerate(chunks, start=1):
+                    ctx_texts.append(
+                        contextualize_chunk(c.text, full_text, cfg)
+                    )
+                    # Tick the in-flight counters every chunk so headline
+                    # numbers move even though the file isn't committed.
+                    chunks_in_progress = ci
+                    file_bytes_in_progress = int(
+                        file_size * (ci / len(chunks)) * 0.5  # ctx is half the work; embed is the other half
+                    )
+                    elapsed = time.perf_counter() - ctx_t0
+                    rate = ci / elapsed if elapsed > 0 else 0.0
+                    eta = ((len(chunks) - ci) / rate) if rate > 0 else 0.0
+                    if eta >= 60:
+                        eta_str = f"{int(eta // 60)}m{int(eta % 60):02d}s"
+                    else:
+                        eta_str = f"{int(eta)}s"
+                    # Emit every chunk — at ~3s per chunk for a reasoning
+                    # model the UI desperately needs the tick. The watchdog
+                    # also fires at 0.5s so the elapsed clock keeps moving
+                    # between chunks.
+                    # Refresh the snippet to whatever's currently being
+                    # contextualized so the snippet card doesn't sit on
+                    # a stale page-113 sample for an entire 30-min run.
+                    cur_snippet = (c.text or "").strip().replace(
+                        "\n", " ")[:240]
+                    _emit(progress, snapshot(
+                        current_path=rel,
+                        status=(f"contextualizing chunk {ci}/"
+                                f"{len(chunks)} (ETA {eta_str})"),
+                        page=c.page, snippet=cur_snippet,
+                    ))
+                embed_texts = ctx_texts
             _emit(progress, snapshot(
                 current_path=rel,
                 status=f"embedding {len(chunks)} chunks",
@@ -272,18 +528,36 @@ def ingest(
                 batch = embed_texts[i : i + BATCH]
                 vec_chunks.append(np.asarray(embedder.embed(batch),
                                              dtype=np.float32))
-                if len(embed_texts) > BATCH:
-                    _emit(progress, snapshot(
-                        current_path=rel,
-                        status=f"embedding {min(i + BATCH, len(embed_texts))}"
-                               f"/{len(embed_texts)} chunks",
-                        page=sample.page, snippet=snippet,
-                    ))
+                # Embedding is the second half of "in-progress" — count
+                # from 0.5 to 1.0 of file_size so the bar smoothly fills
+                # whether or not contextualization ran.
+                processed = min(i + BATCH, len(embed_texts))
+                base_pct = 0.5 if cfg.enable_contextual else 0.0
+                file_bytes_in_progress = int(file_size * (
+                    base_pct + (1 - base_pct) * (processed / len(embed_texts))
+                ))
+                chunks_in_progress = processed
+                # Always emit per batch (was: only when len > BATCH) — even
+                # tiny files benefit from a "embedding 4/4 chunks" tick.
+                _emit(progress, snapshot(
+                    current_path=rel,
+                    status=f"embedding {processed}/{len(embed_texts)} chunks",
+                    page=sample.page, snippet=snippet,
+                ))
             vecs = np.concatenate(vec_chunks, axis=0) if vec_chunks else \
                    np.zeros((0, embedder.dim), dtype=np.float32)
             rows = []
             for c, v in zip(chunks, vecs):
                 rows.append((c.ord, c.page, c.section, c.text, _tokenize(c.text), v))
+
+            # Chapter boundaries (PDF outline / heading sections / fallback
+            # 'Document'). Cheap — pypdf already opened the file in the
+            # parser cache. Failures here must not block ingest.
+            try:
+                chapters = detect_chapters(path, chunks)
+            except Exception:
+                chapters = []
+
             index.replace_file(
                 path=rel,
                 sha256=sha,
@@ -293,6 +567,7 @@ def ingest(
                 chunker_version=CHUNKER_VERSION,
                 embedder=embedder.name,
                 chunks=rows,
+                chapters=chapters,
             )
             stats.chunks_added += len(rows)
             chunks_done += len(rows)
@@ -302,6 +577,11 @@ def ingest(
                 stats.files_changed += 1
             bytes_done += file_size
             files_done += 1
+            # File committed — clear the in-flight counters so the next
+            # file's progress is measured from zero again (and we don't
+            # double-count what we just committed into chunks_done).
+            chunks_in_progress = 0
+            file_bytes_in_progress = 0
             _emit(progress, snapshot(
                 current_path=rel,
                 status=f"ok ({len(rows)} chunks)",
@@ -312,6 +592,8 @@ def ingest(
             stats.errors.append((str(path), repr(e)))
             bytes_done += file_size
             files_done += 1
+            chunks_in_progress = 0
+            file_bytes_in_progress = 0
             _emit(progress, snapshot(current_path=rel,
                                      status=f"ERROR: {e}"))
 

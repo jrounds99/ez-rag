@@ -13,8 +13,14 @@ A workspace is just a directory containing:
 """
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover
+    import tomli as tomllib
 
 from .config import Config
 
@@ -211,10 +217,17 @@ class Workspace:
 
 
 def find_workspace(start: Path | None = None) -> Workspace | None:
-    """Walk upward looking for a .ezrag/ directory. Returns None if not found."""
+    """Walk upward looking for a real workspace. Returns None if not found.
+
+    Requires both `<dir>/.ezrag/` AND `<dir>/.ezrag/config.toml`. The bare-
+    dir check would otherwise misidentify `~/.ezrag/` (the global config /
+    preview-cache home) as a workspace whenever the user runs ez-rag from
+    anywhere under their home directory.
+    """
     p = (start or Path.cwd()).resolve()
     for candidate in [p, *p.parents]:
-        if (candidate / WORKSPACE_MARKER).is_dir():
+        marker = candidate / WORKSPACE_MARKER
+        if marker.is_dir() and (marker / "config.toml").exists():
             return Workspace(candidate)
     return None
 
@@ -252,7 +265,14 @@ def _write_global(d: dict) -> None:
     lines = []
     for k, v in d.items():
         if isinstance(v, str):
-            lines.append(f'{k} = "{v}"')
+            # TOML literal strings (single-quoted) don't interpret backslashes,
+            # which matters for Windows paths like C:\Users\... — quoted strings
+            # would mangle them as escape sequences.
+            if "'" in v:
+                escaped = v.replace("\\", "\\\\").replace('"', '\\"')
+                lines.append(f'{k} = "{escaped}"')
+            else:
+                lines.append(f"{k} = '{v}'")
         elif isinstance(v, bool):
             lines.append(f"{k} = {'true' if v else 'false'}")
         else:
@@ -273,6 +293,17 @@ def get_default_rags_dir() -> Path:
 def set_default_rags_dir(path: Path) -> None:
     g = _read_global()
     g["default_rags_dir"] = str(Path(path).expanduser())
+    _write_global(g)
+
+
+def get_theme_name() -> str:
+    """Active GUI palette name. Defaults to 'dark'."""
+    return _read_global().get("theme", "dark") or "dark"
+
+
+def set_theme_name(name: str) -> None:
+    g = _read_global()
+    g["theme"] = name
     _write_global(g)
 
 

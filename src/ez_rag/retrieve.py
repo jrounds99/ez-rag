@@ -19,6 +19,11 @@ from .generate import (
 from .index import Hit, Index
 
 
+class EmbedderMismatchError(RuntimeError):
+    """Current embedder's vector dimension doesn't match what the index
+    was built with. Re-ingest required (or switch embedder back)."""
+
+
 def hybrid_search(
     *, query: str, embedder: Embedder, index: Index, k: int = 8, fetch: int = 30,
     use_hybrid: bool = True,
@@ -35,6 +40,33 @@ def hybrid_search(
     mat, ids = index.all_embeddings()
     if mat.shape[0] == 0:
         return []
+    # Embedder swap detection — produces a much more useful error than
+    # numpy's `matmul: Input operand 1 has a mismatch in its core
+    # dimension 0...` when the current embedder produces vectors of a
+    # different dimension than what the index was built with.
+    if qvec.shape[0] != mat.shape[1]:
+        # Read which embedder built the index for a more precise message.
+        prev = ""
+        try:
+            row = index.conn.execute(
+                "SELECT embedder FROM files ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if row and row[0]:
+                prev = row[0]
+        except Exception:
+            pass
+        prev_str = f" (built with `{prev}`)" if prev else ""
+        raise EmbedderMismatchError(
+            f"Embedder dimension mismatch: query vector is {qvec.shape[0]}-d "
+            f"but the index has {mat.shape[1]}-d vectors{prev_str}.\n\n"
+            f"This means the embedder changed since ingest. Current "
+            f"embedder: `{embedder.name}` ({embedder.dim}-d).\n\n"
+            f"Two ways to fix:\n"
+            f"  1. Re-ingest with the current embedder — Files tab → "
+            f"Re-ingest (force). Will rebuild every chunk vector.\n"
+            f"  2. Switch the embedder back in Settings to whatever built "
+            f"the index{prev_str}, then retry the question."
+        )
 
     vec_idx, vec_scores = cosine_top_k(qvec, mat, fetch_n)
     vec_chunk_ids = [ids[i] for i in vec_idx.tolist()]
@@ -63,6 +95,75 @@ def hybrid_search(
         return rerank_hits(query, hits, top_k=k,
                            model_name=rerank_model or DEFAULT_RERANKER)
     return hits[:k]
+
+
+def expand_to_chapter(
+    hits: list[Hit], index: Index, *, max_chars: int = 16000,
+) -> list[Hit]:
+    """For each hit, replace `text` with the full text of its chapter.
+
+    Chapter boundaries come from `files.chapters_json` (built at ingest
+    time from PDF bookmarks or section headings). When two hits land in
+    the same chapter, only the first keeps the expanded text — the others
+    are tagged with `source_kind='chapter-dup'` so the UI/LLM can dedupe
+    visually.
+
+    Falls back to the original hit text when no chapter metadata exists or
+    the chapter would exceed `max_chars` (in which case the original chunk
+    is kept to preserve the precise hit).
+    """
+    if not hits:
+        return hits
+    from .chapters import find_chapter
+
+    seen_ids: dict[int, str] = {}     # file_id → chapter title already used
+    chapters_by_file: dict[int, list[dict]] = {}
+    for h in hits:
+        if h.file_id not in chapters_by_file:
+            chapters_by_file[h.file_id] = index.chapters_for_file(h.file_id)
+        chapters = chapters_by_file[h.file_id]
+        if not chapters:
+            continue
+
+        # Get the hit's ord from the chunks table.
+        row = index.conn.execute(
+            "SELECT ord FROM chunks WHERE id = ?", (h.chunk_id,),
+        ).fetchone()
+        if not row:
+            continue
+        ord_ = row[0]
+        ch = find_chapter(chapters, ord_)
+        if ch is None:
+            continue
+
+        # Dedupe: only first hit in a chapter expands; later hits get
+        # marked but keep their own text (so the LLM still sees them as
+        # distinct citations and the UI can warn about overlap).
+        key = (h.file_id, ch["title"])
+        if key in seen_ids:
+            h.source_kind = "chapter-dup"
+            continue
+        seen_ids[key] = ch["title"]
+
+        rows = index.conn.execute(
+            "SELECT text FROM chunks "
+            "WHERE file_id = ? AND ord BETWEEN ? AND ? ORDER BY ord",
+            (h.file_id, ch["start_ord"], ch["end_ord"]),
+        ).fetchall()
+        if not rows:
+            continue
+        full = "\n\n".join(r[0] for r in rows if r[0])
+        if not full:
+            continue
+        if len(full) > max_chars:
+            # Chapter is too big — keep the original hit text but flag it
+            # so callers know we tried.
+            h.source_kind = "chapter-skip"
+            continue
+        h.text = full
+        h.section = ch["title"] or h.section
+        h.source_kind = "chapter"
+    return hits
 
 
 def expand_with_neighbors(hits: list[Hit], index: Index, window: int) -> list[Hit]:
@@ -187,6 +288,11 @@ def smart_retrieve(
             hits = hits[:cfg.top_k]
         if getattr(cfg, "context_window", 0) > 0:
             hits = expand_with_neighbors(hits, index, cfg.context_window)
+        if getattr(cfg, "expand_to_chapter", False):
+            hits = expand_to_chapter(
+                hits, index,
+                max_chars=int(getattr(cfg, "chapter_max_chars", 16000)),
+            )
         return hits
 
     # Multi-query: search each, fuse with RRF.
@@ -219,6 +325,11 @@ def smart_retrieve(
         candidates = candidates[:cfg.top_k]
     if getattr(cfg, "context_window", 0) > 0:
         candidates = expand_with_neighbors(candidates, index, cfg.context_window)
+    if getattr(cfg, "expand_to_chapter", False):
+        candidates = expand_to_chapter(
+            candidates, index,
+            max_chars=int(getattr(cfg, "chapter_max_chars", 16000)),
+        )
     return candidates
 
 

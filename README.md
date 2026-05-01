@@ -48,6 +48,26 @@ ez-rag chat                       # or interactive
 
 PDF (text + scanned with OCR fallback) · DOCX · XLSX · CSV · HTML · MD · TXT / RST / LOG · EPUB · EML · PNG / JPG / WEBP / TIFF / BMP (OCR'd).
 
+## Terminology
+
+The docs and the GUI use these three words deliberately — they're not interchangeable:
+
+| Term | What it means | Where it lives |
+|---|---|---|
+| **Corpus** | Your collection of source documents (the input). From linguistics, Latin for "body." | `<workspace>/docs/` |
+| **Index** | The searchable data structure ez-rag builds *from* the corpus: chunks + embeddings + BM25. | `<workspace>/.ezrag/meta.sqlite` |
+| **RAG** | **R**etrieval-**A**ugmented **G**eneration — the whole technique. Corpus + index + retrieval + LLM glued together. | The workspace as a whole |
+
+Litmus test: if `ez-rag ingest` can rebuild it, you changed the **index**. If your original files survive, the **corpus** is intact. If you only touched Settings or the model, the **corpus** and **index** are both unchanged — you changed the **RAG**'s configuration.
+
+Other recurring vocabulary:
+
+- **Embedder** / **embedding model** — small model that turns text into fixed-length vectors. Used at *both* ingest and query time. Swapping it forces a full re-ingest.
+- **Embedding** / **vector** / **dense vector** — the numeric output of the embedder. Texts with similar meaning land near each other in vector space.
+- **Reranker** / **cross-encoder** — second-stage scoring model that judges `(query, passage)` pairs jointly. Biggest single quality lift in most pipelines, ~10 ms / candidate.
+- **Chunk** — a piece of a document the embedder sees (~512 tokens by default). The thing actually retrieved.
+- **Hybrid retrieval** — fuses BM25 (keyword) and dense (vector) results via Reciprocal Rank Fusion.
+
 ## CLI
 
 ```
@@ -117,7 +137,7 @@ question → [HyDE]? → [multi-query]? → hybrid (BM25 + dense, RRF)
 | **Contextual Retrieval** *(at ingest)* | ☐ | technical / structured docs (~49 % fewer retrieval failures, but slow ingest) |
 | **Agentic mode** | ☐ | LLM iteratively reflects + re-searches when initial hits look weak. Uses your chat model by default; OpenAI / Anthropic / OpenAI-compat supported as upgrades |
 | **Query modifiers** *(prefix · suffix · negatives)* | ☐ | persistent persona / formatting / "avoid X" wrappers around every question. Per-query checkbox in the chat composer |
-| **Use corpus** | ✅ | toggle OFF in the Chat tab to A/B compare model-only vs RAG-augmented |
+| **Use RAG** | ✅ | toggle OFF in the Chat tab to A/B compare model-only vs RAG-augmented |
 
 Defaults are tuned for "drop docs, get good answers." See `ez-rag help retrieval` or the GUI's Help (?) for the empirical config matrix and when to flip what.
 

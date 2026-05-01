@@ -138,7 +138,7 @@ question and check:
 
 - **Citations** — the chips below the answer show which passages were
   used. Click them to see the exact text.
-- **`Use corpus` toggle** — turn it OFF, ask the same question. Compare. If
+- **`Use RAG` toggle** — turn it OFF, ask the same question. Compare. If
   the corpus is actually helping, the difference will be obvious.
 - **Benchmark** — `python benchmark/rag_compare.py` runs a curated Q-set
   through both modes and prints accuracy + timing.

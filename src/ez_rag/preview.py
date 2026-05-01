@@ -1,0 +1,107 @@
+"""PDF page → PNG preview cache.
+
+Renders the cited page of a PDF to an image so the chat UI can show users
+exactly what they're looking at when they click a citation chip.
+
+Cache layout (cross-workspace, single shared folder):
+    ~/.ezrag/preview_cache/{sha256(abs_path)[:16]}_p{page}.png
+
+`sweep_old_previews(days=3)` runs on app startup and deletes any image
+older than the cutoff. We do NOT delete on access — `mtime` is touched
+when an image is re-served so frequently-viewed previews effectively get a
+3-day rolling lease.
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import time
+from pathlib import Path
+
+PREVIEW_CACHE_DIR = Path.home() / ".ezrag" / "preview_cache"
+DEFAULT_TTL_DAYS = 3
+# 2.5x gives ~180 DPI when source is 72 DPI — readable on hi-DPI displays
+# and still zoomable. The cost is ~4x the bytes vs 1.5x; preview cache
+# self-evicts after 3 days so it doesn't grow forever.
+DEFAULT_RENDER_SCALE = 2.5
+
+
+def _key(pdf_path: Path, page: int) -> str:
+    abs_path = str(pdf_path.resolve())
+    digest = hashlib.sha256(abs_path.encode("utf-8")).hexdigest()[:16]
+    return f"{digest}_p{int(page)}.png"
+
+
+def cache_path_for(pdf_path: Path, page: int) -> Path:
+    PREVIEW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return PREVIEW_CACHE_DIR / _key(pdf_path, page)
+
+
+def render_pdf_page(
+    pdf_path: Path,
+    page: int,
+    *,
+    scale: float = DEFAULT_RENDER_SCALE,
+    force: bool = False,
+) -> Path | None:
+    """Render `pdf_path` page `page` (1-indexed) to PNG and return the path.
+
+    Returns None on any failure (PDF unreadable, page out of range, renderer
+    not installed). Idempotent — re-renders only when the cached file is
+    missing or `force=True`. Touches mtime on cache hits so the 3-day sweep
+    effectively becomes a 3-day rolling lease per image.
+    """
+    if page is None or page <= 0:
+        return None
+    pdf_path = Path(pdf_path)
+    if not pdf_path.is_file():
+        return None
+    out = cache_path_for(pdf_path, page)
+    if out.exists() and not force:
+        try:
+            os.utime(out, None)  # refresh mtime so the sweep treats this as fresh
+        except OSError:
+            pass
+        return out
+
+    try:
+        import pypdfium2 as pdfium  # type: ignore
+    except ImportError:
+        return None
+
+    try:
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        idx = page - 1
+        if idx < 0 or idx >= len(pdf):
+            return None
+        bitmap = pdf[idx].render(scale=scale)
+        pil = bitmap.to_pil()
+        pil.save(out, format="PNG", optimize=True)
+        return out
+    except Exception:
+        return None
+
+
+def sweep_old_previews(*, days: int = DEFAULT_TTL_DAYS) -> int:
+    """Delete cached previews older than `days`. Returns number removed.
+
+    Runs at app startup. Failures are silent — a corrupt cache shouldn't
+    prevent the GUI from starting.
+    """
+    if not PREVIEW_CACHE_DIR.is_dir():
+        return 0
+    cutoff = time.time() - (days * 86400)
+    removed = 0
+    try:
+        for f in PREVIEW_CACHE_DIR.iterdir():
+            if not f.is_file() or f.suffix.lower() != ".png":
+                continue
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return removed

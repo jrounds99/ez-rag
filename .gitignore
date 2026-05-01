@@ -34,6 +34,19 @@ benchmark/reports/*.json
 benchmark/corpus/
 ez-rag-test/
 my-rag/
+# Test RAGs the user/devs build locally — regeneratable with
+# bench/fetch_test_corpus.py and shouldn't go into git.
+test-rags/
+test_rags/
+
+# Benchmark RAW results — the harness scripts under bench/ are committed,
+# the data they produce is not.
+bench/results*.json
+bench/*.log
+
+# Claude Code session state (and any other agent breadcrumbs) — local to
+# whoever ran the agent.
+.claude/
 
 # logs
 *.log

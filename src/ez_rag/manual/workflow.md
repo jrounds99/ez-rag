@@ -80,7 +80,7 @@ Per-question pipeline:
    quality win; ~50–200 ms.
 5. **Generate**: the top-K (default 8) passages are prepended to the question
    as numbered context items. The LLM answers and cites `[1]`, `[2]`, …
-6. *(optional)* When **Use corpus** is OFF, retrieval is skipped entirely and
+6. *(optional)* When **Use RAG** is OFF, retrieval is skipped entirely and
    the LLM answers from its own knowledge — useful for A/B-comparing whether
    the corpus is actually helping.
 

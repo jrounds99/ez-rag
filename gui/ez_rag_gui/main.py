@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
@@ -28,7 +29,8 @@ from ez_rag.models import (
     LibraryModel, OllamaModel, delete_ollama_model,
     detect_total_vram_gb, estimate_vram_gb, fetch_ollama_library,
     fmt_size, fmt_vram_gb, is_embed_capable, list_ollama_models,
-    pull_ollama_model, search_library, vram_fit,
+    list_running_models, pull_ollama_model, search_library,
+    unload_ollama_model, unload_running_models, vram_fit,
 )
 from ez_rag.generate import apply_query_modifiers
 from ez_rag.parsers import supported_extensions
@@ -36,26 +38,86 @@ from ez_rag.retrieve import agentic_retrieve, hybrid_search, smart_retrieve
 from ez_rag.workspace import (
     Workspace, find_workspace,
     get_default_rags_dir, set_default_rags_dir, list_managed_rags,
+    get_theme_name, set_theme_name,
 )
 
 
 # ============================================================================
-# Theme
+# Theme — palettes loaded from themes.toml at startup. The chosen palette
+# name is persisted via workspace.get_theme_name() / set_theme_name(). Module-
+# level color constants below are *populated* by `_load_theme()` in app() so
+# every widget sees the active palette at construction time. To switch
+# themes the app saves config and restarts (live theme switching would
+# require re-walking the entire control tree).
 # ============================================================================
 
-ACCENT = "#7C7BFF"            # indigo accent
-ACCENT_SOFT = "#5856D6"
-BG_DARK = "#0F1115"           # near-black, slight blue
-SURFACE_DARK = "#171922"
-SURFACE_DARK_HI = "#1F2230"
-ON_SURFACE = "#E6E7EB"
-ON_SURFACE_DIM = "#9097A6"
-SUCCESS = "#3DDC84"
-WARNING = "#F6B042"
-DANGER = "#F75A68"
-USER_BUBBLE = "#272A39"
-ASSIST_BUBBLE = "#1A1D29"
-CHIP_BG = "#23263A"
+import sys as _sys
+if _sys.version_info >= (3, 11):
+    import tomllib as _tomllib
+else:  # pragma: no cover
+    import tomli as _tomllib  # type: ignore
+
+THEMES_FILE = Path(__file__).parent / "themes.toml"
+
+# Default palette baked into the source so a missing/corrupt themes.toml
+# never breaks the app. Mirror of the [dark] entry.
+_FALLBACK_PALETTE = {
+    "accent":         "#7C7BFF",
+    "accent_soft":    "#5856D6",
+    "bg":             "#0F1115",
+    "surface":        "#171922",
+    "surface_hi":     "#1F2230",
+    "on_surface":     "#E6E7EB",
+    "on_surface_dim": "#9097A6",
+    "success":        "#3DDC84",
+    "warning":        "#F6B042",
+    "danger":         "#F75A68",
+    "user_bubble":    "#272A39",
+    "assist_bubble":  "#1A1D29",
+    "chip_bg":        "#23263A",
+}
+
+
+def load_themes() -> dict[str, dict[str, str]]:
+    """Read themes.toml. Returns {palette_name: {key: hex, ...}}.
+    Always includes a 'dark' palette (the in-source fallback) even if the
+    file is missing or unreadable."""
+    out: dict[str, dict[str, str]] = {"dark": dict(_FALLBACK_PALETTE)}
+    try:
+        with THEMES_FILE.open("rb") as f:
+            data = _tomllib.load(f)
+        for name, palette in data.items():
+            if isinstance(palette, dict):
+                # Merge with fallback so partial palettes still work.
+                merged = dict(_FALLBACK_PALETTE)
+                merged.update({k: str(v) for k, v in palette.items()
+                               if isinstance(v, str)})
+                out[name] = merged
+    except Exception:
+        pass
+    return out
+
+
+def _apply_palette(palette: dict[str, str]) -> None:
+    """Mutate the module-level color globals from the chosen palette."""
+    g = globals()
+    g["ACCENT"] = palette["accent"]
+    g["ACCENT_SOFT"] = palette["accent_soft"]
+    g["BG_DARK"] = palette["bg"]
+    g["SURFACE_DARK"] = palette["surface"]
+    g["SURFACE_DARK_HI"] = palette["surface_hi"]
+    g["ON_SURFACE"] = palette["on_surface"]
+    g["ON_SURFACE_DIM"] = palette["on_surface_dim"]
+    g["SUCCESS"] = palette["success"]
+    g["WARNING"] = palette["warning"]
+    g["DANGER"] = palette["danger"]
+    g["USER_BUBBLE"] = palette["user_bubble"]
+    g["ASSIST_BUBBLE"] = palette["assist_bubble"]
+    g["CHIP_BG"] = palette["chip_bg"]
+
+
+# Initial bind to the fallback so module imports work before app() runs.
+_apply_palette(_FALLBACK_PALETTE)
 
 RECENTS_FILE = Path.home() / ".ezrag_recents.txt"
 MAX_RECENTS = 8
@@ -89,7 +151,26 @@ TIP = {
     "send_btn":       "Send the message (Enter).",
     "stop_btn":       "Stop generation. The partial answer is kept.",
     "clear_btn":      "Start a fresh conversation. The model loses prior turns.",
-    "rag_toggle":     "USE CORPUS — when ON, ez-rag retrieves from your docs "
+    "free_vram_btn":   "Evict every model currently resident in Ollama's "
+                      "VRAM (`ollama stop` for each loaded tag). Use when "
+                      "you suspect a model is stuck, before switching "
+                      "models, or when you need GPU memory back for "
+                      "something else. The next chat will transparently "
+                      "reload on demand. If a soft unload doesn't help, "
+                      "kill ollama.exe from Task Manager.",
+    "test_model_btn":  "Quick health check — sends a 1-token request to "
+                      "your configured LLM and prints the verbatim result "
+                      "(or the exact Ollama error) into the chat. Useful "
+                      "when a specific tag like qwen3.6:35b refuses to "
+                      "work and you want to see *why* without sending a "
+                      "real question.",
+    "reload_model_btn": "Force-redownload the configured LLM. Unloads "
+                      "everything from VRAM, deletes the on-disk blob, then "
+                      "re-pulls it from ollama.com. Use this if the model "
+                      "is failing to load (the 'unable to load model' "
+                      "error) — it's the equivalent of running  ollama rm "
+                      "<tag>  then  ollama pull <tag>  in a terminal.",
+    "rag_toggle":     "USE RAG — when ON, ez-rag retrieves from your corpus "
                       "before answering and cites passages [1], [2], …\n"
                       "When OFF, the question goes straight to the LLM with no "
                       "retrieval. Useful for A/B testing how much the corpus "
@@ -130,6 +211,14 @@ TIP = {
                       "throughput on a strong GPU, more memory in flight. "
                       "16 is a balanced default; on a 5090 you can comfortably "
                       "go to 64.",
+    "num_batch":      "Ollama prompt-eval batch size. Bigger = faster TTFT "
+                      "(prompt processing) at the cost of more peak memory. "
+                      "Empirically 1024 measured -23% TTFT on a 32B model "
+                      "vs the default 512 in our benchmark.",
+    "num_ctx":        "Tokens of context Ollama allocates for the model. "
+                      "0 = let Ollama pick the model's default. Larger = "
+                      "more VRAM upfront but no per-token speed cost when "
+                      "actual sequences are short.",
     "parallel_workers": "Reserved for future parallel parsing. Currently "
                       "no effect; leave at 1.",
     "default_rags_dir": "Where 'New RAG' creates workspaces by default. "
@@ -137,6 +226,22 @@ TIP = {
                       "dropdown automatically.",
     "manage_rags":    "Browse, open, export, or delete every RAG stored in "
                       "the default folder.",
+    "export_chatbot": "Bundle this RAG and a runnable chatbot into a single "
+                      "zip. Cross-platform (Windows / macOS / Linux). The "
+                      "recipient needs Python and Ollama with the configured "
+                      "model pulled. Settings, theme, and index are baked in.",
+    "include_sources": "Bundle the original ingested files (PDFs, HTML, "
+                      "screenshots) under data/sources/ so the chatbot can "
+                      "render PDF page previews and show original images "
+                      "when a citation chip is clicked. Off by default "
+                      "because PDF-heavy workspaces can be multi-GB.",
+    "theme_palette":  "GUI color palette. Light, dark, midnight, forest, "
+                      "solarized, nord, dracula, rosé pine, rainbow. Edit "
+                      "themes.toml to add your own.",
+    "theme_apply":    "Save the chosen palette to ~/.ezrag/global.toml. "
+                      "Takes effect on the next launch (or click Restart now).",
+    "theme_restart":  "Save and re-launch ez-rag immediately so the new "
+                      "palette takes effect.",
 
     # Files tab
     "add_files":      "Copy files from anywhere on disk into this workspace's "
@@ -195,6 +300,16 @@ TIP = {
                       "top-K to be diverse rather than near-duplicates. Helps "
                       "when the corpus has many similar chunks; harmless on "
                       "small/diverse corpora. ~70 ms overhead.",
+    "expand_to_chapter": "Replace each retrieved chunk with the entire "
+                      "chapter it belongs to. Best for 'summarize the rules "
+                      "around X' / 'list everything about Y' questions. "
+                      "Chapter boundaries come from PDF bookmarks or heading "
+                      "styles. Skipped per-hit when a chapter exceeds the "
+                      "cap below.",
+    "chapter_max_chars": "Hard limit on expanded chapter size, in characters. "
+                      "If a chapter is bigger than this we keep the original "
+                      "chunk instead so a single hit can't blow your context "
+                      "window. ~4 chars ≈ 1 token.",
     "mmr_lambda":     "MMR balance: 1.0 = pure relevance (same as off), "
                       "0.0 = pure diversity, 0.5 = balanced.",
 
@@ -255,8 +370,31 @@ to the LLM as supplementary context.
 
 The model is the primary intelligence — it answers from its own knowledge.
 The corpus is **secondary reference material** the model can cite when relevant.
-Toggle the **Use corpus** switch off (top of the Chat tab) to test the model
+Toggle the **Use RAG** switch off (top of the Chat tab) to test the model
 with no retrieval.
+
+## Terminology
+
+These three words are not synonyms — they refer to different layers of the
+same system. Knowing the difference makes everything else in this manual
+clearer.
+
+| Term | Refers to |
+|---|---|
+| **Corpus** | The collection of source documents — your `docs/` folder. From linguistics, Latin for "body." A corpus is *the input*. |
+| **Index** | The searchable structure ez-rag builds from the corpus — chunks + embeddings + BM25, all stored in `.ezrag/meta.sqlite`. *The processed data*. |
+| **RAG** | Retrieval-Augmented Generation. *The whole technique*: corpus + index + retrieval logic + LLM, working together. The "RAG" dropdown at the top picks which workspace (= which corpus + index + frozen settings) is active. |
+
+The Chat tab toggle is labelled **"Use RAG"** — when ON, your question is augmented with retrieved passages from the corpus before the LLM answers; when OFF, the question goes straight to the LLM with no retrieval (useful for A/B comparison).
+
+Other recurring terms:
+
+- **Embedder** / **embedding model** — the small model that turns text into vectors. Used at *both* ingest time (one vector per chunk) and query time (one vector per question). Swapping it forces a full re-ingest.
+- **Embedding** / **vector** / **dense vector** — the numeric output of the embedder. Texts with similar meaning land at similar coordinates in vector space.
+- **Reranker** / **cross-encoder** — a small *second* model that scores `(query, passage)` pairs jointly. Runs on the top candidates after initial retrieval. Biggest single quality lift in most pipelines; cheap.
+- **Chunk** — a piece of a document the embedder sees. Default ~512 tokens. The thing actually retrieved.
+- **Hybrid retrieval** — fuses BM25 (keyword) and dense (vector) results via Reciprocal Rank Fusion. Default ON.
+- **Chapter** (ez-rag specific) — a contiguous span of chunks belonging to one section, derived from PDF bookmarks or heading styles. Used by the *Expand to chapter* retrieval mode.
 
 ## Tabs
 
@@ -308,7 +446,7 @@ estimated VRAM and color-codes whether it fits your GPU.
 **Use a local GGUF instead of Ollama**: Settings → *Use local GGUF…*. Install
 `llama-cpp-python` once.
 
-**Test with vs without RAG**: toggle *Use corpus* in the Chat tab header.
+**Test with vs without RAG**: toggle *Use RAG* in the Chat tab header.
 Same question, both modes — direct comparison.
 
 **Run as an OpenAI-compatible API**: from a terminal, `ez-rag serve --port 11533`,
@@ -412,6 +550,9 @@ class ChatTurn:
     thinking_header: object = None  # ft.Text header (so we can show "thinking..."
                                     # vs "Reasoning · 1234 chars")
     chips_row: object = None
+    # Inline recovery actions, rendered as buttons under the bubble.
+    # list of (label, icon, callable) — callable takes no args.
+    actions: list = field(default_factory=list)
     bubble: object = None
 
 
@@ -423,6 +564,15 @@ class AppState:
     turns: list[ChatTurn] = field(default_factory=list)
     streaming: bool = False
     stop_flag: bool = False
+    # Cached LLM-generated chat-welcome suggestions, keyed by workspace path.
+    # None = not requested yet, [] = requested and got nothing back.
+    suggestions: dict = field(default_factory=dict)
+    suggestions_loading: bool = False
+    # Active background Ollama pulls: tag -> {pct, completed, total, status,
+    # started_at}. Lives at app level (not per-dialog) so the pull can
+    # outlive the dialog that started it. Surfaces in the header badge
+    # and resyncs the dialog when reopened.
+    active_pulls: dict = field(default_factory=dict)
 
 
 # ============================================================================
@@ -452,6 +602,156 @@ def add_recent(path: Path) -> None:
 # ============================================================================
 # Reusable widgets
 # ============================================================================
+
+# ---------------------------------------------------------------------------
+# Win32 paint-message kicker
+# ---------------------------------------------------------------------------
+# Flet 0.84 / Flutter Desktop on Windows pauses repaints when nothing is
+# triggering a frame. `page.update()` from a background thread sets the
+# value but the renderer doesn't actually flush until the OS sends a
+# WM_PAINT — which happens when you click in the window, alt-tab, or
+# even Win+S (the snipping tool briefly covers the window). The fix is
+# to send our own WM_PAINT periodically by calling RedrawWindow on our
+# Flutter HWND. Same effect as Win+S but invisible.
+#
+# Best-effort + cached. Returns None and silently no-ops on non-Windows
+# or if the HWND can't be found.
+
+_FLUTTER_HWND: int | None = None
+# Flutter desktop's window class name on Windows. The Flutter team uses
+# this exact identifier for the embedded view window — confirmed in the
+# flutter/engine source. Flet ships flet-desktop (a Flutter app) as a
+# separate process, so its window is NOT owned by our Python process —
+# we have to find it by class name across all processes.
+_FLUTTER_WIN_CLASS = "FLUTTER_RUNNER_WIN32_WINDOW"
+
+
+def _find_flutter_hwnd() -> int | None:
+    """Locate the Flutter view window. Looks for the FLUTTER_RUNNER_WIN32_WINDOW
+    class across all processes (since flet-desktop runs out-of-process).
+    Falls back to title-prefix matching ("ez-rag") if class lookup fails.
+    Caches on first success; retries on every call until found."""
+    global _FLUTTER_HWND
+    if _FLUTTER_HWND is not None:
+        # Validate cache — handle the case where the window was closed
+        # and recreated (re-launch via RAG-switch, theme change, etc.).
+        try:
+            import ctypes
+            if ctypes.windll.user32.IsWindow(_FLUTTER_HWND):
+                return _FLUTTER_HWND
+        except Exception:
+            pass
+        _FLUTTER_HWND = None
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+
+        # Strategy 1: FindWindowW by class name. Fast and works regardless
+        # of process ownership.
+        hwnd = user32.FindWindowW(_FLUTTER_WIN_CLASS, None)
+        if hwnd:
+            _FLUTTER_HWND = int(hwnd)
+            return _FLUTTER_HWND
+
+        # Strategy 2: enumerate all top-level windows, match by class
+        # OR by visible title starting with 'ez-rag'. Some Flet versions
+        # may use a different class name (FLUTTER_VIEW, etc.).
+        candidates: list[int] = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def _enum_proc(hwnd, lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            # Class name check
+            buf = ctypes.create_unicode_buffer(256)
+            n = user32.GetClassNameW(hwnd, buf, 256)
+            cls = buf.value if n > 0 else ""
+            if "FLUTTER" in cls.upper():
+                candidates.append(int(hwnd))
+                return True
+            # Title check
+            tlen = user32.GetWindowTextLengthW(hwnd)
+            if tlen > 0:
+                tbuf = ctypes.create_unicode_buffer(tlen + 1)
+                user32.GetWindowTextW(hwnd, tbuf, tlen + 1)
+                if tbuf.value and tbuf.value.lower().startswith("ez-rag"):
+                    candidates.append(int(hwnd))
+            return True
+
+        user32.EnumWindows(_enum_proc, 0)
+        if candidates:
+            _FLUTTER_HWND = candidates[0]
+    except Exception:
+        pass
+    return _FLUTTER_HWND
+
+
+def force_window_redraw() -> bool:
+    """Force a Flutter Desktop repaint by invalidating the Flutter view
+    window and pumping a UpdateWindow. Same effect as Win+S / alt-tab
+    waking the app — but invisible.
+
+    Background: Flutter on Windows handles WM_PAINT by doing nothing
+    (default WindowProc), and Flet's `page.update()` from a background
+    thread queues the value change but doesn't itself trigger a frame.
+    The OS only sends paint messages on input/focus events. So we send
+    one ourselves, which is exactly what alt-tab + alt-tab back does.
+    See flutter/flutter#75319 and flutter/flutter#102030.
+
+    Returns True on success. No-op on non-Windows or if the HWND can't
+    be found yet."""
+    if os.name != "nt":
+        return False
+    hwnd = _find_flutter_hwnd()
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        # Invalidate the entire client area + force an immediate paint
+        # for all child windows. RDW_FRAME also includes the non-client
+        # area for good measure. RDW_ERASE forces background re-paint.
+        # 0x0001 = RDW_INVALIDATE
+        # 0x0004 = RDW_ERASE
+        # 0x0080 = RDW_ALLCHILDREN
+        # 0x0100 = RDW_UPDATENOW
+        # 0x0400 = RDW_FRAME
+        flags = 0x0001 | 0x0004 | 0x0080 | 0x0100 | 0x0400
+        user32.RedrawWindow(hwnd, None, None, flags)
+        # Belt-and-suspenders: explicit InvalidateRect + UpdateWindow.
+        # Some Flutter engine builds respond to one but not the other.
+        user32.InvalidateRect(hwnd, None, False)
+        user32.UpdateWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
+def modal_heartbeat() -> ft.Control:
+    """Tiny always-spinning ProgressRing meant to be embedded inside any
+    long-lived modal overlay.
+
+    Flutter Desktop on Windows pauses repaints when no input arrives and
+    nothing in the visible widget tree is animating. The sysmon footer's
+    heartbeat covers the main page, but modal overlays render in their
+    own stack and don't always inherit those frame ticks. Drop one of
+    these into any overlay where progress (download bytes, ingest pages,
+    etc.) needs to keep ticking without user clicks.
+
+    The ring is 8x8 px and dim — barely visible, but its rotation forces
+    Flutter to keep rendering the overlay's subtree at vsync rate.
+    """
+    return ft.ProgressRing(
+        width=8, height=8, stroke_width=1,
+        color=ft.Colors.with_opacity(0.5, ACCENT),
+        bgcolor="transparent",
+        tooltip="Live indicator — keeps this dialog repainting so "
+                "progress stays current without clicking.",
+    )
+
 
 def status_pill(text: str, color: str, *, dot: bool = True) -> ft.Container:
     return ft.Container(
@@ -677,6 +977,27 @@ def build_header(state: AppState, *, on_open_workspace, on_create_rag,
             body_md=HELP_MD, icon=ft.Icons.HELP_OUTLINE,
         ),
     )
+    # Pull badge — visible only while a model download is running. Hidden
+    # otherwise. Lets the user see a download still progressing even after
+    # they've dismissed the pull dialog. Updated by the sysmon watchdog
+    # tick (already running at 1 Hz to keep Flutter painting).
+    pull_badge_text = ft.Text(
+        "", size=11, color="#FFFFFF",
+        weight=ft.FontWeight.W_700,
+    )
+    pull_badge = ft.Container(
+        visible=False,
+        padding=ft.padding.symmetric(horizontal=10, vertical=4),
+        bgcolor=ACCENT, border_radius=999,
+        tooltip="Active model downloads — keeps running even if you close "
+                "the pull dialog. Clears when complete.",
+        content=ft.Row([
+            ft.Icon(ft.Icons.CLOUD_DOWNLOAD, size=14, color="#FFFFFF"),
+            pull_badge_text,
+        ], spacing=6,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
+    )
+
     btn_about = ft.IconButton(
         icon=ft.Icons.INFO_OUTLINE,
         tooltip=TIP["about_btn"],
@@ -717,6 +1038,7 @@ def build_header(state: AppState, *, on_open_workspace, on_create_rag,
                 ft.Container(expand=True),
                 files_pill,
                 backend_pill,
+                pull_badge,
                 rag_dropdown,
                 btn_new_rag,
                 btn_open,
@@ -757,7 +1079,28 @@ def build_header(state: AppState, *, on_open_workspace, on_create_rag,
             files_pill.content = status_pill(
                 f"{s['files']} files · {s['chunks']} chunks", ACCENT).content
 
-    return bar, update
+    def refresh_pull_badge():
+        """Refresh the header download badge from state.active_pulls.
+        Called by the sysmon watchdog at 1 Hz so progress stays live even
+        when the pull dialog is closed."""
+        pulls = state.active_pulls
+        if not pulls:
+            pull_badge.visible = False
+            return
+        pull_badge.visible = True
+        # Take the first (or only) active pull's progress for the label.
+        # Multi-pull is rare; we just show "N downloading" if so.
+        if len(pulls) == 1:
+            tag, info = next(iter(pulls.items()))
+            pct = info.get("pct")
+            if pct is not None:
+                pull_badge_text.value = f"{tag}  {int(pct * 100)}%"
+            else:
+                pull_badge_text.value = f"{tag}  {info.get('status', 'pulling')}"
+        else:
+            pull_badge_text.value = f"{len(pulls)} downloads"
+
+    return bar, update, refresh_pull_badge
 
 
 # ============================================================================
@@ -765,7 +1108,8 @@ def build_header(state: AppState, *, on_open_workspace, on_create_rag,
 # ============================================================================
 
 def build_chat_view(state: AppState, *, refresh_status,
-                    on_open_workspace, on_open_files):
+                    on_open_workspace, on_open_files,
+                    open_pull_dialog_cb):
     chat_list = ft.ListView(
         expand=True, spacing=12, padding=ft.padding.all(20), auto_scroll=True,
     )
@@ -801,7 +1145,7 @@ def build_chat_view(state: AppState, *, refresh_status,
         tooltip=TIP["rag_toggle"],
     )
     rag_label = ft.Text(
-        "Use corpus" if state.cfg.use_rag else "Bypass corpus (model only)",
+        "Use RAG" if state.cfg.use_rag else "Bypass RAG (model only)",
         size=12, color=ON_SURFACE_DIM, weight=ft.FontWeight.W_600,
     )
 
@@ -827,7 +1171,7 @@ def build_chat_view(state: AppState, *, refresh_status,
     def on_rag_toggle(e):
         state.cfg.use_rag = bool(e.control.value)
         rag_label.value = (
-            "Use corpus" if state.cfg.use_rag
+            "Use RAG" if state.cfg.use_rag
             else "Bypass corpus (model only)"
         )
         rag_label.color = ACCENT if state.cfg.use_rag else WARNING
@@ -848,47 +1192,286 @@ def build_chat_view(state: AppState, *, refresh_status,
         content=ft.Container(width=720, height=480, content=ft.Text("")),
     )
 
+    def _try_render_page_image(hit) -> ft.Control | None:
+        """Render the cited PDF page → zoomable image control with download.
+        Returns None for any failure path (non-PDF, missing renderer, broken
+        file, etc.). Must never raise — citation chips are user-clicked and
+        a crash here would brick the chat dialog."""
+        try:
+            if not hit.path.lower().endswith(".pdf"):
+                return None
+            if not hit.page or state.ws is None:
+                return None
+            from ez_rag.preview import render_pdf_page
+            abs_path = (state.ws.root / hit.path).resolve()
+            img_path = render_pdf_page(abs_path, int(hit.page))
+            if img_path is None:
+                return None
+
+            # InteractiveViewer gives pan + pinch-to-zoom on the rendered
+            # page (mouse-wheel zoom + click-drag pan on desktop). The
+            # image itself is already rendered at 2.5x natural scale so
+            # zoom-in stays sharp.
+            inner_img = ft.Image(
+                src=str(img_path),
+                fit="contain",
+                border_radius=4,
+            )
+            viewer = ft.InteractiveViewer(
+                min_scale=0.5, max_scale=8.0,
+                content=ft.Container(
+                    content=inner_img, alignment=ft.Alignment.CENTER,
+                ),
+                expand=True,
+            )
+
+            def download_clicked(_=None):
+                async def _do():
+                    src = Path(hit.path).stem
+                    suggested = f"{src}-p{hit.page}.png"
+                    try:
+                        dest = await rags_dir_picker.save_file(
+                            dialog_title="Save page image",
+                            file_name=suggested,
+                            allowed_extensions=["png"],
+                        )
+                    except Exception as ex:
+                        _toast(state.page, f"Save dialog failed: {ex}")
+                        return
+                    if not dest:
+                        return
+                    try:
+                        shutil.copy2(img_path, dest)
+                        _toast(state.page, f"Saved → {Path(dest).name}")
+                    except Exception as ex:
+                        _toast(state.page, f"Save failed: {ex}")
+                state.page.run_task(_do)
+
+            toolbar = ft.Row([
+                ft.Text(f"page {hit.page} · 2.5x render",
+                        size=11, color=ON_SURFACE_DIM),
+                ft.Container(expand=True),
+                ft.OutlinedButton(
+                    "Download", icon=ft.Icons.DOWNLOAD,
+                    on_click=download_clicked,
+                    tooltip="Save this page image as a PNG.",
+                ),
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=6)
+
+            return ft.Container(
+                bgcolor=SURFACE_DARK_HI, border_radius=8, padding=8,
+                content=ft.Column([
+                    toolbar,
+                    ft.Container(
+                        content=viewer,
+                        bgcolor="#0F0F12",
+                        border=ft.border.all(1, "#1E2130"),
+                        border_radius=6,
+                        expand=True,
+                    ),
+                    ft.Text(
+                        "Scroll to zoom · drag to pan · double-click to reset",
+                        size=10, color=ON_SURFACE_DIM, italic=True,
+                    ),
+                ], spacing=6, expand=True),
+                expand=True,
+            )
+        except Exception as ex:
+            print(f"[ez-rag] page-preview render failed: {ex!r}")
+            return None
+
     def open_source(idx: int, hit):
-        loc = hit.path + (f"  ·  page {hit.page}" if hit.page else "")
-        sec = f"  ·  {hit.section}" if hit.section else ""
-        source_dialog.title = ft.Row(
-            [
-                ft.Container(
-                    width=28, height=28, border_radius=999,
-                    bgcolor=ft.Colors.with_opacity(0.25, ACCENT),
-                    alignment=ft.Alignment.CENTER,
-                    content=ft.Text(str(idx), size=12,
-                                    weight=ft.FontWeight.W_700, color=ACCENT),
-                ),
-                ft.Column([
-                    ft.Text(Path(hit.path).name, size=14,
-                            weight=ft.FontWeight.W_700),
-                    ft.Text(f"{hit.path}{sec}{('  ·  page ' + str(hit.page)) if hit.page else ''}",
-                            size=11, color=ON_SURFACE_DIM),
-                ], spacing=2, tight=True),
-            ],
-            vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=12,
-        )
-        source_dialog.content = ft.Container(
-            width=720, height=480, padding=10,
-            content=ft.Column([
-                ft.Container(
-                    bgcolor=SURFACE_DARK_HI, border_radius=8, padding=14,
-                    content=ft.Column([
-                        ft.Text(hit.text, size=13, selectable=True,
-                                color=ON_SURFACE),
-                    ], scroll=ft.ScrollMode.AUTO, expand=True),
-                    expand=True,
-                ),
-            ], expand=True),
-        )
-        source_dialog.actions = [
-            ft.TextButton("Close",
-                          on_click=lambda _: state.page.pop_dialog()),
-        ]
-        state.page.show_dialog(source_dialog)
+        # Wrap the whole dialog build so a render failure shows a toast and
+        # falls back to text-only — it must never leave the user stuck on an
+        # unrecoverable error overlay.
+        try:
+            sec = f"  ·  {hit.section}" if hit.section else ""
+            source_dialog.title = ft.Row(
+                [
+                    ft.Container(
+                        width=28, height=28, border_radius=999,
+                        bgcolor=ft.Colors.with_opacity(0.25, ACCENT),
+                        alignment=ft.Alignment.CENTER,
+                        content=ft.Text(str(idx), size=12,
+                                        weight=ft.FontWeight.W_700, color=ACCENT),
+                    ),
+                    ft.Column([
+                        ft.Text(Path(hit.path).name, size=14,
+                                weight=ft.FontWeight.W_700),
+                        ft.Text(f"{hit.path}{sec}{('  ·  page ' + str(hit.page)) if hit.page else ''}",
+                                size=11, color=ON_SURFACE_DIM),
+                    ], spacing=2, tight=True),
+                ],
+                vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=12,
+            )
+
+            page_image_ctrl = _try_render_page_image(hit)
+
+            text_panel = ft.Container(
+                bgcolor=SURFACE_DARK_HI, border_radius=8, padding=14,
+                content=ft.Column([
+                    ft.Text(hit.text, size=13, selectable=True,
+                            color=ON_SURFACE),
+                ], scroll=ft.ScrollMode.AUTO, expand=True),
+                expand=True,
+            )
+
+            # Side-by-side layout when we have a rendered page; text-only otherwise.
+            if page_image_ctrl is not None:
+                body = ft.Row([
+                    ft.Container(content=page_image_ctrl, expand=1),
+                    ft.Container(content=text_panel, expand=1),
+                ], expand=True, spacing=10)
+                dialog_w = 980
+            else:
+                body = text_panel
+                dialog_w = 720
+
+            source_dialog.content = ft.Container(
+                width=dialog_w, height=520, padding=10, content=body,
+            )
+            source_dialog.actions = [
+                ft.TextButton("Close",
+                              on_click=lambda _: state.page.pop_dialog()),
+            ]
+            state.page.show_dialog(source_dialog)
+        except Exception as ex:
+            print(f"[ez-rag] source dialog failed: {ex!r}")
+            _toast(state.page, f"Couldn't open source: {ex}")
 
     # ------------- bubble rendering --------------------------------------
+
+    def _actions_for_embedder_mismatch(*, last_question: str) -> list:
+        """Recovery actions for an EmbedderMismatchError.
+
+        Two paths: re-ingest (slow but always works) or open Settings so
+        the user can flip the embedder back to whatever built the index.
+        Plus a Retry once they've fixed it.
+        """
+        def reingest():
+            on_open_files()
+            _toast(state.page,
+                "Files tab opened — click 'Re-ingest (force)' to rebuild "
+                "every chunk vector with the current embedder.")
+
+        def open_settings():
+            # `set_view` is exposed on state by the parent app() — fall
+            # back to a toast if not bound (e.g. when called from a unit
+            # test harness).
+            try:
+                state.page.run_thread(lambda: None)  # touch
+            except Exception:
+                pass
+            _toast(state.page,
+                "Open Settings → Embedder and switch back to whatever "
+                "built the index, then retry.")
+
+        def retry_question():
+            input_field.value = last_question
+            state.page.update()
+            send_clicked()
+
+        return [
+            ("Re-ingest now", ft.Icons.REFRESH, reingest, True),
+            ("Open Settings", ft.Icons.SETTINGS, open_settings, False),
+            ("Retry question", ft.Icons.SEND, retry_question, False),
+        ]
+
+    def _actions_for_ollama_error(ex, *, last_question: str) -> list:
+        """Build inline recovery buttons for an OllamaChatError. Each
+        action is a (label, icon, callable) tuple consumed by `_bubble`.
+
+        The actions don't return — they kick off background work and
+        toast/refresh as needed. Callers store the list on `ChatTurn`.
+        """
+        from ez_rag.generate import OllamaChatError
+        kind = getattr(ex, "kind", "generic")
+        cfg = state.cfg
+        url = cfg.llm_url
+        model = cfg.llm_model
+        out: list = []
+
+        def repair_model():
+            # rm + pull the offending tag. Re-uses the existing pull dialog
+            # so the user gets a streaming progress bar for free.
+            def _do():
+                try:
+                    delete_ollama_model(url, model)
+                except Exception:
+                    pass
+                _toast(state.page,
+                       f"Removed {model} — opening pull dialog to redownload")
+            state.page.run_thread(_do)
+            # Open the pull dialog with the tag pre-filled so the user can
+            # start the re-pull with one click.
+            opener = open_pull_dialog_cb.get("fn")
+            if opener is None:
+                _toast(state.page,
+                       "Pull dialog not ready yet — try Settings → "
+                       "Browse Ollama library.")
+                return
+            try:
+                opener("llm", None, prefill_tag=model)
+            except Exception as ex2:
+                _toast(state.page, f"Couldn't open pull dialog: {ex2}")
+
+        def free_vram():
+            def _do():
+                try:
+                    out_tags = unload_running_models(url)
+                except Exception:
+                    out_tags = []
+                if out_tags:
+                    _toast(state.page,
+                           f"Unloaded from VRAM: {', '.join(out_tags)}")
+                else:
+                    _toast(state.page,
+                           "Nothing was loaded — nothing to unload.")
+            state.page.run_thread(_do)
+
+        def open_ollama_download():
+            try:
+                import webbrowser
+                webbrowser.open("https://ollama.com/download")
+            except Exception:
+                pass
+
+        def retry_question():
+            input_field.value = last_question
+            state.page.update()
+            send_clicked()
+
+        # Each entry: (label, icon, callable, primary?)
+        # `primary=True` renders as a filled accent button so the recovery
+        # path is visually obvious even at a glance.
+        if kind == "load_failure":
+            out.append(("Reload model", ft.Icons.CLOUD_DOWNLOAD,
+                        repair_model, True))
+            out.append(("Free all VRAM", ft.Icons.MEMORY, free_vram, False))
+            out.append(("Update Ollama", ft.Icons.OPEN_IN_NEW,
+                        open_ollama_download, False))
+            out.append(("Retry question", ft.Icons.REFRESH,
+                        retry_question, False))
+        elif kind == "oom":
+            out.append(("Free all VRAM", ft.Icons.MEMORY, free_vram, True))
+            out.append(("Retry question", ft.Icons.REFRESH,
+                        retry_question, False))
+        elif kind == "context_overflow":
+            out.append(("Retry question", ft.Icons.REFRESH,
+                        retry_question, True))
+        elif kind == "model_not_found":
+            out.append(("Pull this model", ft.Icons.CLOUD_DOWNLOAD,
+                        repair_model, True))
+        elif kind == "server_down":
+            out.append(("Retry question", ft.Icons.REFRESH,
+                        retry_question, True))
+            out.append(("Open Ollama download", ft.Icons.OPEN_IN_NEW,
+                        open_ollama_download, False))
+        else:
+            out.append(("Retry question", ft.Icons.REFRESH,
+                        retry_question, True))
+
+        return out
 
     def _build_chips(turn: ChatTurn) -> ft.Row:
         return ft.Row(
@@ -946,11 +1529,40 @@ def build_chat_view(state: AppState, *, refresh_status,
             else ft.Row([], visible=False)
         turn.chips_row = chips_row
 
+        # Inline recovery actions (e.g. "Reload model" on a load failure).
+        # Each entry is (label, icon, callable, primary?). The callable
+        # runs on click. Primary actions render as a filled accent button
+        # so the recommended recovery path is impossible to miss.
+        actions_row = ft.Row([], visible=False, wrap=True, spacing=8)
+        if turn.actions and not is_user:
+            actions_row.visible = True
+            for entry in turn.actions:
+                # Backward-compat: tolerate 3-tuples that older test paths
+                # may have constructed.
+                if len(entry) == 4:
+                    label, icon, cb, primary = entry
+                else:
+                    label, icon, cb = entry
+                    primary = False
+                handler = (lambda fn=cb: lambda _: fn())(cb)
+                if primary:
+                    btn = ft.FilledButton(
+                        label, icon=icon, on_click=handler,
+                        bgcolor=ACCENT, color="#FFFFFF",
+                    )
+                else:
+                    btn = ft.FilledTonalButton(
+                        label, icon=icon, on_click=handler,
+                    )
+                actions_row.controls.append(btn)
+
         bubble_items = []
         if not is_user:
             bubble_items.append(thinking_box)
         bubble_items.append(md)
         bubble_items.append(chips_row)
+        if actions_row.visible:
+            bubble_items.append(actions_row)
 
         bubble_col = ft.Column(bubble_items, spacing=10, tight=True)
         bubble = ft.Container(
@@ -977,6 +1589,17 @@ def build_chat_view(state: AppState, *, refresh_status,
         turn.bubble = outer
         return outer
 
+    def _scroll_to_bottom(duration: int = 120):
+        """Best-effort jump to the latest message.
+
+        Flet's ListView.auto_scroll handles new appends but not full rebuilds
+        or in-place updates of existing children, so we trigger explicitly.
+        """
+        try:
+            chat_list.scroll_to(offset=-1, duration=duration)
+        except Exception:
+            pass
+
     def render_chat():
         """Full re-render. Call when turns are added/removed."""
         chat_list.controls.clear()
@@ -986,6 +1609,7 @@ def build_chat_view(state: AppState, *, refresh_status,
             for t in state.turns:
                 chat_list.controls.append(_bubble(t))
         state.page.update()
+        _scroll_to_bottom()
 
     def update_streaming_assistant(turn: ChatTurn):
         """In-place update for the streaming bubble. Avoids full rebuilds."""
@@ -1032,10 +1656,7 @@ def build_chat_view(state: AppState, *, refresh_status,
             state.page.update()
 
         # Auto-scroll the chat list as the bubble grows.
-        try:
-            chat_list.scroll_to(offset=-1, duration=80)
-        except Exception:
-            pass
+        _scroll_to_bottom(duration=80)
 
     # ------------- send / stream ------------------------------------------
 
@@ -1072,7 +1693,7 @@ def build_chat_view(state: AppState, *, refresh_status,
                 # Apply prefix/suffix/negatives if the per-query toggle is on
                 effective_q = apply_query_modifiers(text, state.cfg)
 
-                # Honor the "Use corpus" toggle. When OFF we skip embedding +
+                # Honor the "Use RAG" toggle. When OFF we skip embedding +
                 # retrieval entirely, sending the question straight to the LLM.
                 if state.cfg.use_rag:
                     embedder = make_embedder(state.cfg)
@@ -1146,7 +1767,30 @@ def build_chat_view(state: AppState, *, refresh_status,
                 # Final rebuild to splice in citation chips below the answer.
                 render_chat()
             except Exception as ex:
-                assistant.text = f"_Error: {ex}_"
+                # Render the friendly OllamaChatError text as plain markdown
+                # rather than wrapping it in italics — it's already
+                # multi-line guidance the user needs to read.
+                from ez_rag.generate import OllamaChatError
+                from ez_rag.retrieve import EmbedderMismatchError
+                if isinstance(ex, OllamaChatError):
+                    assistant.text = (
+                        "**Couldn't get a reply from the LLM.**\n\n"
+                        f"{ex}"
+                    )
+                    assistant.actions = _actions_for_ollama_error(
+                        ex, last_question=text,
+                    )
+                elif isinstance(ex, EmbedderMismatchError):
+                    assistant.text = (
+                        "**Embedder mismatch — your index is unusable with "
+                        "the current embedder setting.**\n\n"
+                        f"{ex}"
+                    )
+                    assistant.actions = _actions_for_embedder_mismatch(
+                        last_question=text,
+                    )
+                else:
+                    assistant.text = f"_Error: {ex}_"
                 assistant.streaming = False
                 render_chat()
             finally:
@@ -1165,6 +1809,265 @@ def build_chat_view(state: AppState, *, refresh_status,
     def clear_chat(_):
         state.turns.clear()
         render_chat()
+
+    def _test_current_model():
+        """Quick load-and-generate test against the configured chat LLM.
+
+        Surfaces the exact Ollama error verbatim — useful when a model
+        like qwen3.6:35b is misbehaving and the chat path's wrapped
+        OllamaChatError translation is hiding the underlying detail.
+        Posts a fresh assistant turn with the result so it's visible in
+        chat history alongside any previous errors.
+        """
+        if state.ws is None:
+            _toast(state.page, "Open a workspace first.")
+            return
+        cfg = state.cfg
+        model = cfg.llm_model or "(unset)"
+        # Build a placeholder turn that we'll fill in
+        diag = ChatTurn(role="assistant",
+                        text=f"_Testing **{model}**…_",
+                        streaming=True)
+        state.turns.append(diag)
+        render_chat()
+
+        def _bg():
+            import httpx
+            url = cfg.llm_url.rstrip("/")
+            t0 = time.monotonic()
+            verdict = []
+            verdict.append(f"## Diagnostic: `{model}`\n")
+            verdict.append(f"- backend URL: `{url}`")
+            # 1. Is Ollama reachable?
+            try:
+                r = httpx.get(f"{url}/api/tags", timeout=3.0)
+                r.raise_for_status()
+                tags = [m.get("name", "") for m in r.json().get("models", [])]
+                verdict.append(f"- /api/tags: **OK** ({len(tags)} model(s) installed)")
+                pulled = model in tags
+                verdict.append(
+                    f"- model installed locally: "
+                    + ("**yes**" if pulled else "**no** — run *Reload model* to pull it")
+                )
+            except Exception as e:
+                verdict.append(f"- /api/tags: **FAIL** — {type(e).__name__}: {e}")
+                diag.text = "\n".join(verdict) + (
+                    "\n\nOllama isn't reachable. Make sure the Ollama app is "
+                    "running, or check that `OLLAMA_HOST` matches the URL above."
+                )
+                diag.streaming = False
+                render_chat()
+                return
+
+            # 2. Try a tiny generate — this is what fails for partial-blob
+            # / corrupt-model cases.
+            verdict.append("- attempting 1-token generate…")
+            try:
+                t1 = time.monotonic()
+                r = httpx.post(
+                    f"{url}/api/generate",
+                    json={
+                        "model": model,
+                        "prompt": "ping",
+                        "stream": False,
+                        "options": {"num_predict": 1, "temperature": 0.0},
+                    },
+                    timeout=300.0,
+                )
+                load_s = time.monotonic() - t1
+                if r.status_code >= 400:
+                    body = r.text[:600]
+                    verdict.append(f"- generate: **FAIL** (HTTP {r.status_code})")
+                    verdict.append("\n```\n" + body.strip() + "\n```")
+                    # Tell the user which actions to try
+                    low = body.lower()
+                    if "unable to load model" in low:
+                        verdict.append(
+                            "\n**Likely fix**: corrupt blob. Click "
+                            "**Reload model** above to `ollama rm` + "
+                            "`ollama pull` this tag.")
+                    elif "out of memory" in low or "cuda" in low:
+                        verdict.append(
+                            "\n**Likely fix**: VRAM exhausted. Click "
+                            "**Free all VRAM** (Reload model dialog) or "
+                            "pick a smaller model in Settings.")
+                    elif "404" in low or "not found" in low:
+                        verdict.append(
+                            f"\n**Likely fix**: model not pulled. Run "
+                            f"`ollama pull {model}` or use Reload model.")
+                else:
+                    elapsed = time.monotonic() - t0
+                    data = r.json()
+                    eval_count = int(data.get("eval_count") or 0)
+                    eval_dur = (data.get("eval_duration") or 0) / 1e9
+                    tok_per_s = (eval_count / eval_dur) if eval_dur > 0 else 0
+                    verdict.append(
+                        f"- generate: **OK** "
+                        f"(load {load_s:.2f}s · {tok_per_s:.0f} tok/s · "
+                        f"{elapsed:.2f}s total)"
+                    )
+                    verdict.append(
+                        "\n**Model is working.** If chat still fails, the "
+                        "issue is prompt-size / context-overflow rather "
+                        "than a load problem — try lowering Top-K or "
+                        "disabling Expand-to-chapter in Settings."
+                    )
+            except Exception as e:
+                verdict.append(f"- generate: **FAIL** ({type(e).__name__}) — {e}")
+            diag.text = "\n".join(verdict)
+            diag.streaming = False
+            render_chat()
+
+        state.page.run_thread(_bg)
+
+    def _free_vram():
+        """Evict every model Ollama currently has resident in VRAM.
+
+        Surfaces what got unloaded as a toast so the user can confirm.
+        Handles the 'stuck model' case by also offering a hard taskkill
+        of ollama.exe when the soft unload returns nothing (or the user
+        still suspects it's wedged).
+        """
+        if state.ws is None:
+            _toast(state.page, "Open a workspace first.")
+            return
+        url = state.cfg.llm_url
+
+        def _do():
+            # First check what's actually loaded so we can show the user
+            # what we're about to do.
+            try:
+                resident = list_running_models(url)
+            except Exception:
+                resident = []
+            if not resident:
+                _toast(state.page,
+                    "No models currently resident in VRAM (per /api/ps). "
+                    "If you still suspect Ollama is stuck, click 'Reload "
+                    "model' to force a clean rm + pull, or kill ollama.exe "
+                    "from Task Manager / `taskkill /F /IM ollama.exe`.")
+                return
+
+            try:
+                unloaded = unload_running_models(url)
+            except Exception as ex:
+                _toast(state.page, f"Unload failed: {ex}")
+                return
+            if unloaded:
+                _toast(state.page,
+                    f"Freed VRAM: unloaded {', '.join(unloaded)}. "
+                    "Next chat will reload on demand.")
+            else:
+                _toast(state.page,
+                    f"Ollama said {len(resident)} model(s) are resident "
+                    "but didn't unload them. Try 'Reload model' or kill "
+                    "ollama.exe from Task Manager.")
+
+        state.page.run_thread(_do)
+
+    def _reload_current_model():
+        """Proactive 'reload model' — same flow the error bubble uses, but
+        available before any question fails. Frees VRAM, removes the
+        on-disk blob, and opens the pull dialog with the current tag pre-
+        filled so one click starts the redownload.
+        """
+        if state.ws is None:
+            _toast(state.page, "Open a workspace first.")
+            return
+        cfg = state.cfg
+        if not cfg.llm_model:
+            _toast(state.page, "No LLM model set in Settings.")
+            return
+
+        # Show a confirmation overlay first since this re-downloads ~ multi-GB.
+        confirm_overlay = ft.Container(
+            expand=True, visible=True,
+            bgcolor=ft.Colors.with_opacity(0.55, "#000000"),
+            alignment=ft.Alignment.CENTER,
+        )
+
+        def _close_confirm(_=None):
+            confirm_overlay.visible = False
+            try:
+                if confirm_overlay in state.page.overlay:
+                    state.page.overlay.remove(confirm_overlay)
+            except Exception:
+                pass
+            state.page.update()
+
+        def _do_reload(_=None):
+            _close_confirm()
+            tag = cfg.llm_model
+
+            def _bg():
+                # 1. Evict everything currently loaded so the pull-and-load
+                #    has a clean slate.
+                try:
+                    unloaded = unload_running_models(cfg.llm_url)
+                    if unloaded:
+                        _toast(state.page,
+                               f"Freed VRAM: {', '.join(unloaded)}")
+                except Exception:
+                    pass
+                # 2. Delete the on-disk blob so the pull does a fresh download
+                #    (this is the key step for the 'unable to load model' bug).
+                try:
+                    delete_ollama_model(cfg.llm_url, tag)
+                except Exception:
+                    pass
+
+            state.page.run_thread(_bg)
+
+            # 3. Open the pull dialog with the tag pre-filled so the user
+            #    just has to click Pull and watch the progress bar.
+            opener = open_pull_dialog_cb.get("fn")
+            if opener is None:
+                _toast(state.page,
+                       "Pull dialog not ready yet — try Settings → "
+                       "Browse Ollama library.")
+                return
+            try:
+                opener("llm", None, prefill_tag=tag)
+            except Exception as ex:
+                _toast(state.page, f"Couldn't open pull dialog: {ex}")
+
+        confirm_overlay.content = ft.Container(
+            width=480, padding=20,
+            bgcolor=SURFACE_DARK,
+            border=ft.border.all(1, "#262938"),
+            border_radius=14,
+            content=ft.Column([
+                ft.Row([
+                    ft.Icon(ft.Icons.AUTORENEW, color=ACCENT, size=22),
+                    ft.Text("Reload model", size=16,
+                            weight=ft.FontWeight.W_700, color=ON_SURFACE),
+                ], spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Text(
+                    f"This will:\n"
+                    f"  1. Unload every model currently in VRAM\n"
+                    f"  2. Delete '{cfg.llm_model}' from disk\n"
+                    f"  3. Re-download it from ollama.com\n\n"
+                    "Use this when the model fails to load or behaves "
+                    "oddly. The on-disk blob is multi-GB, so the download "
+                    "takes a while.",
+                    size=12, color=ON_SURFACE_DIM,
+                ),
+                ft.Row([
+                    ft.Container(expand=True),
+                    ft.TextButton("Cancel", on_click=_close_confirm),
+                    ft.FilledButton(
+                        "Reload model",
+                        icon=ft.Icons.AUTORENEW,
+                        bgcolor=ACCENT, color="#FFFFFF",
+                        on_click=_do_reload,
+                    ),
+                ], spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ], spacing=14, tight=True),
+        )
+        state.page.overlay.append(confirm_overlay)
+        state.page.update()
 
     composer = ft.Container(
         padding=ft.padding.only(left=20, right=20, top=10, bottom=16),
@@ -1213,6 +2116,24 @@ def build_chat_view(state: AppState, *, refresh_status,
                     ], spacing=6,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     tight=True),
+                ),
+                ft.TextButton(
+                    "Test model",
+                    icon=ft.Icons.HEALTH_AND_SAFETY,
+                    on_click=lambda _: _test_current_model(),
+                    tooltip=TIP["test_model_btn"],
+                ),
+                ft.TextButton(
+                    "Free VRAM",
+                    icon=ft.Icons.MEMORY,
+                    on_click=lambda _: _free_vram(),
+                    tooltip=TIP["free_vram_btn"],
+                ),
+                ft.TextButton(
+                    "Reload model",
+                    icon=ft.Icons.AUTORENEW,
+                    on_click=lambda _: _reload_current_model(),
+                    tooltip=TIP["reload_model_btn"],
                 ),
                 ft.TextButton(
                     "Clear", icon=ft.Icons.RESTART_ALT,
@@ -1264,19 +2185,108 @@ def build_chat_view(state: AppState, *, refresh_status,
                 ],
             )
         backend = detect_backend(state.cfg)
-        prompt_text = (
-            "Try one of:" if s["files"] > 0 else
-            "Add documents to start asking questions."
-        )
-        suggestions = [
-            "Summarize the corpus.",
-            "What topics are covered?",
-            "List the documents and their main points.",
-        ]
+        ws_key = str(state.ws.root)
+        cached = state.suggestions.get(ws_key)  # None | [] | list[str]
 
         def fill(text: str):
             input_field.value = text
             state.page.update()
+            try:
+                input_field.focus()
+            except Exception:
+                pass
+
+        # ----- LLM-generated suggestions, opt-in & cached per workspace -----
+        suggestion_status = ft.Text(
+            "" if cached is None else (
+                "(no suggestions returned — try again)" if cached == [] else ""
+            ),
+            size=11, color=ON_SURFACE_DIM, italic=True,
+        )
+        suggestions_col = ft.Column(
+            spacing=8,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+        def _render_suggestions(items: list[str]):
+            suggestions_col.controls.clear()
+            for q in items:
+                suggestions_col.controls.append(
+                    ft.Container(
+                        content=ft.Text(q, size=13, color=ON_SURFACE),
+                        bgcolor=SURFACE_DARK,
+                        border=ft.border.all(1, "#262938"),
+                        border_radius=10,
+                        padding=ft.padding.symmetric(horizontal=14, vertical=10),
+                        on_click=(lambda q=q: lambda _: fill(q))(q),
+                        width=560,
+                        ink=True,
+                    )
+                )
+
+        if cached:
+            _render_suggestions(cached)
+
+        def _request_suggestions(_=None):
+            if state.suggestions_loading:
+                return
+            if backend == "none":
+                suggestion_status.value = (
+                    "No LLM detected — install Ollama and pull a model "
+                    "to use suggestions."
+                )
+                state.page.update()
+                return
+            state.suggestions_loading = True
+            suggestion_status.value = "Asking the model for ideas…"
+            suggest_btn.disabled = True
+            state.page.update()
+
+            def _worker():
+                items: list[str] = []
+                try:
+                    # Sample diverse-ish chunks from the index.
+                    import random
+                    from ez_rag.generate import generate_question_suggestions
+                    conn = sqlite3.connect(str(state.ws.meta_db_path))
+                    try:
+                        rows = conn.execute(
+                            "SELECT text FROM chunks "
+                            "WHERE LENGTH(text) > 80 "
+                            "ORDER BY RANDOM() LIMIT 12"
+                        ).fetchall()
+                    finally:
+                        conn.close()
+                    excerpts = [r[0] for r in rows if r[0]]
+                    items = generate_question_suggestions(
+                        excerpts, state.cfg, n=3,
+                    )
+                except Exception as ex:
+                    suggestion_status.value = f"Suggestion error: {ex}"
+                finally:
+                    state.suggestions[ws_key] = items
+                    state.suggestions_loading = False
+                    suggest_btn.disabled = False
+                    if items:
+                        _render_suggestions(items)
+                        suggestion_status.value = ""
+                    elif suggestion_status.value.startswith("Asking"):
+                        suggestion_status.value = (
+                            "Model didn't return usable suggestions — "
+                            "click Suggest again."
+                        )
+                    state.page.update()
+
+            state.page.run_thread(_worker)
+
+        suggest_btn = ft.OutlinedButton(
+            "Suggest questions" if cached is None else "Refresh suggestions",
+            icon=ft.Icons.LIGHTBULB_OUTLINE,
+            on_click=_request_suggestions,
+            tooltip=("Ask the LLM to propose 3 specific questions you could "
+                     "ask about your corpus, based on a random sample of "
+                     "indexed text."),
+        )
 
         return ft.Container(
             expand=True,
@@ -1292,25 +2302,16 @@ def build_chat_view(state: AppState, *, refresh_status,
                         f"Backend: {backend if backend != 'none' else 'retrieval-only (no LLM detected)'}",
                         size=12, color=ON_SURFACE_DIM,
                     ),
-                    ft.Container(height=18),
-                    ft.Text(prompt_text, size=12, color=ON_SURFACE_DIM),
-                    ft.Container(height=8),
-                    ft.Column(
-                        [
-                            ft.Container(
-                                content=ft.Text(s, size=13, color=ON_SURFACE),
-                                bgcolor=SURFACE_DARK,
-                                border=ft.border.all(1, "#262938"),
-                                border_radius=10,
-                                padding=ft.padding.symmetric(horizontal=14, vertical=10),
-                                on_click=(lambda s=s: lambda _: fill(s))(s),
-                                width=520,
-                            )
-                            for s in suggestions
-                        ],
-                        spacing=8,
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    ft.Container(height=14),
+                    ft.Text(
+                        "Ask anything about your documents.",
+                        size=13, color=ON_SURFACE_DIM,
                     ),
+                    ft.Container(height=14),
+                    suggest_btn,
+                    ft.Container(height=8),
+                    suggestion_status,
+                    suggestions_col,
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 spacing=2,
@@ -1357,6 +2358,99 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
         ], spacing=4, tight=True),
     )
     ingest_log = ft.ListView(spacing=2, padding=8, height=120, auto_scroll=True)
+
+    # ----- "Done" summary card, shown only after ingest completes -----------
+    ingest_done_headline = ft.Text(
+        "Ingest complete", size=14, color=SUCCESS,
+        weight=ft.FontWeight.W_700,
+    )
+    ingest_done_summary = ft.Text(
+        "", size=12, color=ON_SURFACE,
+    )
+    ingest_done_meta = ft.Text(
+        "", size=11, color=ON_SURFACE_DIM, italic=True,
+    )
+    ingest_done_card = ft.Container(
+        visible=False,
+        padding=ft.padding.symmetric(horizontal=14, vertical=12),
+        bgcolor="#13251A",   # subtle green-tinted dark — works against most palettes
+        border=ft.border.all(1, SUCCESS),
+        border_radius=10,
+        content=ft.Row([
+            ft.Icon(ft.Icons.CHECK_CIRCLE, color=SUCCESS, size=24),
+            ft.Container(width=4),
+            ft.Column([
+                ingest_done_headline,
+                ingest_done_summary,
+                ingest_done_meta,
+            ], spacing=2, tight=True, expand=True),
+        ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+    )
+
+    def reset_ingest_panel_for_run():
+        """Hide the 'done' card and dim/clear stale state from the previous
+        run so a fresh ingest starts with a clean slate."""
+        ingest_done_card.visible = False
+        ingest_status.color = ON_SURFACE_DIM
+        ingest_status.weight = None
+        ingest_status.size = 12
+        ingest_snippet_card.visible = False
+
+    def show_ingest_done(stats, elapsed_s: float):
+        """Replace the in-flight UI with a clear 'finished' state.
+
+        Hides the snippet/countdown card (its progress text becomes nonsense
+        once nothing is running), promotes the status to a success-colored
+        headline, and surfaces a tidy summary block.
+        """
+        # Promote status text
+        ingest_status.value = "Finished"
+        ingest_status.color = SUCCESS
+        ingest_status.weight = ft.FontWeight.W_700
+        ingest_status.size = 14
+
+        # Build a human summary; suppress zero-count clauses for readability.
+        bits = []
+        if stats.files_new:
+            bits.append(f"{stats.files_new} new")
+        if stats.files_changed:
+            bits.append(f"{stats.files_changed} changed")
+        if stats.files_skipped_unchanged:
+            bits.append(f"{stats.files_skipped_unchanged} unchanged")
+        if stats.files_removed:
+            bits.append(f"{stats.files_removed} removed")
+        if stats.files_errored:
+            bits.append(f"{stats.files_errored} errored")
+        files_summary = " · ".join(bits) if bits else "no changes"
+        ingest_done_summary.value = (
+            f"{stats.chunks_added:,} chunks added  ·  {files_summary}"
+        )
+
+        # Format elapsed nicely (h:mm:ss for long runs)
+        e = max(0.0, elapsed_s)
+        if e >= 3600:
+            h = int(e // 3600); m = int((e % 3600) // 60); s = int(e % 60)
+            elapsed_str = f"{h}h{m:02d}m{s:02d}s"
+        elif e >= 60:
+            elapsed_str = f"{int(e // 60)}m{int(e % 60):02d}s"
+        else:
+            elapsed_str = f"{e:.1f}s"
+        files_total = stats.files_seen
+        ingest_done_meta.value = (
+            f"{files_total} files scanned · elapsed {elapsed_str}"
+        )
+
+        # Switch off the in-flight card; show the done card.
+        ingest_snippet_card.visible = False
+        ingest_done_card.visible = True
+        ingest_progress.visible = False
+
+        # Bookend the streaming log so it's clear the activity has stopped.
+        ingest_log.controls.append(ft.Text(
+            f"  ✓ done — {stats.chunks_added:,} chunks, {elapsed_str}",
+            size=11, color=SUCCESS,
+            weight=ft.FontWeight.W_700, font_family="monospace",
+        ))
 
     def add_files_clicked(_):
         if state.ws is None:
@@ -1514,11 +2608,15 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
             _toast(state.page, "Already busy")
             return
         ingest_log.controls.clear()
+        reset_ingest_panel_for_run()
         ingest_progress.visible = True
         ingest_progress.value = None
-        ingest_status.value = "Starting…"
-        ingest_meta.value = ""
-        ingest_snippet_card.visible = False
+        # More descriptive than "Starting…" — tells the user what's
+        # actually happening in the first few hundred ms before ingest()
+        # has time to emit its own status. ingest()'s very first call
+        # (within microseconds of being invoked) overwrites this.
+        ingest_status.value = "Spinning up worker thread…"
+        ingest_meta.value = "ingest is about to begin — initial setup runs on a background thread"
         state.page.update()
 
         # Shared state between progress callback, watchdog, and worker.
@@ -1527,6 +2625,8 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
             "last_snippet_t": 0.0,
             "last_bytes_change_t": time.monotonic(),
             "last_bytes": 0,
+            "last_page": 0,
+            "last_status": "",
             "last_stall_log_t": 0.0,
             "stall_severity": 0,         # 0=ok, 1=slow, 2=stalled
             "current_prog": None,        # latest IngestProgress snapshot
@@ -1534,7 +2634,6 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
             "running": True,
         }
 
-        SNIPPET_REFRESH_S = 3     # snippet card refresh cadence
         SLOW_THRESHOLD_S = 10     # no progress for this long → log "slow"
         STALL_THRESHOLD_S = 45    # → log "stalled" warning
         WATCHDOG_TICK_S = 0.5     # how often the heartbeat runs
@@ -1567,17 +2666,25 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
             )
 
         def progress_cb(prog):
-            # Track whether bytes_done advanced (for stall detection)
-            if prog.bytes_done > ingest_state["last_bytes"]:
-                ingest_state["last_bytes"] = prog.bytes_done
+            # Stall detection considers any forward signal — bytes finishing
+            # a file, page index advancing inside a long parse, or the status
+            # text changing (e.g. "parsing" → "embedding 32/200 chunks").
+            advanced = (
+                prog.bytes_done > ingest_state["last_bytes"]
+                or (prog.page or 0) > ingest_state["last_page"]
+                or prog.status != ingest_state["last_status"]
+            )
+            if advanced:
                 ingest_state["last_bytes_change_t"] = time.monotonic()
-                # Reset stall severity — we're moving again
                 if ingest_state["stall_severity"] > 0:
                     ingest_log.controls.append(ft.Text(
                         f"  ▶ resumed: {Path(prog.current_path).name}",
                         size=11, color=SUCCESS, font_family="monospace",
                     ))
                     ingest_state["stall_severity"] = 0
+            ingest_state["last_bytes"] = prog.bytes_done
+            ingest_state["last_page"] = prog.page or 0
+            ingest_state["last_status"] = prog.status
             ingest_state["current_prog"] = prog
 
             # Bar
@@ -1601,10 +2708,13 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                     )
                 )
 
-            # Snippet card every ~5 s
+            # Snippet card refreshes whenever the ingest pipeline sends a
+            # new sample (chunk text changing during contextualization,
+            # page-image preview, etc.). No countdown — the snippet just
+            # updates as new samples arrive, which on a busy run is
+            # multiple times per second.
             now = time.monotonic()
-            if (prog.snippet and
-                    (now - ingest_state["last_snippet_t"]) >= SNIPPET_REFRESH_S):
+            if prog.snippet:
                 page_str = f"  ·  page {prog.page}" if prog.page else ""
                 ingest_snippet_path.value = (
                     f"{Path(prog.current_path).name}{page_str}"
@@ -1615,12 +2725,16 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
 
             state.page.update()
 
-        def watchdog():
-            """Ticks every WATCHDOG_TICK_S seconds, regardless of whether the
-            ingest pipeline emitted progress. Updates the elapsed display
-            (real-time clock feel) and logs slow/stalled warnings."""
+        async def watchdog():
+            """Async watchdog. MUST be async + scheduled via page.run_task,
+            not page.run_thread — `page.update()` only paints reliably
+            from coroutines on Flet's asyncio loop. From a sync thread it
+            queues the change and waits for an OS paint event before
+            flushing, which is exactly the "doesn't refresh until I
+            alt-tab" symptom."""
+            import asyncio
             while ingest_state["running"]:
-                time.sleep(WATCHDOG_TICK_S)
+                await asyncio.sleep(WATCHDOG_TICK_S)
                 if not ingest_state["running"]:
                     break
                 prog = ingest_state["current_prog"]
@@ -1640,10 +2754,47 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                 else:
                     severity = 0
 
-                # Update the meta line with the live elapsed time
+                # Re-apply the LATEST status text + bar from prog, in case
+                # progress_cb's own page.update() got dropped on the floor
+                # by Flet 0.84 (the well-known "background-thread updates
+                # don't always paint without a window event" issue). The
+                # watchdog runs on page.run_thread() context, which paints
+                # reliably, so we mirror the worker's state here. Without
+                # this, the status text only repaints when the user pokes
+                # the window (Win+S, click, focus change, etc.).
+                ingest_status.value = (
+                    f"{prog.status} — {Path(prog.current_path).name}"
+                    if prog.current_path else prog.status
+                )
+                if prog.bytes_total > 0:
+                    ingest_progress.value = min(1.0, prog.bytes_pct)
+
                 ingest_meta.value = fmt_meta_line(
                     prog, override_elapsed=live_elapsed, extra=stall_msg,
                 )
+
+                # Update the OS window title so the user can see ingest
+                # progress in the taskbar / dock even when ez-rag is
+                # minimized, in the background, or on another tab. Flet
+                # propagates title changes regardless of focus state, and
+                # on Windows the SetWindowText syscall happens to also
+                # nudge Flutter into flushing pending paints — bonus.
+                try:
+                    if prog.files_total:
+                        pct = int(100 * prog.bytes_pct)
+                        state.page.title = (
+                            f"ez-rag — ingesting {prog.files_done}"
+                            f"/{prog.files_total} ({pct}%)"
+                        )
+                    else:
+                        # Even before files_total is known, set title so
+                        # the taskbar shows we're not frozen.
+                        state.page.title = (
+                            f"ez-rag — {prog.status[:40]}"
+                            if prog.status else "ez-rag — ingesting…"
+                        )
+                except Exception:
+                    pass
 
                 # Log the slow/stall transition once per severity escalation,
                 # then every 30 s while it persists.
@@ -1667,18 +2818,26 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                     state.page.update()
                 except Exception:
                     pass
+                # NUCLEAR: force a Win32 paint message so the queued value
+                # changes from the worker thread actually render. Without
+                # this, on Windows the user has to alt-tab / Win+S / click
+                # the window to see updates — Flutter Desktop pauses
+                # repaints when nothing is triggering a frame and Flet's
+                # background-thread updates don't always wake it.
+                force_window_redraw()
 
-        def worker():
+        async def worker():
+            """Async worker — runs the synchronous `ingest()` call on a
+            thread via asyncio.to_thread so blocking I/O doesn't pin the
+            event loop, but the wrapping context is async so any
+            page.update() calls we make here go through the working path."""
+            import asyncio
             try:
-                stats = ingest(state.ws, cfg=state.cfg, force=force,
-                               progress=progress_cb)
-                ingest_status.value = (
-                    f"Done · {stats.files_new} new · "
-                    f"{stats.files_changed} changed · "
-                    f"{stats.files_skipped_unchanged} unchanged · "
-                    f"{stats.chunks_added} chunks in "
-                    f"{stats.seconds:.1f}s"
+                stats = await asyncio.to_thread(
+                    ingest, state.ws, cfg=state.cfg, force=force,
+                    progress=progress_cb,
                 )
+                show_ingest_done(stats, stats.seconds)
                 if stats.errors:
                     ingest_log.controls.append(ft.Text(
                         f"{len(stats.errors)} error(s):", color=DANGER, size=12,
@@ -1689,19 +2848,28 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                         ))
             except Exception as ex:
                 ingest_status.value = f"Failed: {ex}"
+                ingest_status.color = DANGER
+                ingest_status.weight = ft.FontWeight.W_700
+                ingest_done_card.visible = False
             finally:
                 ingest_state["running"] = False
                 ingest_progress.visible = False
+                try:
+                    state.page.title = "ez-rag"
+                except Exception:
+                    pass
                 refresh_files()
                 refresh_status()
                 state.page.update()
 
-        # Both run via page.run_thread — Flet 0.84 silently drops
-        # page.update() calls made from a vanilla threading.Thread context,
-        # which would freeze the meta line / stall warnings here. The
-        # underlying executor handles >1 concurrent thread fine.
-        state.page.run_thread(watchdog)
-        state.page.run_thread(worker)
+        # Both run via page.run_task — async coroutines on Flet's asyncio
+        # loop. This is the only context where page.update() reliably
+        # triggers a Flutter frame on Windows. Using page.run_thread()
+        # (which we did before) puts the call on a thread pool that's
+        # outside the event loop, and updates from there only paint when
+        # an OS event (focus, click, alt-tab, Win+S) wakes the renderer.
+        state.page.run_task(watchdog)
+        state.page.run_task(worker)
 
     ingest_card = section_card(
         "INGEST",
@@ -1717,6 +2885,7 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
         ingest_progress,
         ingest_status,
         ingest_meta,
+        ingest_done_card,
         ingest_snippet_card,
         ft.Container(
             content=ingest_log,
@@ -1832,6 +3001,99 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
     rags_dir_picker = ft.FilePicker()
     page.services.append(rags_dir_picker)
 
+    def _build_appearance_card(_state: AppState) -> ft.Control:
+        themes = load_themes()
+        names = sorted(themes.keys())
+        active = get_theme_name() if get_theme_name() in themes else "dark"
+
+        # A small swatch row so the user can preview the selected palette
+        # without restarting.
+        swatch_row = ft.Row([], spacing=4, wrap=True)
+
+        def render_swatches(name: str):
+            swatch_row.controls.clear()
+            pal = themes.get(name) or themes["dark"]
+            for key in ("accent", "accent_soft", "bg", "surface", "surface_hi",
+                        "success", "warning", "danger", "user_bubble",
+                        "assist_bubble", "chip_bg"):
+                swatch_row.controls.append(ft.Container(
+                    width=18, height=18, bgcolor=pal[key], border_radius=4,
+                    tooltip=f"{key}: {pal[key]}",
+                    border=ft.border.all(1, "#0008"),
+                ))
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        def fmt_label(n: str) -> str:
+            return n.replace("_", " ").title()
+
+        dropdown = ft.Dropdown(
+            label="Palette",
+            value=active,
+            options=[ft.dropdown.Option(n, fmt_label(n)) for n in names],
+            width=240, dense=True,
+            tooltip=TIP["theme_palette"],
+        )
+        dropdown.on_change = lambda e: render_swatches(e.control.value)
+
+        status_text = ft.Text("", size=11, color=ON_SURFACE_DIM, italic=True)
+
+        def apply_theme(_):
+            chosen = dropdown.value or "dark"
+            if chosen == get_theme_name():
+                status_text.value = "Already active. Pick a different palette."
+                page.update()
+                return
+            set_theme_name(chosen)
+            status_text.value = (
+                f"Saved · '{fmt_label(chosen)}' applies on next launch. "
+                "Click Restart now."
+            )
+            page.update()
+
+        def restart_now(_):
+            try:
+                # Save first in case user picked-but-didn't-press Apply.
+                if dropdown.value and dropdown.value != get_theme_name():
+                    set_theme_name(dropdown.value)
+                # On Windows, sys.executable points at python; sys.argv[0]
+                # is the script path. Re-execing the current process is the
+                # simplest way to fully tear down and rebuild Flet's UI.
+                py = _sys.executable
+                os.execv(py, [py, *_sys.argv])
+            except Exception as ex:
+                _toast(page, f"Restart failed: {ex}. Close and reopen ez-rag.")
+
+        render_swatches(active)
+
+        return section_card(
+            "APPEARANCE",
+            ft.Row([
+                ft.Icon(ft.Icons.PALETTE, size=16, color=ACCENT),
+                ft.Text("Theme palette", size=11,
+                        color=ON_SURFACE_DIM, weight=ft.FontWeight.W_700),
+            ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            dropdown,
+            swatch_row,
+            ft.Row([
+                ft.FilledButton("Apply", icon=ft.Icons.CHECK,
+                                on_click=apply_theme,
+                                bgcolor=ACCENT, color="#FFFFFF",
+                                tooltip=TIP["theme_apply"]),
+                ft.OutlinedButton("Restart now", icon=ft.Icons.RESTART_ALT,
+                                  on_click=restart_now,
+                                  tooltip=TIP["theme_restart"]),
+            ], spacing=8),
+            status_text,
+            ft.Text(
+                f"Edit {THEMES_FILE.name} to add or tweak palettes — RGB hex "
+                "values, one TOML table per theme.",
+                size=11, color=ON_SURFACE_DIM, italic=True,
+            ),
+        )
+
     def _build_storage_card(_state: AppState) -> ft.Control:
         path_text = ft.Text(
             str(get_default_rags_dir()),
@@ -1876,6 +3138,123 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                 on_change=refresh_path,
             )
 
+        def export_chatbot_clicked(_):
+            if state.ws is None or not state.ws.is_initialized():
+                _toast(page, "Open a workspace first.")
+                return
+            if not state.ws.meta_db_path.exists():
+                _toast(page, "No index yet — run an ingest first.")
+                return
+            from ez_rag.export import estimate_sources_size, export_chatbot
+            n_files, n_bytes = estimate_sources_size(state.ws)
+            mb = n_bytes / (1024 * 1024)
+
+            # ----- confirm overlay with options -----
+            overlay = ft.Container(
+                expand=True, visible=True,
+                bgcolor=ft.Colors.with_opacity(0.55, "#000000"),
+                alignment=ft.Alignment.CENTER,
+            )
+
+            include_sources_cb = ft.Checkbox(
+                label=f"Include source files  ({n_files} files, "
+                      f"{mb:.1f} MB)",
+                value=False, active_color=ACCENT,
+                tooltip=TIP["include_sources"],
+            )
+
+            def _close(_=None):
+                overlay.visible = False
+                try:
+                    if overlay in page.overlay:
+                        page.overlay.remove(overlay)
+                except Exception:
+                    pass
+                page.update()
+
+            async def _confirm(_=None):
+                include = bool(include_sources_cb.value)
+                _close()
+                # File picker for the destination zip
+                default_name = (
+                    f"{state.ws.root.name}-chatbot"
+                    + ("-with-sources" if include else "") + ".zip"
+                )
+                try:
+                    p = await rags_dir_picker.save_file(
+                        dialog_title="Save chatbot bundle",
+                        file_name=default_name,
+                        allowed_extensions=["zip"],
+                    )
+                except Exception as ex:
+                    _toast(page, f"Save dialog failed: {ex}")
+                    return
+                if not p:
+                    return
+                # Spin off the actual export on a background thread —
+                # bundling 2 GB of PDFs would otherwise freeze the UI for
+                # 10+ seconds.
+                def _bg():
+                    try:
+                        themes = load_themes()
+                        palette = themes.get(get_theme_name()) or themes["dark"]
+                        out = export_chatbot(
+                            state.ws, Path(p),
+                            palette=palette,
+                            title=state.ws.root.name,
+                            include_sources=include,
+                        )
+                        size_mb = out.stat().st_size / (1024 * 1024)
+                        _toast(page,
+                            f"Chatbot exported → {out.name} ({size_mb:.1f} MB)"
+                        )
+                    except Exception as ex:
+                        _toast(page, f"Export failed: {ex}")
+                page.run_thread(_bg)
+
+            overlay.content = ft.Container(
+                width=520, padding=20,
+                bgcolor=SURFACE_DARK,
+                border=ft.border.all(1, "#262938"),
+                border_radius=14,
+                content=ft.Column([
+                    ft.Row([
+                        ft.Icon(ft.Icons.IOS_SHARE, color=ACCENT, size=22),
+                        ft.Text("Export chatbot", size=16,
+                                weight=ft.FontWeight.W_700, color=ON_SURFACE),
+                    ], spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ft.Text(
+                        "The chatbot index, vendored library, web UI, and "
+                        "launchers are always bundled. Source files are "
+                        "optional — bundle them if you want citation chips "
+                        "in the chatbot to render PDF pages and original "
+                        "screenshots.",
+                        size=12, color=ON_SURFACE_DIM,
+                    ),
+                    include_sources_cb,
+                    ft.Text(
+                        ("With sources: ~"
+                         f"{mb + 30:.0f} MB total (estimate). "
+                         "Without sources: ~30 MB. "
+                         "Citations show chunk text either way."),
+                        size=11, color=ON_SURFACE_DIM, italic=True,
+                    ),
+                    ft.Row([
+                        ft.Container(expand=True),
+                        ft.TextButton("Cancel", on_click=_close),
+                        ft.FilledButton(
+                            "Export…", icon=ft.Icons.DOWNLOAD,
+                            on_click=lambda e: page.run_task(_confirm),
+                            bgcolor=ACCENT, color="#FFFFFF",
+                        ),
+                    ], spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ], spacing=14, tight=True),
+            )
+            page.overlay.append(overlay)
+            page.update()
+
         return section_card(
             "STORAGE",
             ft.Row([
@@ -1895,6 +3274,24 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                                 bgcolor=ACCENT, color="#FFFFFF",
                                 tooltip=TIP["manage_rags"]),
             ], spacing=8, wrap=True),
+            ft.Container(height=4),
+            ft.Row([
+                ft.Icon(ft.Icons.IOS_SHARE, size=16, color=ACCENT),
+                ft.Text("Portable chatbot:", size=11,
+                        color=ON_SURFACE_DIM, weight=ft.FontWeight.W_700),
+            ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Text(
+                "Bundle this RAG with a runnable chatbot (Windows / macOS / "
+                "Linux). Settings, model choice, and index are baked in — the "
+                "recipient just runs the launcher.",
+                size=11, color=ON_SURFACE_DIM, italic=True,
+            ),
+            ft.Row([
+                ft.FilledButton("Export Chatbot…", icon=ft.Icons.DOWNLOAD,
+                                on_click=export_chatbot_clicked,
+                                bgcolor=ACCENT, color="#FFFFFF",
+                                tooltip=TIP["export_chatbot"]),
+            ], spacing=8),
         )
 
     chunk_size = ft.TextField(label="Chunk size (tokens)", value="512",
@@ -1922,7 +3319,15 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         label="MMR λ (0–1)", value="0.5", width=140, dense=True,
         tooltip=TIP["mmr_lambda"],
     )
-    use_corpus = ft.Switch(label="Use corpus (RAG)", value=True,
+    expand_chapter_sw = ft.Switch(
+        label="Expand to chapter", value=False, active_color=ACCENT,
+        tooltip=TIP["expand_to_chapter"],
+    )
+    chapter_max_chars_field = ft.TextField(
+        label="Chapter cap (chars)", value="16000", width=180, dense=True,
+        tooltip=TIP["chapter_max_chars"],
+    )
+    use_corpus = ft.Switch(label="Use RAG", value=True,
                            active_color=ACCENT, tooltip=TIP["use_corpus"])
     unload_llm_sw = ft.Switch(
         label="Unload LLM during ingest",
@@ -1931,6 +3336,14 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
     embed_batch_field = ft.TextField(
         label="Embed batch size", value="16", width=160, dense=True,
         tooltip=TIP["embed_batch"],
+    )
+    num_batch_field = ft.TextField(
+        label="LLM num_batch", value="1024", width=160, dense=True,
+        tooltip=TIP["num_batch"],
+    )
+    num_ctx_field = ft.TextField(
+        label="LLM num_ctx (0=auto)", value="0", width=180, dense=True,
+        tooltip=TIP["num_ctx"],
     )
     agentic_sw = ft.Switch(label="Agentic mode", value=False,
                            active_color=ACCENT, tooltip=TIP["agentic"])
@@ -2074,14 +3487,25 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
     # dialog.open=False from a worker thread, so we use a plain visibility-
     # toggled Container in page.overlay instead. Open/close from any thread.
 
-    def open_pull_dialog(kind: str, target_dropdown: ft.Dropdown):
+    def open_pull_dialog(kind: str, target_dropdown=None, *,
+                         prefill_tag: str | None = None):
+        """Show the Ollama library browser. `target_dropdown` is optional —
+        when provided, picking a tag also sets that dropdown's value (used
+        from the LLM / embedder model fields). `prefill_tag` lets callers
+        skip the browse step entirely and go straight to a pull (used by
+        the chat-error 'Re-pull this model' action).
+        """
         capability_filter = "embedding" if kind == "embed" else None
         gpu_total_vram = detect_total_vram_gb()
 
+        # NB: this TextField sits directly in the dialog's Column, so we
+        # MUST NOT pass expand=True — that means "grab leftover vertical
+        # space" inside a Column, which is what was making the search bar
+        # stretch and shove the list off-screen.
         search_field = ft.TextField(
             hint_text="Search the Ollama library…",
             prefix_icon=ft.Icons.SEARCH,
-            expand=True, dense=True,
+            dense=True,
             border_color="#2A2D3D",
             focused_border_color=ACCENT,
             cursor_color=ACCENT,
@@ -2090,6 +3514,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         tag_field = ft.TextField(
             label="Tag",
             hint_text="qwen2.5:7b-instruct  (auto-fills when you click a size below)",
+            value=prefill_tag or "",
             expand=True, dense=True,
             border_color="#2A2D3D",
             focused_border_color=ACCENT,
@@ -2367,7 +3792,13 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                 ft.Row([tag_field, pull_btn], spacing=10,
                        vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 progress,
-                progress_text,
+                # Heartbeat lives next to the progress text so the modal's
+                # frame loop stays alive across multi-minute downloads —
+                # otherwise the % / MB/s / ETA values only repaint when
+                # the user clicks somewhere.
+                ft.Row([modal_heartbeat(), progress_text],
+                       spacing=8,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ft.Row([ft.Container(expand=True), cancel_btn],
                        vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ], spacing=10, tight=True),
@@ -2393,13 +3824,36 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
             if not tag:
                 _toast(page, "Click a size chip or type a tag first")
                 return
+            if tag in state.active_pulls:
+                _toast(page,
+                    f"{tag} is already being pulled — close this dialog "
+                    "and check the header badge for progress.")
+                return
             pull_btn.disabled = True
             cancel_btn.disabled = True
             search_field.disabled = True
             progress.visible = True
             progress.value = None
             progress_text.value = "Starting…"
+            # Register the pull at app-level state so it survives if the
+            # dialog is dismissed mid-pull. The header badge polls this.
+            state.active_pulls[tag] = {
+                "completed": 0, "total": 0, "status": "starting",
+                "pct": 0.0, "started_at": time.monotonic(),
+            }
             page.update()
+
+            def safe_update(**fields):
+                """Update dialog widgets but never raise if they're already
+                detached (because the user closed the dialog)."""
+                try:
+                    if "progress" in fields:
+                        progress.value = fields["progress"]
+                    if "text" in fields:
+                        progress_text.value = fields["text"]
+                    page.update()
+                except Exception:
+                    pass
 
             def worker():
                 start_t = time.monotonic()
@@ -2426,9 +3880,19 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                         last_t = now
                         last_completed = completed
 
+                        # Mirror to app-level state so the header badge +
+                        # any reopened dialog can read live progress.
+                        pct = (completed / total) if total else None
+                        state.active_pulls[tag] = {
+                            "completed": completed,
+                            "total": total,
+                            "status": status,
+                            "pct": pct,
+                            "rate_bps": avg_rate,
+                            "started_at": start_t,
+                        }
+
                         if total and completed:
-                            pct = completed / total
-                            progress.value = min(1.0, pct)
                             done_g, tot_g = completed / 1e9, total / 1e9
                             rate_str = (
                                 f"{avg_rate / 1e6:.1f} MB/s"
@@ -2444,48 +3908,58 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                                     eta_str = f"{int(eta_s/60)}:{int(eta_s%60):02d}"
                             else:
                                 eta_str = "—"
-                            progress_text.value = (
+                            text = (
                                 f"{status}  ·  {pct*100:.1f}%  ·  "
                                 f"{done_g:.2f} / {tot_g:.2f} GB  ·  "
                                 f"{rate_str}  ·  ETA {eta_str}"
                             )
+                            if now - last_paint_t > 0.1 or status == "success":
+                                safe_update(progress=min(1.0, pct), text=text)
+                                last_paint_t = now
                         else:
-                            progress_text.value = status
-                            if status not in ("success",):
-                                progress.value = None
-
-                        # Repaint at most ~10 fps so we don't flood Flet.
-                        if now - last_paint_t > 0.1 or status == "success":
-                            page.update()
-                            last_paint_t = now
+                            if now - last_paint_t > 0.5 or status == "success":
+                                safe_update(
+                                    progress=None if status != "success" else 1.0,
+                                    text=status,
+                                )
+                                last_paint_t = now
 
                         if status == "success":
                             break
 
                     elapsed = time.monotonic() - start_t
-                    progress.value = 1.0
-                    progress_text.value = (
-                        f"✓ Pulled {tag} in {elapsed:.1f}s"
-                        if elapsed < 60
-                        else f"✓ Pulled {tag} in {int(elapsed//60)}m{int(elapsed%60):02d}s"
-                    )
-                    pull_btn.disabled = False
-                    cancel_btn.disabled = False
-                    search_field.disabled = False
-                    page.update()
-                    refresh_model_dropdowns()
-                    target_dropdown.value = _norm_tag(tag)
-                    page.update()
-                    # Auto-close — overlay visibility toggles propagate fine
-                    # from a worker thread (unlike DialogControl).
-                    close_dialog()
+                    elapsed_str = (f"{elapsed:.1f}s" if elapsed < 60
+                                   else f"{int(elapsed//60)}m{int(elapsed%60):02d}s")
+                    safe_update(progress=1.0,
+                                text=f"✓ Pulled {tag} in {elapsed_str}")
+                    # Always toast on success — works whether the dialog is
+                    # still open or was dismissed mid-download.
+                    _toast(page, f"✓ Downloaded {tag} ({elapsed_str})")
+                    try:
+                        refresh_model_dropdowns()
+                        if target_dropdown is not None:
+                            target_dropdown.value = _norm_tag(tag)
+                        page.update()
+                    except Exception:
+                        pass
+                    try:
+                        close_dialog()
+                    except Exception:
+                        pass
                 except Exception as e:
-                    progress.value = 0
-                    progress_text.value = f"Error: {e}"
-                    pull_btn.disabled = False
-                    cancel_btn.disabled = False
-                    search_field.disabled = False
-                    page.update()
+                    safe_update(progress=0, text=f"Error: {e}")
+                    _toast(page, f"✗ Pull failed for {tag}: {e}")
+                finally:
+                    # Re-enable controls (no-op if dialog closed) and remove
+                    # this pull from active state so the badge clears.
+                    try:
+                        pull_btn.disabled = False
+                        cancel_btn.disabled = False
+                        search_field.disabled = False
+                        page.update()
+                    except Exception:
+                        pass
+                    state.active_pulls.pop(tag, None)
 
             page.run_thread(worker)
 
@@ -2513,6 +3987,8 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         context_window_field.value = str(c.context_window)
         use_mmr_sw.value = c.use_mmr
         mmr_lambda_field.value = str(c.mmr_lambda)
+        expand_chapter_sw.value = getattr(c, "expand_to_chapter", False)
+        chapter_max_chars_field.value = str(getattr(c, "chapter_max_chars", 16000))
         agentic_sw.value = c.agentic
         agent_provider_dd.value = c.agent_provider
         agent_model_field.value = c.agent_model
@@ -2523,6 +3999,8 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         query_negatives_field.value = c.query_negatives
         unload_llm_sw.value = c.unload_llm_during_ingest
         embed_batch_field.value = str(c.embed_batch_size)
+        num_batch_field.value = str(getattr(c, "num_batch", 1024))
+        num_ctx_field.value = str(getattr(c, "num_ctx", 0))
         use_corpus.value = c.use_rag
         enable_ocr.value = c.enable_ocr
         contextual.value = c.enable_contextual
@@ -2550,6 +4028,16 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
             return
         try:
             c = state.cfg
+            # Snapshot the model fields BEFORE we mutate them so we can
+            # detect a model switch and evict the old ones from VRAM. If
+            # we don't do this Ollama often returns 'unable to load model'
+            # on the first chat after a switch — the new model can't fit
+            # because the old one is still resident.
+            old_llm_url = c.llm_url
+            old_llm_model = c.llm_model
+            old_ollama_embed = c.ollama_embed_model
+            old_embedder_provider = c.embedder_provider
+
             c.chunk_size = int(chunk_size.value)
             c.chunk_overlap = int(chunk_overlap.value)
             c.top_k = int(top_k.value)
@@ -2563,6 +4051,13 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                 c.mmr_lambda = max(0.0, min(1.0, float(mmr_lambda_field.value or 0.5)))
             except ValueError:
                 pass
+            c.expand_to_chapter = bool(expand_chapter_sw.value)
+            try:
+                c.chapter_max_chars = max(
+                    1000, int(chapter_max_chars_field.value or 16000)
+                )
+            except ValueError:
+                pass
             c.agentic = bool(agentic_sw.value)
             c.agent_provider = agent_provider_dd.value or "same"
             c.agent_model = (agent_model_field.value or "").strip()
@@ -2574,6 +4069,14 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
             c.unload_llm_during_ingest = bool(unload_llm_sw.value)
             try:
                 c.embed_batch_size = max(1, int(embed_batch_field.value or 16))
+            except ValueError:
+                pass
+            try:
+                c.num_batch = max(64, int(num_batch_field.value or 1024))
+            except ValueError:
+                pass
+            try:
+                c.num_ctx = max(0, int(num_ctx_field.value or 0))
             except ValueError:
                 pass
             c.use_rag = bool(use_corpus.value)
@@ -2593,6 +4096,47 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                 c.llm_provider = "auto"
             c.save(state.ws.config_path)
             clear_embedder_cache()
+
+            # ----- VRAM hygiene on model switch -----
+            # Build the set of "models we still want resident" so we don't
+            # accidentally evict the new selections. Then unload anything
+            # else, which catches stale chat models and old embedders.
+            llm_changed = (c.llm_model != old_llm_model
+                           or c.llm_url != old_llm_url)
+            embedder_changed = (
+                c.ollama_embed_model != old_ollama_embed
+                or c.embedder_provider != old_embedder_provider
+            )
+
+            unloaded: list[str] = []
+            if llm_changed or embedder_changed:
+                # Run on a thread so a slow Ollama doesn't freeze the GUI.
+                def _evict():
+                    keep: set[str] = set()
+                    # Keep the new selections, in case Ollama autostarts them.
+                    if c.llm_model:
+                        keep.add(c.llm_model)
+                    if c.embedder_provider == "ollama" and c.ollama_embed_model:
+                        keep.add(c.ollama_embed_model)
+                    try:
+                        out = unload_running_models(c.llm_url, except_=keep)
+                    except Exception:
+                        out = []
+                    # Also explicitly unload the OLD specific tags in case
+                    # the user is on a different Ollama URL or /api/ps
+                    # didn't return them.
+                    for old_tag in (old_llm_model, old_ollama_embed):
+                        if old_tag and old_tag not in keep and old_tag not in out:
+                            try:
+                                if unload_ollama_model(old_llm_url, old_tag):
+                                    out.append(old_tag)
+                            except Exception:
+                                pass
+                    if out:
+                        _toast(state.page,
+                               f"Unloaded from VRAM: {', '.join(out)}")
+                state.page.run_thread(_evict)
+
             _toast(state.page, "Settings saved")
             refresh_status()
         except ValueError as ex:
@@ -2629,6 +4173,10 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
                             ft.Row([context_window_field, use_mmr_sw,
                                     mmr_lambda_field], spacing=14,
+                                   wrap=True,
+                                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                            ft.Row([expand_chapter_sw,
+                                    chapter_max_chars_field], spacing=14,
                                    wrap=True,
                                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
                         ),
@@ -2695,14 +4243,21 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                     ft.Container(
                         expand=1,
                         content=section_card(
-                            "INGEST PERFORMANCE",
+                            "INGEST + INFERENCE PERFORMANCE",
                             unload_llm_sw,
-                            ft.Row([embed_batch_field],
+                            ft.Row([embed_batch_field, num_batch_field,
+                                    num_ctx_field],
+                                   wrap=True, spacing=10,
                                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
                             ft.Text(
                                 "Higher batch sizes use more memory but ingest "
                                 "faster on a strong GPU. Unloading the chat LLM "
-                                "is auto-skipped when Contextual Retrieval is on.",
+                                "is auto-skipped when Contextual Retrieval is on. "
+                                "num_batch=1024 measured -23% TTFT on a 32B model "
+                                "vs default 512. For maximum chat speed also set "
+                                "OLLAMA_FLASH_ATTENTION=1 in the shell that "
+                                "starts `ollama serve` — see Doctor for the full "
+                                "recommendation.",
                                 size=11, color=ON_SURFACE_DIM, italic=True,
                             ),
                         ),
@@ -2710,6 +4265,16 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                     ft.Container(
                         expand=1,
                         content=_build_storage_card(state),
+                    ),
+                ],
+                spacing=14,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            ),
+            ft.Row(
+                [
+                    ft.Container(
+                        expand=1,
+                        content=_build_appearance_card(state),
                     ),
                 ],
                 spacing=14,
@@ -2731,7 +4296,10 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
     )
 
     container = ft.Container(bgcolor=BG_DARK, expand=True, content=body)
-    return container, load_from_cfg
+    # Expose open_pull_dialog so other views (e.g. the chat error
+    # 'Re-pull this model' action) can trigger a pull without re-implementing
+    # the whole dialog. The chat view captures this via a shared callback dict.
+    return container, load_from_cfg, open_pull_dialog
 
 
 # ============================================================================
@@ -2806,6 +4374,99 @@ def build_doctor_view(state: AppState):
             "Python", True,
             f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro} ({sys.platform})",
         ))
+
+        # ----- performance recommendations ------------------------------
+        # These are environment variables that affect Ollama itself, not
+        # ez-rag — they have to be set in the shell that launched
+        # `ollama serve`. ez-rag can only detect them and recommend
+        # changes. Empirically (deepseek-r1:32b, RTX 5090) flash + KV
+        # quant gave +6% throughput; with our num_batch=1024 default
+        # (already applied per-request) the total gain was ~+8%.
+        flash = os.environ.get("OLLAMA_FLASH_ATTENTION", "")
+        kvtype = os.environ.get("OLLAMA_KV_CACHE_TYPE", "")
+        flash_on = flash in ("1", "true", "TRUE", "True")
+        kv_q = kvtype in ("q4_0", "q8_0")
+
+        rows.controls.append(row(
+            "Ollama: Flash attention",
+            flash_on,
+            f"OLLAMA_FLASH_ATTENTION={flash or '(unset)'}",
+            "+~4% throughput. Set OLLAMA_FLASH_ATTENTION=1 in the shell "
+            "that launches `ollama serve` and restart Ollama."
+            if not flash_on else "enabled",
+        ))
+        rows.controls.append(row(
+            "Ollama: KV cache quantization",
+            kv_q,
+            f"OLLAMA_KV_CACHE_TYPE={kvtype or '(unset → f16)'}",
+            "Halves KV memory at no measurable speed cost (q8_0) or "
+            "quarters it (q4_0). Set OLLAMA_KV_CACHE_TYPE=q8_0 in the "
+            "shell launching `ollama serve`. Pairs with flash attention."
+            if not kv_q else "enabled",
+        ))
+        rows.controls.append(row(
+            "Per-request num_batch",
+            int(getattr(state.cfg, "num_batch", 0) or 0) >= 1024,
+            f"num_batch={getattr(state.cfg, 'num_batch', 0) or 0}",
+            "1024 measured -23% TTFT vs default 512. Tune in Settings → "
+            "Performance.",
+        ))
+
+        # ----- Embedder vs index dimension check -----
+        # Crucial: if the configured embedder's vector size differs from
+        # the index's, every retrieval will throw the matmul-mismatch
+        # error. Surface this BEFORE the user hits it in chat.
+        if state.ws is not None and state.ws.meta_db_path.exists():
+            idx_stats = read_stats(state.ws.meta_db_path) or {}
+            idx_embedder = idx_stats.get("last_embedder") or ""
+            cur_embedder_label = ""
+            cur_dim = None
+            try:
+                from ez_rag.embed import make_embedder as _mk
+                emb = _mk(state.cfg)
+                cur_embedder_label = emb.name
+                cur_dim = emb.dim
+            except Exception as _e:
+                cur_embedder_label = f"unloadable ({_e})"
+            # Read index dim straight from a chunk row.
+            idx_dim = None
+            try:
+                import sqlite3 as _s
+                conn = _s.connect(str(state.ws.meta_db_path))
+                r = conn.execute(
+                    "SELECT embedding FROM chunks LIMIT 1"
+                ).fetchone()
+                if r and r[0]:
+                    idx_dim = len(r[0]) // 4  # float32
+                conn.close()
+            except Exception:
+                pass
+            if idx_dim is None:
+                # No chunks yet — nothing to mismatch. Skip the row.
+                pass
+            elif cur_dim is None:
+                rows.controls.append(row(
+                    "Embedder match", "warn",
+                    f"index={idx_dim}-d, current=?",
+                    "Couldn't load the configured embedder — see error above.",
+                ))
+            elif cur_dim != idx_dim:
+                rows.controls.append(row(
+                    "Embedder match", False,
+                    f"index={idx_dim}-d ({idx_embedder or 'unknown'}), "
+                    f"current={cur_dim}-d ({cur_embedder_label})",
+                    "MISMATCH — chat will fail with a matmul error. "
+                    "Either re-ingest with the current embedder (Files tab "
+                    "→ Re-ingest force) or switch the embedder back in "
+                    "Settings → Embedder.",
+                ))
+            else:
+                rows.controls.append(row(
+                    "Embedder match", True,
+                    f"{idx_dim}-d ({cur_embedder_label})",
+                    "Index dimensions match the active embedder.",
+                ))
+
         state.page.update()
 
     container = ft.Container(
@@ -3381,12 +5042,299 @@ def _toast(page: ft.Page, msg: str) -> None:
 
 
 # ============================================================================
+# System telemetry status bar
+# ============================================================================
+
+def _build_sysmon_bar(state: AppState, *,
+                      refresh_pull_badge_cb=None) -> ft.Control:
+    """Pinned footer showing CPU / RAM / GPU / VRAM / temps in real time.
+
+    Sampling runs on a background thread at 1 Hz. Fields the host can't
+    supply (no NVIDIA driver, no CPU temp on Windows, etc.) are hidden
+    rather than shown as 'N/A' clutter.
+    """
+    from ez_rag.sysmon import (
+        Sample, fmt_gb, fmt_mb_as_gb, fmt_pct, fmt_power_w, fmt_temp_c, sample,
+    )
+
+    # ----- color helpers -------------------------------------------------
+    def _color_for_pct(pct: float | None) -> str:
+        if pct is None:
+            return ON_SURFACE_DIM
+        if pct >= 95:
+            return DANGER
+        if pct >= 80:
+            return WARNING
+        return ON_SURFACE
+
+    def _color_for_temp(t: float | None) -> str:
+        if t is None:
+            return ON_SURFACE_DIM
+        if t >= 85:
+            return DANGER
+        if t >= 75:
+            return WARNING
+        return ON_SURFACE
+
+    def _segment(label: str, value_text: ft.Text,
+                 *, value_extra: ft.Control | None = None,
+                 tip: str = "") -> ft.Control:
+        kids = [
+            ft.Text(label, size=10, color=ON_SURFACE_DIM,
+                    weight=ft.FontWeight.W_700),
+            value_text,
+        ]
+        if value_extra is not None:
+            kids.append(value_extra)
+        return ft.Container(
+            tooltip=tip,
+            padding=ft.padding.symmetric(horizontal=10, vertical=2),
+            content=ft.Row(kids, spacing=6,
+                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        )
+
+    # Mini progress bar (used for CPU/RAM/GPU compute/VRAM percentages)
+    def _mini_bar() -> ft.ProgressBar:
+        return ft.ProgressBar(
+            value=0, color=ACCENT, bgcolor="#1E2130",
+            width=80, height=4,
+        )
+
+    # ----- segment widgets -----------------------------------------------
+    cpu_text = ft.Text("—", size=11, color=ON_SURFACE,
+                       weight=ft.FontWeight.W_600, font_family="monospace")
+    cpu_bar = _mini_bar()
+    cpu_seg = _segment("CPU", cpu_text, value_extra=cpu_bar,
+                       tip="System CPU load (rolling) and core count.")
+
+    cpu_temp_text = ft.Text("—", size=11, color=ON_SURFACE,
+                            font_family="monospace")
+    cpu_temp_seg = _segment("CPU °", cpu_temp_text,
+                            tip="CPU package temperature. Often unavailable "
+                                "on Windows without elevated permissions.")
+
+    ram_text = ft.Text("—", size=11, color=ON_SURFACE,
+                       weight=ft.FontWeight.W_600, font_family="monospace")
+    ram_bar = _mini_bar()
+    ram_seg = _segment("RAM", ram_text, value_extra=ram_bar,
+                       tip="System RAM used / total.")
+
+    gpu_text = ft.Text("—", size=11, color=ON_SURFACE,
+                       weight=ft.FontWeight.W_600, font_family="monospace")
+    gpu_bar = _mini_bar()
+    gpu_seg = _segment("GPU", gpu_text, value_extra=gpu_bar,
+                       tip="NVIDIA GPU compute utilization.")
+
+    vram_text = ft.Text("—", size=11, color=ON_SURFACE,
+                        weight=ft.FontWeight.W_600, font_family="monospace")
+    vram_bar = _mini_bar()
+    vram_seg = _segment("VRAM", vram_text, value_extra=vram_bar,
+                        tip="GPU video memory used / total. The LLM weights "
+                            "+ KV cache live here.")
+
+    gpu_temp_text = ft.Text("—", size=11, color=ON_SURFACE,
+                            font_family="monospace")
+    gpu_temp_seg = _segment("GPU °", gpu_temp_text,
+                            tip="GPU edge temperature.")
+
+    gpu_power_text = ft.Text("—", size=11, color=ON_SURFACE,
+                             font_family="monospace")
+    gpu_power_seg = _segment("Power", gpu_power_text,
+                             tip="Live GPU power draw.")
+
+    sep = lambda: ft.Container(
+        width=1, height=14, bgcolor=SURFACE_DARK_HI,
+        margin=ft.margin.symmetric(horizontal=2),
+    )
+
+    # Layout — segments separated by thin vertical dividers. Whole bar is
+    # one row that horizontally scrolls on narrow windows so nothing gets
+    # truncated mysteriously.
+    bar_row = ft.Row(
+        [
+            cpu_seg, sep(),
+            cpu_temp_seg, sep(),
+            ram_seg, sep(),
+            gpu_seg, sep(),
+            vram_seg, sep(),
+            gpu_temp_seg, sep(),
+            gpu_power_seg,
+        ],
+        spacing=4,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        scroll=ft.ScrollMode.AUTO,
+    )
+
+    # ----- frame-loop heartbeat ------------------------------------------
+    # Flutter Desktop on Windows pauses repaints when the window has no
+    # user input, which means page.update() from background threads only
+    # gets painted on the next user click. Keeping a small element
+    # animating forces vsync to stay engaged — the indicator below ticks
+    # twice a second whether or not the user is touching the window, which
+    # makes ingest progress / sysmon stats feel live.
+    heartbeat = ft.ProgressRing(
+        width=10, height=10, stroke_width=1.5,
+        color=ft.Colors.with_opacity(0.6, ACCENT),
+        bgcolor="transparent",
+        tooltip="Live indicator — keeps the UI repainting so progress "
+                "tickers stay current even when you're not clicking.",
+    )
+
+    bar_container = ft.Container(
+        content=ft.Row([heartbeat, bar_row], spacing=8,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        padding=ft.padding.symmetric(horizontal=10, vertical=4),
+        bgcolor=SURFACE_DARK,
+        border=ft.border.only(top=ft.BorderSide(1, "#1E2130")),
+        height=28,
+    )
+
+    # ----- background sampler --------------------------------------------
+    sysmon_state = {"running": True, "interval_s": 1.0}
+    state.page.on_close = (lambda *a, **k:
+        sysmon_state.__setitem__("running", False))
+
+    def _apply(s: Sample):
+        # CPU
+        if s.cpu_pct is not None:
+            cores = f" / {s.cpu_count}c" if s.cpu_count else ""
+            cpu_text.value = f"{fmt_pct(s.cpu_pct)}{cores}"
+            cpu_text.color = _color_for_pct(s.cpu_pct)
+            cpu_bar.value = max(0.0, min(1.0, s.cpu_pct / 100.0))
+            cpu_bar.color = cpu_text.color
+            cpu_seg.visible = True
+        else:
+            cpu_seg.visible = False
+
+        # CPU temp — hide if not available (Windows default)
+        if s.cpu_temp_c is not None:
+            cpu_temp_text.value = fmt_temp_c(s.cpu_temp_c)
+            cpu_temp_text.color = _color_for_temp(s.cpu_temp_c)
+            cpu_temp_seg.visible = True
+        else:
+            cpu_temp_seg.visible = False
+
+        # RAM
+        if s.ram_pct is not None:
+            ram_text.value = (
+                f"{fmt_gb(s.ram_used_gb)} / {fmt_gb(s.ram_total_gb)} "
+                f"({fmt_pct(s.ram_pct)})"
+            )
+            ram_text.color = _color_for_pct(s.ram_pct)
+            ram_bar.value = max(0.0, min(1.0, s.ram_pct / 100.0))
+            ram_bar.color = ram_text.color
+            ram_seg.visible = True
+        else:
+            ram_seg.visible = False
+
+        # GPU (first GPU only — multi-GPU users with nvidia-smi can read
+        # the rest from the OS; the status bar stays single-line).
+        gpu = s.gpus[0] if s.gpus else None
+        if gpu and gpu.util_pct is not None:
+            gpu_text.value = fmt_pct(gpu.util_pct)
+            gpu_text.color = _color_for_pct(gpu.util_pct)
+            gpu_bar.value = max(0.0, min(1.0, (gpu.util_pct or 0) / 100.0))
+            gpu_bar.color = gpu_text.color
+            gpu_seg.visible = True
+        else:
+            gpu_seg.visible = False
+
+        if gpu and gpu.vram_used_mb is not None and gpu.vram_total_mb:
+            vram_pct = gpu.vram_pct
+            vram_text.value = (
+                f"{fmt_mb_as_gb(gpu.vram_used_mb)} / "
+                f"{fmt_mb_as_gb(gpu.vram_total_mb)} "
+                f"({fmt_pct(vram_pct)})"
+            )
+            vram_text.color = _color_for_pct(vram_pct)
+            vram_bar.value = max(0.0, min(1.0, (vram_pct or 0) / 100.0))
+            vram_bar.color = vram_text.color
+            vram_seg.visible = True
+        else:
+            vram_seg.visible = False
+
+        if gpu and gpu.temp_c is not None:
+            gpu_temp_text.value = fmt_temp_c(gpu.temp_c)
+            gpu_temp_text.color = _color_for_temp(gpu.temp_c)
+            gpu_temp_seg.visible = True
+        else:
+            gpu_temp_seg.visible = False
+
+        if gpu and gpu.power_w is not None:
+            gpu_power_text.value = fmt_power_w(gpu.power_w)
+            gpu_power_seg.visible = True
+        else:
+            gpu_power_seg.visible = False
+
+    async def _sampler_async():
+        """Async version of the sysmon ticker.
+
+        IMPORTANT: this MUST be async + scheduled via page.run_task, not
+        page.run_thread. Flet's `page.update()` only reliably paints when
+        called from a coroutine running on the asyncio loop. The same
+        call from a vanilla thread (page.run_thread) just queues the
+        change and waits for an OS paint event (focus change, alt-tab,
+        Win+S) before flushing. See flet-dev/flet#3571 / #4829.
+        """
+        import asyncio
+        # Burn one sample on a thread so we don't block the event loop
+        # while psutil initializes its first cpu_percent baseline.
+        await asyncio.to_thread(sample)
+        while sysmon_state["running"]:
+            await asyncio.sleep(sysmon_state["interval_s"])
+            if not sysmon_state["running"]:
+                break
+            try:
+                # nvidia-smi takes ~5-30 ms — push it to a thread so we
+                # don't block the event loop.
+                snap = await asyncio.to_thread(sample)
+                _apply(snap)
+                if refresh_pull_badge_cb:
+                    cb = refresh_pull_badge_cb.get("fn")
+                    if cb is not None:
+                        try: cb()
+                        except Exception: pass
+                state.page.update()
+                # Belt-and-suspenders Win32 paint message. Cheap.
+                force_window_redraw()
+            except Exception:
+                pass
+
+    # page.run_task() schedules the coroutine on Flet's asyncio loop —
+    # the ONLY context where page.update() reliably triggers a frame.
+    state.page.run_task(_sampler_async)
+
+    return bar_container
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
 def app(page: ft.Page):
+    # Resolve the active palette and apply BEFORE any widgets are built
+    # below — those widgets bake the colors into their constructor args.
+    themes = load_themes()
+    theme_name = get_theme_name()
+    if theme_name not in themes:
+        theme_name = "dark"
+    _apply_palette(themes[theme_name])
+
+    # Sweep stale citation page-image previews so the cache doesn't grow
+    # forever. 3 days of inactivity → eviction (mtime is touched on each
+    # cache hit so frequently-viewed previews effectively get a rolling
+    # lease). One-shot at startup, never blocks rendering.
+    try:
+        from ez_rag.preview import sweep_old_previews
+        sweep_old_previews()
+    except Exception:
+        pass
+
     page.title = "ez-rag"
-    page.theme_mode = ft.ThemeMode.DARK
+    # Light palettes need ThemeMode.LIGHT so Flet's auto-rendered material
+    # widgets (date pickers, default scrollbars, etc.) match.
+    is_light = theme_name in ("light", "solarized_light")
+    page.theme_mode = ft.ThemeMode.LIGHT if is_light else ft.ThemeMode.DARK
     page.bgcolor = BG_DARK
     page.padding = 0
     page.window.width = 1280
@@ -3402,6 +5350,7 @@ def app(page: ft.Page):
     page.services.append(ws_picker)
 
     refresh_files_cb: dict = {}
+    refresh_pull_badge_cb: dict = {}
     refresh_status_cb: dict = {}
     refresh_doctor_cb: dict = {}
     welcome_render_cb: dict = {}
@@ -3462,7 +5411,7 @@ def app(page: ft.Page):
             on_created=lambda new_path: set_workspace_path(new_path),
         )
 
-    header_bar, update_header = build_header(
+    header_bar, update_header, refresh_pull_badge = build_header(
         state,
         on_open_workspace=lambda _=None: on_open_workspace(),
         on_create_rag=on_create_rag_action,
@@ -3470,14 +5419,23 @@ def app(page: ft.Page):
         refresh_status=refresh_status,
     )
     refresh_status_cb["fn"] = update_header
+    # Expose the badge refresher so the sysmon watchdog can tick it once a
+    # second alongside its own samples — that way the user sees download
+    # progress in the header even with the pull dialog closed.
+    refresh_pull_badge_cb["fn"] = refresh_pull_badge
 
     # ---- views -----------------------------------------------------------
+
+    # Will be populated below once build_settings_view returns. Chat view
+    # error actions look it up at click-time, so it can be late-bound.
+    open_pull_dialog_cb: dict = {}
 
     chat_view, render_chat, chat_input = build_chat_view(
         state,
         refresh_status=refresh_status,
         on_open_workspace=lambda _=None: on_open_workspace(),
         on_open_files=go_to_files,
+        open_pull_dialog_cb=open_pull_dialog_cb,
     )
     render_chat_cb = {"fn": render_chat}
 
@@ -3485,11 +5443,14 @@ def app(page: ft.Page):
         state, refresh_status=refresh_status,
         refresh_files_cb=refresh_files_cb,
     )
-    settings_view, load_settings = build_settings_view(
+    settings_view, load_settings, open_pull_dialog = build_settings_view(
         state, refresh_status=refresh_status,
         on_pick_workspace=set_workspace_path,
     )
     load_settings_cb = {"fn": load_settings}
+    # Now that the settings view has been constructed, hand its
+    # `open_pull_dialog` to the chat view's error-action factory.
+    open_pull_dialog_cb["fn"] = open_pull_dialog
     doctor_view, refresh_doctor = build_doctor_view(state)
     refresh_doctor_cb["fn"] = refresh_doctor
 
@@ -3574,6 +5535,13 @@ def app(page: ft.Page):
 
     page.on_keyboard_event = on_keyboard
 
+    # ---- system telemetry status bar -------------------------------------
+    # Pinned footer showing CPU / RAM / GPU / VRAM / temps in real time so
+    # the user can see how loaded their machine is during ingest + chat.
+    sysbar = _build_sysmon_bar(
+        state, refresh_pull_badge_cb=refresh_pull_badge_cb,
+    )
+
     # ---- assemble --------------------------------------------------------
 
     body = ft.Row(
@@ -3584,7 +5552,8 @@ def app(page: ft.Page):
         ],
         expand=True, spacing=0,
     )
-    page.add(ft.Column([header_bar, body], expand=True, spacing=0))
+    page.add(ft.Column([header_bar, body, sysbar],
+                       expand=True, spacing=0))
 
     # If we're already inside a workspace, open it.
     pre = find_workspace()

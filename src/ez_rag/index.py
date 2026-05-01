@@ -53,6 +53,12 @@ CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
 END;
 """
 
+# Idempotent column adds for upgrades from older schemas. SQLite has no
+# `ADD COLUMN IF NOT EXISTS`, so we tolerate the OperationalError.
+_MIGRATIONS = [
+    "ALTER TABLE files ADD COLUMN chapters_json TEXT",
+]
+
 
 @dataclass
 class FileRow:
@@ -87,6 +93,11 @@ class Index:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        for stmt in _MIGRATIONS:
+            try:
+                self.conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists; older DB already migrated
         self.conn.commit()
         import threading
         self._write_lock = threading.Lock()
@@ -122,17 +133,28 @@ class Index:
         chunker_version: str,
         embedder: str,
         chunks: list[tuple[int, int | None, str, str, str, np.ndarray]],
+        chapters: list[dict] | None = None,
     ) -> int:
-        """Insert/replace a file's chunks atomically. chunks tuples: (ord, page, section, text, tokens, vec)."""
+        """Insert/replace a file's chunks atomically. chunks tuples:
+        (ord, page, section, text, tokens, vec).
+
+        `chapters` is an optional list of `{"title", "start_ord", "end_ord",
+        "start_page", "end_page"}` dicts persisted as JSON on the file row
+        and consumed by chapter-aware retrieval.
+        """
+        import json as _json
+        chapters_json = _json.dumps(chapters) if chapters else None
         with self._write_lock, self.conn:
             existing = self.file_state(path)
             if existing:
                 self.conn.execute("DELETE FROM files WHERE id = ?", (existing.id,))
             cur = self.conn.execute(
                 """INSERT INTO files(path, sha256, bytes, mtime, parser_version,
-                                     chunker_version, embedder, n_chunks)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (path, sha256, bytes_, mtime, parser_version, chunker_version, embedder, len(chunks)),
+                                     chunker_version, embedder, n_chunks,
+                                     chapters_json)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (path, sha256, bytes_, mtime, parser_version, chunker_version,
+                 embedder, len(chunks), chapters_json),
             )
             file_id = cur.lastrowid
             self.conn.executemany(
@@ -144,6 +166,20 @@ class Index:
                 ],
             )
             return file_id
+
+    def chapters_for_file(self, file_id: int) -> list[dict]:
+        """Return the persisted chapter list for `file_id` (empty list if
+        the file has no chapter metadata)."""
+        import json as _json
+        row = self.conn.execute(
+            "SELECT chapters_json FROM files WHERE id = ?", (file_id,),
+        ).fetchone()
+        if not row or not row[0]:
+            return []
+        try:
+            return _json.loads(row[0]) or []
+        except Exception:
+            return []
 
     def delete_missing(self, present_paths: set[str]) -> int:
         cur = self.conn.execute("SELECT id, path FROM files")

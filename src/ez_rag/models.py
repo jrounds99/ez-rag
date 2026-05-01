@@ -140,6 +140,46 @@ def unload_ollama_model(url: str, tag: str, *, timeout: float = 10.0) -> bool:
         return False
 
 
+def list_running_models(url: str, *, timeout: float = 2.0) -> list[str]:
+    """Return tags currently resident in VRAM (`ollama ps`).
+
+    Empty list on any error or when nothing is loaded — callers shouldn't
+    hard-fail just because Ollama isn't reachable.
+    """
+    try:
+        r = httpx.get(url.rstrip("/") + "/api/ps", timeout=timeout)
+        r.raise_for_status()
+    except Exception:
+        return []
+    out: list[str] = []
+    for m in (r.json().get("models") or []):
+        tag = m.get("name") or m.get("model") or ""
+        if tag:
+            out.append(tag)
+    return out
+
+
+def unload_running_models(
+    url: str, *, except_: set[str] | None = None,
+    timeout: float = 10.0,
+) -> list[str]:
+    """Evict every loaded model except those in `except_`. Returns the list
+    of tags that were actually unloaded.
+
+    Used by the GUI when the user changes their LLM or embedder model: the
+    old model needs to leave VRAM before the new one tries to load,
+    otherwise Ollama can return 'unable to load model' on the next call.
+    """
+    keep = except_ or set()
+    unloaded: list[str] = []
+    for tag in list_running_models(url, timeout=timeout):
+        if tag in keep:
+            continue
+        if unload_ollama_model(url, tag, timeout=timeout):
+            unloaded.append(tag)
+    return unloaded
+
+
 def delete_ollama_model(url: str, tag: str) -> bool:
     try:
         r = httpx.request(

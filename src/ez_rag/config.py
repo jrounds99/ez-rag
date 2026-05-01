@@ -45,6 +45,8 @@ class Config:
     context_window: int = 0            # include N neighbor chunks per hit (0 = off)
     use_mmr: bool = False              # diversify retrieved chunks via MMR
     mmr_lambda: float = 0.5            # 1.0 = pure relevance, 0.0 = pure diversity
+    expand_to_chapter: bool = False    # replace each hit's text with its full chapter
+    chapter_max_chars: int = 16000     # safety cap so big chapters don't blow context
 
     # Agentic retrieval — LLM-driven iterative search.
     # When ON, the LLM evaluates the initial retrieval and (if needed) generates
@@ -59,6 +61,14 @@ class Config:
     # Generation
     max_tokens: int = 4096
     temperature: float = 0.2
+    # Tokens of context Ollama allocates for the model. 0 = use Ollama's
+    # default for the model. Larger = more memory, no per-token speed cost
+    # if actual sequence is short.
+    num_ctx: int = 0
+    # Prompt-eval batch size. Bigger = faster TTFT (prompt processing) at
+    # the cost of more peak memory. Default 512 (Ollama's default); 1024
+    # was measured to give ~+8% throughput / -23% TTFT on a 32B model.
+    num_batch: int = 1024
 
     # Server
     serve_host: str = "127.0.0.1"
@@ -93,7 +103,15 @@ class Config:
             if k == "extra":
                 continue
             if isinstance(v, str):
-                lines.append(f'{k} = "{v}"')
+                # TOML literal strings (single-quoted) don't interpret
+                # backslashes — needed for Windows paths and any user-typed
+                # query modifiers. Fall back to escaped quoted form when the
+                # value contains a single quote.
+                if "'" in v:
+                    escaped = v.replace("\\", "\\\\").replace('"', '\\"')
+                    lines.append(f'{k} = "{escaped}"')
+                else:
+                    lines.append(f"{k} = '{v}'")
             elif isinstance(v, bool):
                 lines.append(f"{k} = {'true' if v else 'false'}")
             else:
