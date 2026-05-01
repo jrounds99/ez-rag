@@ -50,6 +50,15 @@ class IngestProgress:
     # Index growth
     db_bytes: int = 0              # current size of meta.sqlite on disk
 
+    # Optional payload describing a garbled-page recovery event. When the
+    # parser detects garbled extraction and re-runs OCR, it fires one
+    # snapshot per recovered page with this populated, so the GUI can
+    # render a "before / after" preview of what was fixed in real time.
+    # Shape:
+    #   {"file": str, "page": int, "image_path": str,
+    #    "before": str (≤1500 chars), "after": str (≤1500 chars)}
+    recovery: dict | None = None
+
     @property
     def bytes_pct(self) -> float:
         return (self.bytes_done / self.bytes_total) if self.bytes_total > 0 else 0.0
@@ -420,12 +429,38 @@ def ingest(
             # measured from the start of THIS parse, not the throttle.
             parse_started = [time.perf_counter()]
 
+            # Recovery callback — fires once per page that needed OCR
+            # rescue. Builds a snapshot with the recovery payload set so
+            # the GUI can show a live before/after card. Only wired up
+            # when previews are turned on, otherwise the parser skips
+            # the page-render-to-disk step entirely.
+            recovery_cb = None
+            if getattr(cfg, "preview_garbled_recoveries", False):
+                def _on_recovery(payload):
+                    snap = snapshot(
+                        current_path=rel,
+                        status=(f"recovered garbled page {payload.get('page')}"
+                                f" via OCR"),
+                        page=payload.get("page"),
+                    )
+                    snap.recovery = payload
+                    _emit(progress, snap)
+                recovery_cb = _on_recovery
+
             parse_t0 = time.perf_counter()
             try:
-                sections = parser(path, on_progress=page_cb)
+                if recovery_cb is not None:
+                    sections = parser(
+                        path, on_progress=page_cb, on_recovery=recovery_cb,
+                    )
+                else:
+                    sections = parser(path, on_progress=page_cb)
             except TypeError:
-                # Parser predates the on_progress kwarg — call without it.
-                sections = parser(path)
+                # Parser predates one or both kwargs — fall back gracefully.
+                try:
+                    sections = parser(path, on_progress=page_cb)
+                except TypeError:
+                    sections = parser(path)
             parse_s = time.perf_counter() - parse_t0
             if not sections:
                 bytes_done += file_size

@@ -34,6 +34,12 @@ class Config:
     # heuristic detector missed. EXPENSIVE — one LLM call per section,
     # so a 200-section book is 200 calls. Default OFF.
     llm_inspect_pages: bool = False
+    # Live preview of garbled-page recoveries during ingest. When ON, the
+    # parser saves a 2× page render + before/after text excerpts so the
+    # GUI can show a real-time "what we saw vs. what we fixed" card as
+    # ingest works through bad pages. Costs ~50ms + ~200KB disk per
+    # recovered page; off by default to keep ingest as lean as possible.
+    preview_garbled_recoveries: bool = False
 
     # Ingest performance — flip these on for big corpora
     unload_llm_during_ingest: bool = True   # frees VRAM if contextual is OFF

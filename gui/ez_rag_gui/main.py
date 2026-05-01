@@ -268,6 +268,13 @@ TIP = {
                       "1–2-sentence summary to each chunk before embedding. "
                       "Slower ingest (one LLM call per chunk), but materially "
                       "better recall on technical/structured docs.",
+    "preview_recoveries": "When the parser detects a garbled page and "
+                      "re-extracts it via OCR, show a live before/after "
+                      "card during ingest — the page rendered as an "
+                      "image, the original garbled text, and the OCR "
+                      "result side-by-side. Useful for sanity-checking "
+                      "that recovery is actually working. Costs ~50ms "
+                      "+ ~200KB disk per recovered page.",
     "llm_inspect_pages": "After parsing, send each section's text to the "
                       "LLM with a 'is this garbled?' prompt. Garbled "
                       "sections are dropped before chunking, so the index "
@@ -2469,6 +2476,64 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
             ingest_snippet_text,
         ], spacing=4, tight=True),
     )
+
+    # ----- Garbled-page recovery preview card -----------------------------
+    # Visible only when an OCR recovery event arrives during ingest. Shows
+    # a thumbnail of the page + side-by-side before (garbled) / after
+    # (OCR'd) text so the user can see what got fixed in real time.
+    # Powered by IngestProgress.recovery payloads emitted by the parser
+    # when cfg.preview_garbled_recoveries is True.
+    ingest_recovery_header = ft.Text(
+        "", size=12, color=WARNING, weight=ft.FontWeight.W_700,
+    )
+    ingest_recovery_image = ft.Image(
+        src="", fit="contain", width=200, height=260, border_radius=4,
+    )
+    ingest_recovery_image_wrap = ft.Container(
+        content=ingest_recovery_image,
+        bgcolor="white", border_radius=6, padding=4, width=210, height=270,
+    )
+    ingest_recovery_before = ft.Text(
+        "", size=11, color=ON_SURFACE_DIM, max_lines=12,
+        font_family="monospace",
+    )
+    ingest_recovery_after = ft.Text(
+        "", size=11, color=ON_SURFACE, max_lines=12,
+    )
+    ingest_recovery_card = ft.Container(
+        visible=False,
+        padding=ft.padding.symmetric(horizontal=12, vertical=10),
+        bgcolor="#1F1A0E",   # subtle amber-tinted to match WARNING
+        border=ft.border.all(1, WARNING),
+        border_radius=8,
+        content=ft.Column([
+            ingest_recovery_header,
+            ft.Row([
+                ingest_recovery_image_wrap,
+                ft.Column([
+                    ft.Text("Before — what pypdf extracted (garbled)",
+                            size=10, color=DANGER,
+                            weight=ft.FontWeight.W_700),
+                    ft.Container(
+                        content=ingest_recovery_before,
+                        bgcolor=ft.Colors.with_opacity(0.10, DANGER),
+                        border=ft.border.all(1, ft.Colors.with_opacity(0.3, DANGER)),
+                        border_radius=4, padding=8, expand=True,
+                    ),
+                    ft.Text("After — re-extracted via OCR",
+                            size=10, color=SUCCESS,
+                            weight=ft.FontWeight.W_700),
+                    ft.Container(
+                        content=ingest_recovery_after,
+                        bgcolor=ft.Colors.with_opacity(0.10, SUCCESS),
+                        border=ft.border.all(1, ft.Colors.with_opacity(0.3, SUCCESS)),
+                        border_radius=4, padding=8, expand=True,
+                    ),
+                ], spacing=4, expand=True, tight=True),
+            ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.START),
+        ], spacing=8, tight=True),
+    )
+
     ingest_log = ft.ListView(spacing=2, padding=8, height=120, auto_scroll=True)
 
     # ----- "Done" summary card, shown only after ingest completes -----------
@@ -2507,6 +2572,7 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
         ingest_status.weight = None
         ingest_status.size = 12
         ingest_snippet_card.visible = False
+        ingest_recovery_card.visible = False
 
     def show_ingest_done(stats, elapsed_s: float):
         """Replace the in-flight UI with a clear 'finished' state.
@@ -2835,6 +2901,31 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                 ingest_snippet_card.visible = True
                 ingest_state["last_snippet_t"] = now
 
+            # Garbled-page recovery preview: when the parser fixes a
+            # bad page via OCR, it fires a snapshot with prog.recovery
+            # populated. Show what it looked like before vs after.
+            rec = getattr(prog, "recovery", None)
+            if rec:
+                fname = Path(rec.get("file") or prog.current_path).name
+                ingest_recovery_header.value = (
+                    f"Recovered page {rec.get('page')} of {fname} via OCR"
+                )
+                img_path = rec.get("image_path") or ""
+                if img_path:
+                    ingest_recovery_image.src = img_path
+                    ingest_recovery_image_wrap.visible = True
+                else:
+                    ingest_recovery_image_wrap.visible = False
+                before = (rec.get("before") or "").strip()
+                after = (rec.get("after") or "").strip()
+                ingest_recovery_before.value = (
+                    before[:1200] + ("…" if len(before) > 1200 else "")
+                ) or "(no text — extraction failed entirely)"
+                ingest_recovery_after.value = (
+                    after[:1200] + ("…" if len(after) > 1200 else "")
+                ) or "(OCR also returned nothing — page dropped)"
+                ingest_recovery_card.visible = True
+
             state.page.update()
 
         async def watchdog():
@@ -2998,6 +3089,7 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
         ingest_status,
         ingest_meta,
         ingest_done_card,
+        ingest_recovery_card,
         ingest_snippet_card,
         ft.Container(
             content=ingest_log,
@@ -3504,6 +3596,11 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         label="LLM inspect pages (very slow — drops garbled text)",
         value=False, active_color=ACCENT,
         tooltip=TIP["llm_inspect_pages"],
+    )
+    preview_recoveries_sw = ft.Switch(
+        label="Preview garbled-page recoveries during ingest",
+        value=False, active_color=ACCENT,
+        tooltip=TIP["preview_recoveries"],
     )
 
     # ---- model dropdowns -------------------------------------------------
@@ -4122,6 +4219,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         enable_ocr.value = c.enable_ocr
         contextual.value = c.enable_contextual
         llm_inspect_pages_sw.value = getattr(c, "llm_inspect_pages", False)
+        preview_recoveries_sw.value = getattr(c, "preview_garbled_recoveries", False)
         ollama_url.value = c.llm_url
         embed_provider.value = c.embedder_provider
         embed_model.value = c.embedder_model
@@ -4201,6 +4299,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
             c.enable_ocr = bool(enable_ocr.value)
             c.enable_contextual = bool(contextual.value)
             c.llm_inspect_pages = bool(llm_inspect_pages_sw.value)
+            c.preview_garbled_recoveries = bool(preview_recoveries_sw.value)
             c.llm_model = llm_model.value or c.llm_model
             c.llm_url = ollama_url.value
             c.embedder_provider = embed_provider.value
@@ -4278,6 +4377,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                             enable_ocr,
                             contextual,
                             llm_inspect_pages_sw,
+                            preview_recoveries_sw,
                         ),
                     ),
                     ft.Container(

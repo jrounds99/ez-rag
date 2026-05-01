@@ -166,7 +166,7 @@ def _text_looks_garbled(text: str) -> bool:
 
 
 @register(".pdf")
-def parse_pdf(path: Path, on_progress=None) -> list[ParsedSection]:
+def parse_pdf(path: Path, on_progress=None, on_recovery=None) -> list[ParsedSection]:
     """Parse a PDF page-by-page.
 
     `on_progress(page, total, ocr=False)` — if given, called after each page
@@ -225,8 +225,14 @@ def parse_pdf(path: Path, on_progress=None) -> list[ParsedSection]:
     # 2. Per-page fallback: pypdf got SOMETHING but specific pages are
     #    garbled. OCR just those pages and substitute their text in.
     if garbled_pages:
+        # Capture the BEFORE text so the GUI can show side-by-side
+        # before/after when previewing a recovery.
+        before_map = {p: page_texts[p - 1] for p in garbled_pages}
         ocr_map = _ocr_pdf_pages_subset(
-            path, garbled_pages, on_progress=on_progress,
+            path, garbled_pages,
+            on_progress=on_progress,
+            on_recovery=on_recovery,
+            before_texts=before_map,
         )
         # Replace the placeholder ParsedSection with the OCR text where
         # available; drop the placeholder if OCR also returned nothing.
@@ -251,11 +257,23 @@ def parse_pdf(path: Path, on_progress=None) -> list[ParsedSection]:
 
 
 def _ocr_pdf_pages_subset(
-    path: Path, pages_1indexed: list[int], on_progress=None,
+    path: Path, pages_1indexed: list[int],
+    *,
+    on_progress=None,
+    on_recovery=None,
+    before_texts: dict[int, str] | None = None,
 ) -> dict[int, str]:
     """Render specific PDF pages to images and OCR them. Returns
     {page_number: text}. Used to recover individual pages where pypdf's
-    extraction looked garbled."""
+    extraction looked garbled.
+
+    `on_recovery(payload)` — optional. When given, fires once per page
+    after both the page render and OCR have finished, with a dict shape:
+        {file, page, image_path, before, after}
+    The GUI uses this to show a live before/after preview during ingest.
+    Saving the rendered image to the preview cache costs ~50 ms + ~200 KB
+    per page; only do it when the caller actually wants the preview.
+    """
     out: dict[int, str] = {}
     if not pages_1indexed:
         return out
@@ -264,6 +282,7 @@ def _ocr_pdf_pages_subset(
     except ImportError:
         return out
     from .ocr import ocr_image
+    from .preview import cache_path_for as _img_cache_path
     try:
         pdf = pdfium.PdfDocument(str(path))
     except Exception:
@@ -271,18 +290,42 @@ def _ocr_pdf_pages_subset(
     n_pages = len(pdf)
     pages_1indexed = [p for p in pages_1indexed if 1 <= p <= n_pages]
     for j, p in enumerate(pages_1indexed, start=1):
+        text = ""
+        img_path = ""
         try:
             page = pdf[p - 1]
             bitmap = page.render(scale=2.0)
             pil = bitmap.to_pil()
+            # Save the rendered page to the preview cache only if a
+            # recovery callback wants to display it. Skips the disk
+            # write entirely when previews are off.
+            if on_recovery:
+                try:
+                    cache_p = _img_cache_path(path, p)
+                    pil.save(cache_p, format="PNG", optimize=True)
+                    img_path = str(cache_p)
+                except Exception:
+                    img_path = ""
             text = ocr_image(pil) or ""
             out[p] = text
         except Exception:
             out[p] = ""
+
+        if on_recovery:
+            try:
+                before = (before_texts or {}).get(p, "")
+                on_recovery({
+                    "file": str(path),
+                    "page": p,
+                    "image_path": img_path,
+                    "before": (before or "")[:1500],
+                    "after": (text or "")[:1500],
+                })
+            except Exception:
+                pass
+
         if on_progress:
             try:
-                # Re-OCR pass uses the same callback shape, ocr=True
-                # so the UI can show "OCR'ing page X/Y (garbled re-read)".
                 on_progress(j, len(pages_1indexed), ocr=True)
             except Exception:
                 pass
