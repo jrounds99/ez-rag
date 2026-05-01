@@ -1110,6 +1110,14 @@ def build_header(state: AppState, *, on_open_workspace, on_create_rag,
 def build_chat_view(state: AppState, *, refresh_status,
                     on_open_workspace, on_open_files,
                     open_pull_dialog_cb):
+    # Chat-view-scoped FilePicker for citation-image downloads + chapter
+    # PDF exports. Registered as a service so save dialogs work. Lives
+    # here (not borrowed from settings view) so we don't reach across
+    # closures — that was the "name 'rags_dir_picker' is not defined"
+    # bug a user hit when clicking Download on a citation page render.
+    download_picker = ft.FilePicker()
+    state.page.services.append(download_picker)
+
     chat_list = ft.ListView(
         expand=True, spacing=12, padding=ft.padding.all(20), auto_scroll=True,
     )
@@ -1230,7 +1238,7 @@ def build_chat_view(state: AppState, *, refresh_status,
                     src = Path(hit.path).stem
                     suggested = f"{src}-p{hit.page}.png"
                     try:
-                        dest = await rags_dir_picker.save_file(
+                        dest = await download_picker.save_file(
                             dialog_title="Save page image",
                             file_name=suggested,
                             allowed_extensions=["png"],
@@ -1247,10 +1255,109 @@ def build_chat_view(state: AppState, *, refresh_status,
                         _toast(state.page, f"Save failed: {ex}")
                 state.page.run_task(_do)
 
+            def download_chapter_clicked(_=None):
+                """Experimental — extract just the chapter that contains
+                this hit and save it as a standalone PDF. Uses the
+                chapter metadata persisted at ingest time (PDF outline
+                or section headings). Quality depends on how clean the
+                source PDF's bookmarks are.
+                """
+                async def _do():
+                    if state.ws is None:
+                        _toast(state.page, "Open a workspace first.")
+                        return
+                    try:
+                        from ez_rag.preview import extract_pdf_pages
+                        from ez_rag.embed import make_embedder
+                        from ez_rag.index import Index
+                        from ez_rag.chapters import find_chapter
+                        embedder = make_embedder(state.cfg)
+                        idx = Index(state.ws.meta_db_path,
+                                    embed_dim=embedder.dim)
+                        chapters = idx.chapters_for_file(hit.file_id)
+                        if not chapters:
+                            _toast(state.page,
+                                "No chapter metadata for this file. "
+                                "Re-ingest after a recent ez-rag update "
+                                "to populate it.")
+                            return
+                        # Look up the chunk's ord, then the chapter that
+                        # contains it.
+                        row = idx.conn.execute(
+                            "SELECT ord FROM chunks WHERE id = ?",
+                            (hit.chunk_id,),
+                        ).fetchone()
+                        ord_ = row[0] if row else None
+                        ch = find_chapter(chapters, ord_) if ord_ is not None else None
+                        if ch is None:
+                            _toast(state.page,
+                                "Couldn't locate the chapter for this "
+                                "passage. Try Re-ingest (force).")
+                            return
+                        sp = ch.get("start_page")
+                        ep = ch.get("end_page")
+                        if not sp or not ep:
+                            _toast(state.page,
+                                "Chapter has no page range — can't "
+                                "extract as PDF. (Non-PDF source?)")
+                            return
+                        title = ch.get("title") or f"chapter-{sp}-{ep}"
+                        # Sanitize for filename
+                        safe_title = "".join(
+                            c if c.isalnum() or c in " ._-" else "_"
+                            for c in title
+                        ).strip()
+                        suggested = (
+                            f"{Path(hit.path).stem} - {safe_title} "
+                            f"(pp {sp}-{ep}).pdf"
+                        )
+                    except Exception as ex:
+                        _toast(state.page, f"Lookup failed: {ex}")
+                        return
+
+                    try:
+                        dest = await download_picker.save_file(
+                            dialog_title="Save chapter as PDF",
+                            file_name=suggested,
+                            allowed_extensions=["pdf"],
+                        )
+                    except Exception as ex:
+                        _toast(state.page, f"Save dialog failed: {ex}")
+                        return
+                    if not dest:
+                        return
+
+                    def _bg():
+                        abs_pdf = (state.ws.root / hit.path).resolve()
+                        out = extract_pdf_pages(
+                            abs_pdf, sp, ep, Path(dest), title=title,
+                        )
+                        if out is None:
+                            _toast(state.page,
+                                "Chapter extract failed. pypdf may be "
+                                "missing, or the page range exceeded "
+                                "the document.")
+                        else:
+                            pages = ep - sp + 1
+                            _toast(state.page,
+                                f"Saved chapter '{title}' "
+                                f"({pages} pages) → {Path(out).name}")
+                    state.page.run_thread(_bg)
+                state.page.run_task(_do)
+
             toolbar = ft.Row([
                 ft.Text(f"page {hit.page} · 2.5x render",
                         size=11, color=ON_SURFACE_DIM),
                 ft.Container(expand=True),
+                ft.OutlinedButton(
+                    "Chapter (experimental)",
+                    icon=ft.Icons.AUTO_STORIES,
+                    on_click=download_chapter_clicked,
+                    tooltip=("Save just the chapter containing this "
+                             "passage as a standalone PDF. Boundaries "
+                             "come from the source PDF's bookmarks "
+                             "(or section headings) — quality varies."),
+                ),
                 ft.OutlinedButton(
                     "Download", icon=ft.Icons.DOWNLOAD,
                     on_click=download_clicked,

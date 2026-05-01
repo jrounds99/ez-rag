@@ -82,6 +82,62 @@ def render_pdf_page(
         return None
 
 
+def extract_pdf_pages(
+    pdf_path: Path,
+    start_page: int,
+    end_page: int,
+    dest: Path,
+    *,
+    title: str | None = None,
+) -> Path | None:
+    """Extract `start_page`..`end_page` (1-indexed, inclusive) from
+    `pdf_path` and write them as a new PDF at `dest`.
+
+    Used by the citation modal's "Download chapter (experimental)" button
+    to save just the chapter that contains a cited passage. Returns the
+    written path on success, None on any failure (no pypdf, page out of
+    range, write error, etc.).
+    """
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError:
+        return None
+    pdf_path = Path(pdf_path)
+    if not pdf_path.is_file():
+        return None
+    if start_page <= 0 or end_page < start_page:
+        return None
+    try:
+        reader = PdfReader(str(pdf_path))
+        n = len(reader.pages)
+        # Clamp to actual page count — ingest sometimes records page
+        # numbers that don't match pypdf's page index after a reparse.
+        s = max(1, min(start_page, n))
+        e = max(s, min(end_page, n))
+
+        writer = PdfWriter()
+        for i in range(s - 1, e):
+            writer.add_page(reader.pages[i])
+
+        # Best-effort metadata so the saved chapter is identifiable.
+        try:
+            writer.add_metadata({
+                "/Title": (title or f"{pdf_path.stem} (pp. {s}-{e})"),
+                "/Producer": "ez-rag chapter extract",
+                "/Subject": f"Pages {s}-{e} extracted from {pdf_path.name}",
+            })
+        except Exception:
+            pass
+
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("wb") as f:
+            writer.write(f)
+        return dest
+    except Exception:
+        return None
+
+
 def sweep_old_previews(*, days: int = DEFAULT_TTL_DAYS) -> int:
     """Delete cached previews older than `days`. Returns number removed.
 

@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from ez_rag import preview as prev
+from ez_rag.preview import extract_pdf_pages
 
 
 PASS, FAIL = [], []
@@ -109,6 +110,46 @@ def main():
                   n == 0, f"got {n}")
         finally:
             prev.PREVIEW_CACHE_DIR = tmp_cache
+
+        # ----- extract_pdf_pages (chapter download) ---------------------
+        if pdf is not None:
+            print("\n[chapter] extract_pdf_pages")
+            from pypdf import PdfReader
+            total_pages = len(PdfReader(str(pdf)).pages)
+
+            # Happy path: extract first 2 pages
+            out_pdf = tmp_cache / "chapter1.pdf"
+            r = extract_pdf_pages(pdf, 1, min(2, total_pages), out_pdf,
+                                  title="Test chapter")
+            check("extract returns a path",
+                  r is not None and r.exists(), f"got {r}")
+            if r is not None:
+                check("output is a real PDF (starts with %PDF-)",
+                      r.read_bytes()[:5] == b"%PDF-", "")
+                # Verify the page count is what we asked for
+                pages_out = len(PdfReader(str(r)).pages)
+                wanted = min(2, total_pages)
+                check(f"output has exactly {wanted} page(s)",
+                      pages_out == wanted, f"got {pages_out}")
+
+            # Out-of-range pages: clamps to document length
+            far = tmp_cache / "way_too_far.pdf"
+            r2 = extract_pdf_pages(pdf, 1, 99999, far)
+            check("over-range end clamps to document",
+                  r2 is not None and r2.exists()
+                  and len(PdfReader(str(r2)).pages) == total_pages,
+                  f"got {r2}")
+
+            # Invalid input: end before start
+            r3 = extract_pdf_pages(pdf, 5, 2, tmp_cache / "bad.pdf")
+            check("invalid range returns None",
+                  r3 is None, f"got {r3}")
+
+            # Missing file
+            r4 = extract_pdf_pages(tmp_cache / "nope.pdf", 1, 2,
+                                   tmp_cache / "x.pdf")
+            check("missing file returns None",
+                  r4 is None, f"got {r4}")
 
     finally:
         prev.PREVIEW_CACHE_DIR = saved_cache
