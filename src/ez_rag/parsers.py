@@ -65,6 +65,57 @@ def parse_text(path: Path) -> list[ParsedSection]:
 
 # ----- PDF -------------------------------------------------------------------
 
+# Heuristic thresholds for "this page's text is garbled" detection. Tuned
+# against examples like:
+#   "hAppe�d to the \pell\ Mor&e�kAi�e�'l Bo1A�tif1AI"
+#   "ewAr&'\ I/qt Air, A�& All the re\t ?"
+# which are typical when a PDF embeds a custom/subsetted font with a
+# broken or missing ToUnicode cmap — pypdf falls back to glyph IDs and
+# you get nonsense.
+_GARBLED_REPLACEMENT_RATIO = 0.02   # >2% replacement chars (U+FFFD) → garbled
+_GARBLED_BACKSLASH_RATIO   = 0.025  # >2.5% backslashes → garbled escape sequences
+_GARBLED_VOWEL_FLOOR       = 0.20   # English text is ~35-40% vowels of alpha chars
+_GARBLED_NONALNUM_CEIL     = 0.45   # >45% non-alphanumeric (excl. whitespace) → garbled
+
+
+def _text_looks_garbled(text: str) -> bool:
+    """Heuristic: does this page's extracted text look like font-cmap
+    garbage rather than real prose?
+
+    Returns True for short-vowel / high-replacement / high-backslash /
+    high-symbol-ratio text. False for short snippets (< 40 chars), so
+    headers like "Chapter 1" don't trip the detector.
+    """
+    if not text:
+        return False
+    t = text.strip()
+    if len(t) < 40:
+        return False
+
+    n = len(t)
+    # 1. Replacement characters (the � you saw)
+    n_replacement = t.count("�")
+    if n / max(1, n_replacement) and n_replacement / n > _GARBLED_REPLACEMENT_RATIO:
+        return True
+    # 2. Backslash escape ratio — broken cmaps emit \pell\ \td\ etc.
+    n_back = t.count("\\")
+    if n_back / n > _GARBLED_BACKSLASH_RATIO:
+        return True
+    # 3. Vowel ratio in alpha chars. English prose is ~35-40%; if a page's
+    # alpha chars are <20% vowels something's badly wrong.
+    alpha = [c for c in t.lower() if c.isalpha()]
+    if alpha and len(alpha) > 50:
+        vowels = sum(1 for c in alpha if c in "aeiou")
+        if vowels / len(alpha) < _GARBLED_VOWEL_FLOOR:
+            return True
+    # 4. Non-alphanumeric / non-whitespace ratio — broken extraction often
+    # produces dense punctuation soup like "Mor&e�kAi�e�'l Bo1A�tif1AI".
+    non_alnum_ws = sum(1 for c in t if not c.isalnum() and not c.isspace())
+    if non_alnum_ws / n > _GARBLED_NONALNUM_CEIL:
+        return True
+    return False
+
+
 @register(".pdf")
 def parse_pdf(path: Path, on_progress=None) -> list[ParsedSection]:
     """Parse a PDF page-by-page.
@@ -72,6 +123,13 @@ def parse_pdf(path: Path, on_progress=None) -> list[ParsedSection]:
     `on_progress(page, total, ocr=False)` — if given, called after each page
     so callers can surface live progress for big PDFs (which can otherwise
     block for minutes with no UI feedback).
+
+    Garbled-page recovery: pypdf's `extract_text()` produces nonsense when
+    a PDF uses a custom font with a broken/missing ToUnicode cmap. We
+    detect this per-page via `_text_looks_garbled()` and re-extract via
+    OCR for those pages only — keeps fast pypdf extraction for clean
+    pages, falls back to OCR (which reads pixels, not fonts) for the
+    broken ones.
     """
     try:
         from pypdf import PdfReader  # type: ignore
@@ -81,6 +139,7 @@ def parse_pdf(path: Path, on_progress=None) -> list[ParsedSection]:
     reader = PdfReader(str(path))
     total = len(reader.pages)
     page_texts: list[str] = []
+    garbled_pages: list[int] = []      # 1-indexed page numbers
     for i, page in enumerate(reader.pages, start=1):
         try:
             t = page.extract_text() or ""
@@ -88,21 +147,97 @@ def parse_pdf(path: Path, on_progress=None) -> list[ParsedSection]:
             t = ""
         page_texts.append(t)
         if t.strip():
-            sections.append(ParsedSection(text=_normalize(t), page=i))
+            if _text_looks_garbled(t):
+                garbled_pages.append(i)
+                # Don't add the garbled section yet — we'll try to OCR
+                # it below. Add a placeholder so indexing stays stable.
+                sections.append(ParsedSection(
+                    text="", page=i,
+                    meta={"reparse_pending": "garbled"},
+                ))
+            else:
+                sections.append(ParsedSection(text=_normalize(t), page=i))
         if on_progress:
             try:
                 on_progress(i, total, ocr=False)
             except Exception:
                 pass
 
-    # If we extracted almost nothing, the PDF is likely scanned. Fall back to
-    # OCR over rendered pages, lazily importing OCR + a renderer.
+    # ----- Recovery passes -----
     total_chars = sum(len(t) for t in page_texts)
+
+    # 1. Whole-document fallback when pypdf got almost nothing — the PDF
+    #    is probably a scan with no text layer. OCR every page.
     if total_chars < 50 * max(1, total):
         ocr_sections = _ocr_pdf_pages(path, on_progress=on_progress)
         if ocr_sections:
             return ocr_sections
+
+    # 2. Per-page fallback: pypdf got SOMETHING but specific pages are
+    #    garbled. OCR just those pages and substitute their text in.
+    if garbled_pages:
+        ocr_map = _ocr_pdf_pages_subset(
+            path, garbled_pages, on_progress=on_progress,
+        )
+        # Replace the placeholder ParsedSection with the OCR text where
+        # available; drop the placeholder if OCR also returned nothing.
+        rebuilt: list[ParsedSection] = []
+        for sec in sections:
+            if sec.meta.get("reparse_pending") == "garbled":
+                ocr_text = ocr_map.get(sec.page or 0, "").strip()
+                if ocr_text and not _text_looks_garbled(ocr_text):
+                    rebuilt.append(ParsedSection(
+                        text=_normalize(ocr_text),
+                        page=sec.page,
+                        meta={"ocr": True, "reparse": "garbled"},
+                    ))
+                else:
+                    # Both pypdf AND OCR failed — drop the page rather
+                    # than poison the index with garbage.
+                    pass
+            else:
+                rebuilt.append(sec)
+        sections = rebuilt
     return sections
+
+
+def _ocr_pdf_pages_subset(
+    path: Path, pages_1indexed: list[int], on_progress=None,
+) -> dict[int, str]:
+    """Render specific PDF pages to images and OCR them. Returns
+    {page_number: text}. Used to recover individual pages where pypdf's
+    extraction looked garbled."""
+    out: dict[int, str] = {}
+    if not pages_1indexed:
+        return out
+    try:
+        import pypdfium2 as pdfium  # type: ignore
+    except ImportError:
+        return out
+    from .ocr import ocr_image
+    try:
+        pdf = pdfium.PdfDocument(str(path))
+    except Exception:
+        return out
+    n_pages = len(pdf)
+    pages_1indexed = [p for p in pages_1indexed if 1 <= p <= n_pages]
+    for j, p in enumerate(pages_1indexed, start=1):
+        try:
+            page = pdf[p - 1]
+            bitmap = page.render(scale=2.0)
+            pil = bitmap.to_pil()
+            text = ocr_image(pil) or ""
+            out[p] = text
+        except Exception:
+            out[p] = ""
+        if on_progress:
+            try:
+                # Re-OCR pass uses the same callback shape, ocr=True
+                # so the UI can show "OCR'ing page X/Y (garbled re-read)".
+                on_progress(j, len(pages_1indexed), ocr=True)
+            except Exception:
+                pass
+    return out
 
 
 def _ocr_pdf_pages(path: Path, on_progress=None) -> list[ParsedSection]:
