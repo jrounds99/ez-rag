@@ -28,6 +28,12 @@ class Config:
     enable_ocr: bool = True
     ocr_provider: str = "auto"          # "auto" | "rapidocr" | "tesseract" | "none"
     enable_contextual: bool = False     # Anthropic-style chunk context (slower, better recall)
+    # LLM-assisted text-quality inspection. When ON, every parsed section
+    # is sent to the LLM during ingest with a "is this garbled?" prompt;
+    # garbled sections are dropped. Catches font-cmap or OCR failures the
+    # heuristic detector missed. EXPENSIVE — one LLM call per section,
+    # so a 200-section book is 200 calls. Default OFF.
+    llm_inspect_pages: bool = False
 
     # Ingest performance — flip these on for big corpora
     unload_llm_during_ingest: bool = True   # frees VRAM if contextual is OFF

@@ -268,6 +268,14 @@ TIP = {
                       "1–2-sentence summary to each chunk before embedding. "
                       "Slower ingest (one LLM call per chunk), but materially "
                       "better recall on technical/structured docs.",
+    "llm_inspect_pages": "After parsing, send each section's text to the "
+                      "LLM with a 'is this garbled?' prompt. Garbled "
+                      "sections are dropped before chunking, so the index "
+                      "doesn't get poisoned with font-cmap nonsense the "
+                      "heuristic detector missed. EXPENSIVE — one LLM "
+                      "call per section, so a 200-section book is 200 "
+                      "calls (use a small/fast LLM during ingest, e.g. "
+                      "qwen2.5:7b, not a reasoning model). Off by default.",
 
     # Settings — Retrieval card
     "use_corpus":     "Same as the toggle above the chat — when OFF, retrieval "
@@ -3492,6 +3500,11 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
     contextual = ft.Switch(label="Contextual Retrieval (slower ingest, better recall)",
                            value=False, active_color=ACCENT,
                            tooltip=TIP["contextual"])
+    llm_inspect_pages_sw = ft.Switch(
+        label="LLM inspect pages (very slow — drops garbled text)",
+        value=False, active_color=ACCENT,
+        tooltip=TIP["llm_inspect_pages"],
+    )
 
     # ---- model dropdowns -------------------------------------------------
     llm_model = ft.Dropdown(label="LLM model", value="qwen2.5:7b-instruct",
@@ -4108,6 +4121,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         use_corpus.value = c.use_rag
         enable_ocr.value = c.enable_ocr
         contextual.value = c.enable_contextual
+        llm_inspect_pages_sw.value = getattr(c, "llm_inspect_pages", False)
         ollama_url.value = c.llm_url
         embed_provider.value = c.embedder_provider
         embed_model.value = c.embedder_model
@@ -4186,6 +4200,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
             c.use_rag = bool(use_corpus.value)
             c.enable_ocr = bool(enable_ocr.value)
             c.enable_contextual = bool(contextual.value)
+            c.llm_inspect_pages = bool(llm_inspect_pages_sw.value)
             c.llm_model = llm_model.value or c.llm_model
             c.llm_url = ollama_url.value
             c.embedder_provider = embed_provider.value
@@ -4262,6 +4277,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                             ft.Row([chunk_size, chunk_overlap], spacing=10, wrap=True),
                             enable_ocr,
                             contextual,
+                            llm_inspect_pages_sw,
                         ),
                     ),
                     ft.Container(

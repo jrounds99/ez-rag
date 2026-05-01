@@ -11,7 +11,7 @@ from .chapters import detect_chapters
 from .chunker import Chunk, chunk_sections
 from .config import Config
 from .embed import Embedder, make_embedder
-from .generate import contextualize_chunk, detect_backend
+from .generate import contextualize_chunk, detect_backend, inspect_text_quality
 from .index import Index, file_sha256
 from .models import unload_ollama_model
 from .parsers import ParsedSection, get_parser, supported_extensions
@@ -449,6 +449,60 @@ def ingest(
                         f"chunking @ ~{cfg.chunk_size} tokens "
                         f"(overlap {cfg.chunk_overlap})…"),
             ))
+
+            # Optional LLM-assisted quality inspection — second-guesses
+            # the parser's heuristic garbled-text detector by asking the
+            # LLM to classify each section. Garbled sections are dropped.
+            # Slow (1 LLM call per section); off by default.
+            if (getattr(cfg, "llm_inspect_pages", False)
+                    and detect_backend(cfg) != "none"
+                    and len(sections) > 0):
+                insp_t0 = time.perf_counter()
+                kept: list[ParsedSection] = []
+                garbled = 0
+                partial = 0
+                for si, sec in enumerate(sections, start=1):
+                    if not (sec.text or "").strip():
+                        kept.append(sec)
+                        continue
+                    verdict = inspect_text_quality(sec.text, cfg)
+                    state = verdict.get("state", "unknown")
+                    if state == "garbled":
+                        garbled += 1
+                        # Drop — don't poison the index. Note in the file's
+                        # ingest stream so the user can audit later.
+                        continue
+                    if state == "partial":
+                        partial += 1
+                        # Keep partial sections — better partial than nothing.
+                        sec.meta = {**(sec.meta or {}), "llm_inspect": "partial"}
+                    kept.append(sec)
+                    # Emit per-section progress so the user sees motion
+                    # during what could be a multi-minute pass on big PDFs.
+                    if si == len(sections) or si % 5 == 0:
+                        _emit(progress, snapshot(
+                            current_path=rel,
+                            status=(f"LLM-inspecting section {si}/"
+                                    f"{len(sections)} (garbled so far: "
+                                    f"{garbled}, partial: {partial})"),
+                            page=sec.page,
+                        ))
+                insp_s = time.perf_counter() - insp_t0
+                sections = kept
+                _emit(progress, snapshot(
+                    current_path=rel,
+                    status=(f"LLM inspect done in {insp_s:.1f}s — "
+                            f"kept {len(kept)} sections, dropped "
+                            f"{garbled} garbled, flagged {partial} partial"),
+                ))
+                if not sections:
+                    bytes_done += file_size
+                    files_done += 1
+                    _emit(progress, snapshot(
+                        current_path=rel,
+                        status="all sections rejected by LLM inspect",
+                    ))
+                    continue
 
             chunk_t0 = time.perf_counter()
             chunks = chunk_sections(

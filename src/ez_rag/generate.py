@@ -721,6 +721,51 @@ def generate_question_suggestions(
     return lines
 
 
+def inspect_text_quality(text: str, cfg: Config) -> dict:
+    """LLM-assisted gibberish detector. Asks the model whether a passage
+    is clean prose, garbled (font-cmap glyph IDs, unmapped characters,
+    OCR salad), or partial. Used during ingest to second-guess the
+    heuristic detector and catch cases like "everything is mostly clean
+    but pages 47-49 got vaporized."
+
+    Returns {"state": "clean" | "garbled" | "partial" | "unknown",
+             "raw": short LLM excerpt for debug}.
+    Returns {"state": "unknown"} on any backend failure — caller should
+    treat that as "trust the heuristic" and not penalize the section.
+
+    Costs: one short LLM call (≤120 token prompt, ≤16 token reply).
+    On qwen2.5:7b that's ~0.3s; on a 32B reasoning model it's 5-10s.
+    Run it sparingly — see ingest.py's llm_inspect_pages flag.
+    """
+    if not text or not text.strip():
+        return {"state": "unknown"}
+    backend = detect_backend(cfg)
+    if backend == "none":
+        return {"state": "unknown"}
+    # 1500 chars is plenty for a quality call — more just wastes tokens
+    sample = text.strip()[:1500]
+    prompt = (
+        "You are a text-quality inspector reading a passage extracted "
+        "from a PDF.\n\n"
+        "Classify it as exactly ONE of:\n"
+        "  clean   — normal readable text in any language\n"
+        "  garbled — gibberish from broken font/encoding (e.g. random "
+        "consonant strings, unmapped glyph IDs, unicode replacement "
+        "characters �, sequences like \\pell\\ \\td\\)\n"
+        "  partial — mostly clean but with isolated corruption\n\n"
+        "Reply with EXACTLY ONE WORD on the first line — clean, garbled, "
+        "or partial. No explanation.\n\n"
+        f"---PASSAGE---\n{sample}\n---END---"
+    )
+    out = _llm_complete(cfg, prompt, max_tokens=16) or ""
+    first = out.strip().lower().split()[0] if out.strip() else ""
+    # Strip punctuation the model sometimes appends ("clean.", "garbled,")
+    first = first.rstrip(".,:;!?'\"")
+    if first in ("clean", "garbled", "partial"):
+        return {"state": first, "raw": out.strip()[:120]}
+    return {"state": "unknown", "raw": out.strip()[:120]}
+
+
 def contextualize_chunk(chunk_text: str, doc_summary: str, cfg: Config) -> str:
     """Anthropic-style chunk context: a 1-sentence situational prefix
     prepended before embedding for materially better retrieval recall.
