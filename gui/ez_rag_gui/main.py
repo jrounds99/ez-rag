@@ -5575,6 +5575,10 @@ def app(page: ft.Page):
     refresh_doctor_cb: dict = {}
     welcome_render_cb: dict = {}
 
+    # Rail rebuilder — set later (when the rail itself is constructed),
+    # called here so the nav reflects "have a workspace yet?".
+    rebuild_rail_cb: dict = {}
+
     def set_workspace_path(path: Path):
         ws = Workspace(path)
         if not ws.is_initialized():
@@ -5591,6 +5595,8 @@ def app(page: ft.Page):
             refresh_status_cb["fn"]()
         if "fn" in refresh_doctor_cb:
             refresh_doctor_cb["fn"]()
+        if "fn" in rebuild_rail_cb:
+            rebuild_rail_cb["fn"]()
         switch_view(0)
         render_chat_cb["fn"]()
         page.update()
@@ -5682,35 +5688,56 @@ def app(page: ft.Page):
 
     # ---- nav rail --------------------------------------------------------
 
+    # All possible rail destinations. We pick a subset based on whether
+    # a workspace is open — Files / Settings / Doctor depend on a real
+    # workspace, so we hide them until the user has one. Otherwise the
+    # tabs would be there but every action would just toast "Open a
+    # workspace first."
+    _RAIL_FULL = [
+        ft.NavigationRailDestination(
+            icon=ft.Icons.CHAT_OUTLINED,
+            selected_icon=ft.Icons.CHAT,
+            label="Chat",
+        ),
+        ft.NavigationRailDestination(
+            icon=ft.Icons.FOLDER_OUTLINED,
+            selected_icon=ft.Icons.FOLDER,
+            label="Files",
+        ),
+        ft.NavigationRailDestination(
+            icon=ft.Icons.SETTINGS_OUTLINED,
+            selected_icon=ft.Icons.SETTINGS,
+            label="Settings",
+        ),
+        ft.NavigationRailDestination(
+            icon=ft.Icons.MEDICAL_SERVICES_OUTLINED,
+            selected_icon=ft.Icons.MEDICAL_SERVICES,
+            label="Doctor",
+        ),
+    ]
+    # When no workspace is open, only "Chat" (which routes to the welcome
+    # screen with the Open / New RAG buttons) is reachable.
+    _RAIL_NO_WORKSPACE = _RAIL_FULL[:1]
+
     rail = ft.NavigationRail(
         selected_index=0,
         label_type=ft.NavigationRailLabelType.ALL,
         min_width=80,
         bgcolor=SURFACE_DARK,
         leading=ft.Container(height=8),
-        destinations=[
-            ft.NavigationRailDestination(
-                icon=ft.Icons.CHAT_OUTLINED,
-                selected_icon=ft.Icons.CHAT,
-                label="Chat",
-            ),
-            ft.NavigationRailDestination(
-                icon=ft.Icons.FOLDER_OUTLINED,
-                selected_icon=ft.Icons.FOLDER,
-                label="Files",
-            ),
-            ft.NavigationRailDestination(
-                icon=ft.Icons.SETTINGS_OUTLINED,
-                selected_icon=ft.Icons.SETTINGS,
-                label="Settings",
-            ),
-            ft.NavigationRailDestination(
-                icon=ft.Icons.MEDICAL_SERVICES_OUTLINED,
-                selected_icon=ft.Icons.MEDICAL_SERVICES,
-                label="Doctor",
-            ),
-        ],
+        destinations=_RAIL_NO_WORKSPACE,
     )
+
+    def rebuild_rail():
+        """Show Files / Settings / Doctor only when there's a workspace
+        to act on. Called whenever set_workspace_path() runs."""
+        new_dests = _RAIL_FULL if state.ws is not None else _RAIL_NO_WORKSPACE
+        rail.destinations = new_dests
+        # Clamp selection if we just shrank the rail (e.g. user was on
+        # Settings and closed the workspace — collapse them to Chat).
+        if rail.selected_index is None or rail.selected_index >= len(new_dests):
+            rail.selected_index = 0
+    rebuild_rail_cb["fn"] = rebuild_rail
 
     # ---- view stack ------------------------------------------------------
 
@@ -5721,11 +5748,15 @@ def app(page: ft.Page):
     )
 
     def switch_view(idx: int):
+        # Clamp into the currently-visible destinations. Keyboard
+        # shortcuts and external callers can request a tab the rail
+        # doesn't currently show (e.g. Files when no workspace) — quietly
+        # collapse to the welcome screen instead of breaking the rail.
+        n_visible = len(rail.destinations or [])
+        if idx >= n_visible:
+            idx = 0
         rail.selected_index = idx
-        if state.ws is None and idx != 0:
-            # Force welcome when no workspace.
-            main_area.content = welcome_view
-        elif state.ws is None:
+        if state.ws is None:
             main_area.content = welcome_view
         else:
             main_area.content = [chat_view, files_view, settings_view, doctor_view][idx]
