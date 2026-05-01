@@ -1255,19 +1255,25 @@ def build_chat_view(state: AppState, *, refresh_status,
                         _toast(state.page, f"Save failed: {ex}")
                 state.page.run_task(_do)
 
-            def download_chapter_clicked(_=None):
-                """Experimental — extract just the chapter that contains
-                this hit and save it as a standalone PDF. Uses the
-                chapter metadata persisted at ingest time (PDF outline
-                or section headings). Quality depends on how clean the
-                source PDF's bookmarks are.
+            def open_chapter_in_browser(_=None):
+                """Extract the chapter containing this hit and open it
+                inline in the user's default browser. Browsers (Chrome /
+                Edge / Firefox) show PDFs with built-in toolbar — they
+                can save, print, or copy text from there. Cleaner than
+                a save dialog before the user has seen what they're
+                getting.
+
+                Cached under ~/.ezrag/chapter_cache/ so re-clicking the
+                same chapter reuses the file. 3-day sweep cleans it up.
                 """
-                async def _do():
+                def _bg():
                     if state.ws is None:
                         _toast(state.page, "Open a workspace first.")
                         return
                     try:
-                        from ez_rag.preview import extract_pdf_pages
+                        from ez_rag.preview import (
+                            chapter_cache_path_for, extract_pdf_pages,
+                        )
                         from ez_rag.embed import make_embedder
                         from ez_rag.index import Index
                         from ez_rag.chapters import find_chapter
@@ -1277,12 +1283,9 @@ def build_chat_view(state: AppState, *, refresh_status,
                         chapters = idx.chapters_for_file(hit.file_id)
                         if not chapters:
                             _toast(state.page,
-                                "No chapter metadata for this file. "
-                                "Re-ingest after a recent ez-rag update "
-                                "to populate it.")
+                                "No chapter metadata for this file — "
+                                "re-ingest after a recent ez-rag update.")
                             return
-                        # Look up the chunk's ord, then the chapter that
-                        # contains it.
                         row = idx.conn.execute(
                             "SELECT ord FROM chunks WHERE id = ?",
                             (hit.chunk_id,),
@@ -1291,77 +1294,71 @@ def build_chat_view(state: AppState, *, refresh_status,
                         ch = find_chapter(chapters, ord_) if ord_ is not None else None
                         if ch is None:
                             _toast(state.page,
-                                "Couldn't locate the chapter for this "
-                                "passage. Try Re-ingest (force).")
+                                "Couldn't locate the chapter for this passage.")
                             return
                         sp = ch.get("start_page")
                         ep = ch.get("end_page")
                         if not sp or not ep:
                             _toast(state.page,
-                                "Chapter has no page range — can't "
-                                "extract as PDF. (Non-PDF source?)")
+                                "Chapter has no page range (non-PDF source).")
                             return
-                        title = ch.get("title") or f"chapter-{sp}-{ep}"
-                        # Sanitize for filename
-                        safe_title = "".join(
-                            c if c.isalnum() or c in " ._-" else "_"
-                            for c in title
-                        ).strip()
-                        suggested = (
-                            f"{Path(hit.path).stem} - {safe_title} "
-                            f"(pp {sp}-{ep}).pdf"
-                        )
-                    except Exception as ex:
-                        _toast(state.page, f"Lookup failed: {ex}")
-                        return
-
-                    try:
-                        dest = await download_picker.save_file(
-                            dialog_title="Save chapter as PDF",
-                            file_name=suggested,
-                            allowed_extensions=["pdf"],
-                        )
-                    except Exception as ex:
-                        _toast(state.page, f"Save dialog failed: {ex}")
-                        return
-                    if not dest:
-                        return
-
-                    def _bg():
+                        title = ch.get("title") or f"pp {sp}-{ep}"
                         abs_pdf = (state.ws.root / hit.path).resolve()
-                        out = extract_pdf_pages(
-                            abs_pdf, sp, ep, Path(dest), title=title,
-                        )
-                        if out is None:
+                        cache_path = chapter_cache_path_for(abs_pdf, sp, ep)
+                        # Reuse the cached extract if it's already there;
+                        # extract fresh otherwise.
+                        if not cache_path.exists():
+                            out = extract_pdf_pages(
+                                abs_pdf, sp, ep, cache_path, title=title,
+                            )
+                            if out is None:
+                                _toast(state.page,
+                                    "Chapter extract failed. pypdf may "
+                                    "be missing, or the page range "
+                                    "exceeded the document.")
+                                return
+                        # Open in the user's default browser. webbrowser
+                        # accepts file:// URLs cross-platform.
+                        import webbrowser
+                        url = cache_path.resolve().as_uri()
+                        if not webbrowser.open(url):
                             _toast(state.page,
-                                "Chapter extract failed. pypdf may be "
-                                "missing, or the page range exceeded "
-                                "the document.")
-                        else:
-                            pages = ep - sp + 1
-                            _toast(state.page,
-                                f"Saved chapter '{title}' "
-                                f"({pages} pages) → {Path(out).name}")
-                    state.page.run_thread(_bg)
-                state.page.run_task(_do)
+                                f"Couldn't launch browser. PDF is at: "
+                                f"{cache_path}")
+                            return
+                        pages = ep - sp + 1
+                        _toast(state.page,
+                            f"Opened '{title}' ({pages} pages) in browser. "
+                            "Use the browser's Save/Print to keep it.")
+                    except Exception as ex:
+                        _toast(state.page, f"Chapter preview failed: {ex}")
+                state.page.run_thread(_bg)
 
+            # Toolbar — cleaner now that chapter routes through the browser
+            # (no save dialog needed). Page label on the left, two clearly
+            # differentiated actions on the right: a primary "Chapter"
+            # action (the new flow) and a secondary "Save image" action.
             toolbar = ft.Row([
-                ft.Text(f"page {hit.page} · 2.5x render",
+                ft.Icon(ft.Icons.PICTURE_AS_PDF, size=14,
+                        color=ON_SURFACE_DIM),
+                ft.Text(f"page {hit.page} · 2.5× render",
                         size=11, color=ON_SURFACE_DIM),
                 ft.Container(expand=True),
-                ft.OutlinedButton(
-                    "Chapter (experimental)",
+                ft.FilledTonalButton(
+                    "Chapter preview",
                     icon=ft.Icons.AUTO_STORIES,
-                    on_click=download_chapter_clicked,
-                    tooltip=("Save just the chapter containing this "
-                             "passage as a standalone PDF. Boundaries "
-                             "come from the source PDF's bookmarks "
-                             "(or section headings) — quality varies."),
+                    on_click=open_chapter_in_browser,
+                    tooltip=("Experimental — extract just the chapter "
+                             "containing this passage and open it inline "
+                             "in your default browser. Use the browser's "
+                             "built-in toolbar to save, print, or copy "
+                             "text. Boundaries come from the source "
+                             "PDF's bookmarks; quality varies."),
                 ),
                 ft.OutlinedButton(
-                    "Download", icon=ft.Icons.DOWNLOAD,
+                    "Save image", icon=ft.Icons.IMAGE,
                     on_click=download_clicked,
-                    tooltip="Save this page image as a PNG.",
+                    tooltip="Save this rendered page as a PNG.",
                 ),
             ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=6)
 

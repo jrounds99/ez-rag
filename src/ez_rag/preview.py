@@ -19,6 +19,10 @@ import time
 from pathlib import Path
 
 PREVIEW_CACHE_DIR = Path.home() / ".ezrag" / "preview_cache"
+# Chapter PDFs extracted via "Chapter (preview)" land here. Browser opens
+# them inline; user keeps via the browser's built-in Download/Save.
+# Same 3-day sweep as the page-image cache.
+CHAPTER_CACHE_DIR = Path.home() / ".ezrag" / "chapter_cache"
 DEFAULT_TTL_DAYS = 3
 # 2.5x gives ~180 DPI when source is 72 DPI — readable on hi-DPI displays
 # and still zoomable. The cost is ~4x the bytes vs 1.5x; preview cache
@@ -141,23 +145,37 @@ def extract_pdf_pages(
 def sweep_old_previews(*, days: int = DEFAULT_TTL_DAYS) -> int:
     """Delete cached previews older than `days`. Returns number removed.
 
-    Runs at app startup. Failures are silent — a corrupt cache shouldn't
-    prevent the GUI from starting.
+    Runs at app startup. Sweeps both the page-image cache (PNG) and the
+    chapter-PDF cache (PDF). Failures are silent — a corrupt cache
+    shouldn't prevent the GUI from starting.
     """
-    if not PREVIEW_CACHE_DIR.is_dir():
-        return 0
     cutoff = time.time() - (days * 86400)
     removed = 0
-    try:
-        for f in PREVIEW_CACHE_DIR.iterdir():
-            if not f.is_file() or f.suffix.lower() != ".png":
-                continue
-            try:
-                if f.stat().st_mtime < cutoff:
-                    f.unlink()
-                    removed += 1
-            except OSError:
-                pass
-    except OSError:
-        pass
+    for cache_dir, ext in (
+        (PREVIEW_CACHE_DIR, ".png"),
+        (CHAPTER_CACHE_DIR, ".pdf"),
+    ):
+        if not cache_dir.is_dir():
+            continue
+        try:
+            for f in cache_dir.iterdir():
+                if not f.is_file() or f.suffix.lower() != ext:
+                    continue
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        removed += 1
+                except OSError:
+                    pass
+        except OSError:
+            pass
     return removed
+
+
+def chapter_cache_path_for(pdf_path: Path, start_page: int, end_page: int) -> Path:
+    """Stable cache path for the chapter PDF extract — same hash scheme
+    as cache_path_for() so identical chapter requests reuse the file."""
+    abs_path = str(pdf_path.resolve())
+    digest = hashlib.sha256(abs_path.encode("utf-8")).hexdigest()[:16]
+    CHAPTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CHAPTER_CACHE_DIR / f"{digest}_p{int(start_page)}-{int(end_page)}.pdf"
