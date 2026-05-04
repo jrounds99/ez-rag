@@ -1,0 +1,15 @@
+{"question": "What is the time complexity of merge sort, and on what kind of data is it especially suited?", "must_appear_in_chunk": "O(n log n)", "source_file": "programming_pearls.md"}
+{"question": "Which algorithm decomposes an N-point discrete Fourier transform into smaller transforms?", "must_appear_in_chunk": "Cooley", "source_file": "programming_pearls.md"}
+{"question": "What two properties must a problem have for dynamic programming to apply?", "must_appear_in_chunk": "optimal substructure", "source_file": "programming_pearls.md"}
+{"question": "What is the canonical example of a greedy algorithm that's provably optimal?", "must_appear_in_chunk": "Huffman", "source_file": "programming_pearls.md"}
+{"question": "What does the A* algorithm add on top of Dijkstra?", "must_appear_in_chunk": "heuristic", "source_file": "programming_pearls.md"}
+{"question": "In what year did Carl Linnaeus first publish Systema Naturae?", "must_appear_in_chunk": "1735", "source_file": "linnaean_taxonomy.md"}
+{"question": "What are the eight major taxonomic ranks from Domain to Species?", "must_appear_in_chunk": "Phylum", "source_file": "linnaean_taxonomy.md"}
+{"question": "Which Latin name identifies the domestic cat as a subspecies of the European wildcat?", "must_appear_in_chunk": "Felis silvestris catus", "source_file": "linnaean_taxonomy.md"}
+{"question": "Which 20th-century systematist developed the clade-based approach to taxonomy?", "must_appear_in_chunk": "Hennig", "source_file": "linnaean_taxonomy.md"}
+{"question": "Why is the traditional class Reptilia considered paraphyletic?", "must_appear_in_chunk": "birds", "source_file": "linnaean_taxonomy.md"}
+{"question": "Who wrote The Yellow Wallpaper, and in what year was it published?", "must_appear_in_chunk": "1892", "source_file": "the_yellow_wallpaper_excerpt.md"}
+{"question": "What is the narrator forbidden to do until she's well?", "must_appear_in_chunk": "work", "source_file": "the_yellow_wallpaper_excerpt.md"}
+{"question": "Where is the colonial mansion the narrator describes — how far from the village?", "must_appear_in_chunk": "three miles", "source_file": "the_yellow_wallpaper_excerpt.md"}
+{"question": "What does John, the narrator's husband, do for a living?", "must_appear_in_chunk": "physician", "source_file": "the_yellow_wallpaper_excerpt.md"}
+{"question": "What kind of structures are mentioned as being broken on the estate?", "must_appear_in_chunk": "greenhouses", "source_file": "the_yellow_wallpaper_excerpt.md"}

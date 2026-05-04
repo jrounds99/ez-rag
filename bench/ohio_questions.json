@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "description": "20 questions about Ohio geology + adjacent topics, answerable from sample_data/fetched. Mix of categories: factual lookups, multi-state comparisons, historical, multi-step synthesis.",
+  "corpus_files": [
+    "geology/pdf/ohio-bedrock-geology-2017.pdf",
+    "geology/pdf/ohio-mineral-industries-2023.pdf",
+    "geology/pdf/ohio-geological-survey-history.pdf",
+    "geology/pdf/ohio-paving-brick-industry.pdf",
+    "geology/pdf/usgs-pp-1817-appalachian-basin.pdf",
+    "geology/pdf/usgs-bul-1412-coal-resources.pdf",
+    "geology/pdf/usgs-pp-1625f-d-coal-recoverability.pdf",
+    "geology/pdf/usgs-circ-1399-mineral-resources.pdf"
+  ],
+  "questions": [
+    { "q": "What is the bedrock geology of Ohio composed of?", "category": "factual" },
+    { "q": "Which mineral commodity is Ohio's largest by production value?", "category": "factual" },
+    { "q": "When was the Ohio Geological Survey founded and who led it?", "category": "factual" },
+    { "q": "What are the main coal-producing regions of Ohio?", "category": "factual" },
+    { "q": "Tell me about the paving-brick industry in Ohio.", "category": "factual" },
+    { "q": "Which industrial minerals are produced in Ohio today?", "category": "factual" },
+    { "q": "How does Ohio's geology relate to the broader Appalachian Basin?", "category": "comparison" },
+    { "q": "Compare coal resources between Ohio and West Virginia.", "category": "comparison" },
+    { "q": "What's the difference between bedrock geology in eastern vs western Ohio?", "category": "comparison" },
+    { "q": "How does Ohio's mineral industry compare to other Appalachian states?", "category": "comparison" },
+    { "q": "List specific named geologic formations or members found in Ohio.", "category": "exploratory" },
+    { "q": "Name some historically significant Ohio quarries or mineral deposits.", "category": "exploratory" },
+    { "q": "What kinds of clay deposits are exploited in Ohio's brick industry?", "category": "exploratory" },
+    { "q": "What technologies were used in Appalachian coal mining and how did they change?", "category": "multi-step" },
+    { "q": "Walk through the geologic history of Ohio from the Cambrian to the present.", "category": "multi-step" },
+    { "q": "Explain how recoverability of coal reserves is calculated in USGS assessments.", "category": "multi-step" },
+    { "q": "What is the relationship between Ohio's coal seams and its bedrock structure?", "category": "multi-step" },
+    { "q": "Why is Ohio limestone economically important, and where is it quarried?", "category": "multi-step" },
+    { "q": "How did the Ohio Geological Survey's mission and methods evolve over the 19th and 20th centuries?", "category": "multi-step" },
+    { "q": "Summarize the main critical and strategic minerals discussed in USGS Circular 1399.", "category": "multi-step" }
+  ]
+}

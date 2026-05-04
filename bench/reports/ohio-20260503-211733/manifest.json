@@ -1,0 +1,82 @@
+{
+  "version": 2,
+  "started_at": 1777864168.6000254,
+  "embedders": {
+    "qwen3-emb-8b": {
+      "provider": "ollama",
+      "tag": "qwen3-embedding:8b",
+      "ingest": {
+        "skipped": true
+      }
+    },
+    "nomic-text": {
+      "provider": "ollama",
+      "tag": "nomic-embed-text",
+      "ingest": {
+        "skipped": true
+      }
+    },
+    "bge-m3": {
+      "provider": "ollama",
+      "tag": "bge-m3:567m",
+      "ingest": {
+        "skipped": true
+      }
+    }
+  },
+  "cells_total": 1380,
+  "cells_ok": 1380,
+  "cells_error": 0,
+  "system": {
+    "hostname": "office",
+    "short_system_id": "4e0510f121c6",
+    "os_name": "Windows 11",
+    "os_version": "10.0.26200",
+    "os_kernel": "11",
+    "os_arch": "AMD64",
+    "timezone": "Eastern Daylight Time",
+    "utc_timestamp": "2026-05-04T01:19:32Z",
+    "cpu_model": "AMD Ryzen 7 9800X3D 8-Core Processor",
+    "cpu_physical_cores": 8,
+    "cpu_logical_threads": 16,
+    "cpu_max_freq_mhz": 4700,
+    "ram_total_gb": 61.66,
+    "ram_available_gb": 39.83,
+    "ram_speed_mhz": 4800,
+    "gpus": [
+      {
+        "index": 0,
+        "vendor": "nvidia",
+        "name": "NVIDIA GeForce RTX 5090",
+        "vram_total_mb": 32607,
+        "vram_free_mb": 14476,
+        "driver_version": "591.86",
+        "runtime": "cuda",
+        "detection_source": "nvidia-smi"
+      }
+    ],
+    "docs_disk_seq_read_mbps": 3885.6,
+    "docs_disk_path": "C:\\Users\\jroun\\workstuff\\ez-rag",
+    "ollama_version": "0.12.11",
+    "ollama_url": "http://127.0.0.1:11434",
+    "python_version": "3.14.2",
+    "ezrag_git_sha": "a89d1f76978b",
+    "bench_version": "0.1.0",
+    "bench_run_id": "2026-05-04T01-19-32Z",
+    "probe_warnings": []
+  },
+  "bench_args": {
+    "corpus": "C:\\Users\\jroun\\workstuff\\ez-rag\\sample_data\\fetched\\geology",
+    "out_dir": "C:\\Users\\jroun\\workstuff\\ez-rag\\bench\\reports",
+    "workspaces_dir": "C:\\Users\\jroun\\workstuff\\ez-rag\\bench\\_ohio-workspaces",
+    "ollama_url": "http://127.0.0.1:11434",
+    "judge": "qwen2.5:7b",
+    "limit_models": 0,
+    "limit_questions": 0,
+    "limit_embedders": 0,
+    "strategies": "default",
+    "skip_pull": true,
+    "no_power": false,
+    "reuse_workspaces": true
+  }
+}

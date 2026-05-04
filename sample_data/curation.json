@@ -1,0 +1,236 @@
+{
+  "version": 1,
+  "description": "Curated list of public-domain government datasets for RAG benchmarking. All entries are US federal or state government works (public domain) or otherwise freely reusable.",
+  "items": [
+
+    {
+      "url": "https://pubs.usgs.gov/circ/1399/pdf/circ1399.pdf",
+      "save_as": "geology/pdf/usgs-circ-1399-mineral-resources.pdf",
+      "format": "pdf",
+      "topic": "geology",
+      "subtopic": "mineral-resources",
+      "states": ["national"],
+      "title": "Mineral Resources, Economics, and the Environment (USGS Circular 1399)",
+      "license": "public-domain",
+      "expected_size_mb": 15.0
+    },
+    {
+      "url": "https://pubs.usgs.gov/bul/1412/report.pdf",
+      "save_as": "geology/pdf/usgs-bul-1412-coal-resources.pdf",
+      "format": "pdf",
+      "topic": "geology",
+      "subtopic": "coal",
+      "states": ["national"],
+      "title": "Coal Resources of the United States, January 1, 1974 (USGS Bulletin 1412)",
+      "license": "public-domain",
+      "expected_size_mb": 12.0
+    },
+    {
+      "url": "https://pubs.usgs.gov/pp/1625f/downloads/ChapterD.pdf",
+      "save_as": "geology/pdf/usgs-pp-1625f-d-coal-recoverability.pdf",
+      "format": "pdf",
+      "topic": "geology",
+      "subtopic": "coal-recoverability",
+      "states": ["WV", "KY", "OH", "VA"],
+      "title": "Coal Resource Availability, Recoverability, and Economic Evaluations (USGS PP 1625-F, Chapter D)",
+      "license": "public-domain",
+      "expected_size_mb": 8.0
+    },
+    {
+      "url": "https://pubs.usgs.gov/pp/1817/pp1817.pdf",
+      "save_as": "geology/pdf/usgs-pp-1817-appalachian-basin.pdf",
+      "format": "pdf",
+      "topic": "geology",
+      "subtopic": "appalachian-basin",
+      "states": ["OH", "PA", "WV", "VA", "KY", "TN"],
+      "title": "Appalachian Basin Geology and Resources (USGS Professional Paper 1817)",
+      "license": "public-domain",
+      "expected_size_mb": 10.0
+    },
+    {
+      "url": "https://dam.assets.ohio.gov/image/upload/ohiodnr.gov/documents/geology/MiscMap_BedrockGeology_2017.pdf",
+      "save_as": "geology/pdf/ohio-bedrock-geology-2017.pdf",
+      "format": "pdf",
+      "topic": "geology",
+      "subtopic": "bedrock",
+      "states": ["OH"],
+      "title": "Bedrock Geologic Map of Ohio (2017)",
+      "license": "public-domain",
+      "expected_size_mb": 6.0
+    },
+    {
+      "url": "https://dam.assets.ohio.gov/image/upload/ohiodnr.gov/documents/geology/IM1_2023_Wright.pdf",
+      "save_as": "geology/pdf/ohio-mineral-industries-2023.pdf",
+      "format": "pdf",
+      "topic": "geology",
+      "subtopic": "mineral-industry",
+      "states": ["OH"],
+      "title": "Report on Ohio Mineral Industries 2023 (compiled by C. Wright)",
+      "license": "public-domain",
+      "expected_size_mb": 3.0
+    },
+    {
+      "url": "https://dam.assets.ohio.gov/image/upload/ohiodnr.gov/documents/geology/RS_Hansen_1979.pdf",
+      "save_as": "geology/pdf/ohio-geological-survey-history.pdf",
+      "format": "pdf",
+      "topic": "geology",
+      "subtopic": "history",
+      "states": ["OH"],
+      "title": "A Brief History of the Ohio Geological Survey (Hansen, 1979)",
+      "license": "public-domain",
+      "expected_size_mb": 1.0
+    },
+    {
+      "url": "https://dam.assets.ohio.gov/image/upload/ohiodnr.gov/documents/geology/OGN_1999_n3.pdf",
+      "save_as": "geology/pdf/ohio-paving-brick-industry.pdf",
+      "format": "pdf",
+      "topic": "geology",
+      "subtopic": "industrial-minerals",
+      "states": ["OH"],
+      "title": "The Paving Brick Industry in Ohio (Ohio Geology Newsletter, 1999)",
+      "license": "public-domain",
+      "expected_size_mb": 1.0
+    },
+    {
+      "url": "https://mrdata.usgs.gov/mrds/mrds-csv.zip",
+      "save_as": "geology/zip/mrds-csv-all-states.zip",
+      "format": "zip",
+      "topic": "geology",
+      "subtopic": "mineral-deposits",
+      "states": ["national"],
+      "title": "USGS Mineral Resources Data System — full national CSV (all states)",
+      "license": "public-domain",
+      "expected_size_mb": 25.0,
+      "extract_after": true,
+      "optional": true,
+      "note": "Extracted CSV is ~130 MB (1.3M rows). Pass --include-optional to fetch."
+    },
+
+    {
+      "url": "https://www.eia.gov/state/seds/sep_use/total/xls/use_all_btu.xlsx",
+      "save_as": "energy/xlsx/eia-seds-use-all-btu.xlsx",
+      "format": "xlsx",
+      "topic": "energy",
+      "subtopic": "consumption-by-state",
+      "states": ["national"],
+      "title": "EIA State Energy Data System — Energy Consumption by State (BTU, all sectors, 1960–present)",
+      "license": "public-domain",
+      "expected_size_mb": 6.0
+    },
+    {
+      "url": "https://www.eia.gov/state/seds/sep_prod/xls/Prod_dataset.xlsx",
+      "save_as": "energy/xlsx/eia-seds-production.xlsx",
+      "format": "xlsx",
+      "topic": "energy",
+      "subtopic": "production-by-state",
+      "states": ["national"],
+      "title": "EIA State Energy Data System — Production Dataset",
+      "license": "public-domain",
+      "expected_size_mb": 5.0
+    },
+    {
+      "url": "https://www.eia.gov/state/seds/sep_prices/total/xls/pr_all.xlsx",
+      "save_as": "energy/xlsx/eia-seds-prices.xlsx",
+      "format": "xlsx",
+      "topic": "energy",
+      "subtopic": "prices-by-state",
+      "states": ["national"],
+      "title": "EIA State Energy Data System — All Energy Prices",
+      "license": "public-domain",
+      "expected_size_mb": 5.0
+    },
+    {
+      "url": "https://www.eia.gov/outlooks/aeo/pdf/AEO2023_Narrative.pdf",
+      "save_as": "energy/pdf/eia-aeo-2023-narrative.pdf",
+      "format": "pdf",
+      "topic": "energy",
+      "subtopic": "outlook",
+      "states": ["national"],
+      "title": "EIA Annual Energy Outlook 2023 — Narrative",
+      "license": "public-domain",
+      "expected_size_mb": 4.0
+    },
+
+    {
+      "url": "https://data.bls.gov/cew/data/files/2024/csv/2024_qtrly_by_industry.zip",
+      "save_as": "labor/zip/bls-qcew-2024-by-industry.zip",
+      "format": "zip",
+      "topic": "labor",
+      "subtopic": "employment-wages",
+      "states": ["national"],
+      "title": "BLS Quarterly Census of Employment and Wages 2024 — by industry",
+      "license": "public-domain",
+      "expected_size_mb": 30.0,
+      "extract_after": true,
+      "optional": true,
+      "note": "LARGE — disabled by default. The single-file QCEW is ~290 MB; this by-industry slice is smaller. Skip with --skip-optional or remove this entry to keep the corpus under 100 MB."
+    },
+
+    {
+      "url": "https://www.gutenberg.org/cache/epub/33224/pg33224.txt",
+      "save_as": "text/gutenberg-principles-of-geology-vol1.txt",
+      "format": "txt",
+      "topic": "geology",
+      "subtopic": "historical",
+      "states": ["national"],
+      "title": "Lyell — Principles of Geology Volume I (1830, public domain)",
+      "license": "public-domain",
+      "expected_size_mb": 1.5
+    },
+    {
+      "url": "https://www.gutenberg.org/files/13415/13415-0.txt",
+      "save_as": "text/gutenberg-aspects-of-nature.txt",
+      "format": "txt",
+      "topic": "natural-history",
+      "subtopic": "geology-essays",
+      "states": ["national"],
+      "title": "Humboldt — Aspects of Nature (English translation, 1850, public domain)",
+      "license": "public-domain",
+      "expected_size_mb": 1.0
+    },
+    {
+      "url": "https://www.gutenberg.org/cache/epub/2009/pg2009.txt",
+      "save_as": "text/gutenberg-darwin-origin.txt",
+      "format": "txt",
+      "topic": "natural-history",
+      "subtopic": "evolution",
+      "states": ["national"],
+      "title": "Darwin — On the Origin of Species (1859, public domain)",
+      "license": "public-domain",
+      "expected_size_mb": 1.5
+    },
+    {
+      "url": "https://pubs.usgs.gov/circ/1413/circ1413.pdf",
+      "save_as": "geology/pdf/usgs-circ-1413-aquifers.pdf",
+      "format": "pdf",
+      "topic": "water",
+      "subtopic": "aquifers",
+      "states": ["national"],
+      "title": "Water Quality in Principal Aquifers of the United States (USGS Circular 1413)",
+      "license": "public-domain",
+      "expected_size_mb": 54.0,
+      "optional": true,
+      "note": "54 MB single PDF. Pass --include-optional to fetch."
+    }
+
+  ],
+  "post_processing": {
+    "convert_to_docx": [
+      {
+        "source": "geology/pdf/ohio-mineral-industries-2023.pdf",
+        "target": "docx/ohio-mineral-industries-2023.docx",
+        "method": "pandoc-or-fallback"
+      },
+      {
+        "source": "geology/pdf/ohio-paving-brick-industry.pdf",
+        "target": "docx/ohio-paving-brick-industry.docx",
+        "method": "pandoc-or-fallback"
+      },
+      {
+        "source": "geology/pdf/ohio-geological-survey-history.pdf",
+        "target": "docx/ohio-geological-survey-history.docx",
+        "method": "pandoc-or-fallback"
+      }
+    ]
+  }
+}
