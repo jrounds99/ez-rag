@@ -61,3 +61,23 @@ desktop.ini
 
 # Bulk debug screenshots — keep only the curated ones in docs/screenshots/
 _screenshots/
+
+# Bench result bundles — large binary outputs, regenerable on demand.
+bench-results/
+
+# Bench workspaces (vectors + sqlite) and historical run bundles.
+# We commit one showcase bundle for GitHub viewers (see exception
+# below), everything else is local-only.
+bench/_ohio-workspaces/
+bench/reports/dnd5e-quality-*
+bench/reports/multimodel-*
+bench/reports/ohio-20260503-184645/
+# But DO commit the v2 Ohio showcase (~9.6 MB, JSON + HTML report)
+!bench/reports/ohio-20260503-211733/
+!bench/reports/ohio-20260503-211733/**
+
+# Sample-data downloads — ~100 MB of public-domain government docs.
+# The README + curation.json + fetch.py are committed; the fetched
+# bytes are not. Re-fetchable via `python sample_data/fetch.py`.
+sample_data/fetched/
+sample_data/manifest.json

@@ -45,6 +45,62 @@ are visible to you.
 SYSTEM_PROMPT = SYSTEM_PROMPT_RAG
 
 
+# System prompt for "list X / name some X / give examples of X" style
+# queries. Forces the model to extract specific named items from the
+# retrieved context instead of pivoting into general explanations or
+# definitions — the failure mode the user reported on D&D 5e where
+# "list NPCs" came back with a discussion of elf naming rules instead
+# of an actual list of NPC names.
+SYSTEM_PROMPT_LIST_EXTRACTION = """You are an information-extraction assistant. The user is asking for a LIST of specific named items (people, places, items, creatures, etc.) that appear in the retrieved context.
+
+Your job:
+1. SCAN every context excerpt for proper nouns / specific named items that match the user's request. Look for capitalized names, table entries, sidebar entries, stat-block headers, and any other specific examples.
+2. Output a BULLETED LIST. Each bullet:
+     - <specific name> — <one short sentence of context if available> [filename, page N]
+3. Do NOT explain general concepts. Do NOT pivot to "here's how X works". Do NOT define the term the user is asking about. The user wants the LIST, not the explanation.
+4. If you find specific names buried inside paragraphs of unrelated text, EXTRACT THEM. Do not summarize the surrounding paragraph instead.
+5. If you find fewer than 3 specific examples, say "Only N specific examples found in the indexed excerpts:" and list what you have. Do NOT pad with generic examples or guesses outside the context.
+6. If the context contains zero specific examples, say "I did not find specific named examples for this in the indexed documents." Do NOT make up names.
+"""
+
+
+def _is_list_query(text: str) -> bool:
+    """Heuristic: does this question want a LIST of specific items?
+
+    Used by `answer()` to auto-route list-style queries to the
+    extraction prompt + entity-rich HyDE retrieval, which dramatically
+    improves results on open-ended exploratory queries on this kind of
+    model + corpus combination.
+    """
+    if not text:
+        return False
+    t = text.lower().strip()
+    triggers = (
+        # explicit "list / name" phrasings
+        "list ", "name some", "name a few", "give examples",
+        "give me some", "give me examples", "examples of", "names of",
+        # "what / which" patterns
+        "what are some", "what cool", "which characters", "which npcs",
+        "which monsters", "which items", "which spells",
+        # "tell me / show me" patterns — easy to forget
+        "tell me about", "tell me some", "show me some",
+        # quantifier patterns
+        "the most interesting", "the most unique", "the most memorable",
+        "some interesting", "some unique", "some memorable",
+        "some classic", "some notable", "some famous",
+        "any interesting", "any cool", "any examples", "any unique",
+        "any notable", "any famous",
+        # subject-led patterns
+        "interesting characters", "interesting npcs", "interesting monsters",
+        "interesting items", "interesting locations",
+        "memorable characters", "memorable npcs",
+        "unique sounding", "notable villains", "notable npcs",
+        # imperative
+        "suggest some", "suggest a few", "recommend some",
+    )
+    return any(trig in t for trig in triggers)
+
+
 @dataclass
 class Answer:
     text: str
@@ -93,8 +149,17 @@ def detect_backend(cfg: Config) -> str:
 
 # ----- answering -------------------------------------------------------------
 
-def apply_query_modifiers(question: str, cfg: Config) -> str:
+def apply_query_modifiers(question: str, cfg: Config,
+                           *, workspace_root=None) -> str:
     """Wrap a user question with optional prefix / suffix / negatives.
+
+    Two layers, merged in order:
+      1. Workspace-level (`cfg.query_prefix`/`query_suffix`/`query_negatives`)
+      2. Per-file sidecars under `<workspace_root>` with `scope = "global"`
+
+    Per-file modifiers with scope `topic-aware` or `file-only` are NOT
+    applied here — they need post-retrieval context and are handled by
+    `_apply_per_file_modifiers_post_retrieval` (see retrieve.py).
 
     Honored by both retrieval (the augmented text is what the dense embedder
     sees) and generation (it ends up in the user message). Returns the bare
@@ -102,10 +167,30 @@ def apply_query_modifiers(question: str, cfg: Config) -> str:
     """
     if not getattr(cfg, "apply_query_modifiers", True):
         return question
-    parts = []
+
+    parts: list[str] = []
     pre = (getattr(cfg, "query_prefix", "") or "").strip()
     suf = (getattr(cfg, "query_suffix", "") or "").strip()
     neg = (getattr(cfg, "query_negatives", "") or "").strip()
+
+    # Layer 2 — global-scope per-file sidecars
+    if (getattr(cfg, "use_file_metadata", True)
+            and workspace_root is not None):
+        try:
+            extra_pre, extra_suf, extra_neg = _global_scope_modifiers(
+                workspace_root,
+            )
+            if extra_pre:
+                pre = (pre + " " + extra_pre).strip()
+            if extra_suf:
+                suf = (suf + " " + extra_suf).strip()
+            if extra_neg:
+                merged_neg = (neg + ", " + extra_neg).strip(", ")
+                neg = merged_neg
+        except Exception:
+            # Sidecar parsing should never break the query path.
+            pass
+
     if pre:
         parts.append(pre)
     parts.append(question)
@@ -116,6 +201,71 @@ def apply_query_modifiers(question: str, cfg: Config) -> str:
     return "\n\n".join(parts)
 
 
+# --- per-file metadata helpers (used by apply_query_modifiers) ---
+
+_GLOBAL_SCOPE_CACHE: dict = {}
+_GLOBAL_SCOPE_CACHE_TTL_S = 30.0
+
+
+def _global_scope_modifiers(workspace_root) -> tuple[str, str, str]:
+    """Walk every per-file sidecar in `<workspace_root>/docs` and the
+    workspace meta dir, return (prefix, suffix, negatives) for sidecars
+    whose scope is 'global'.
+
+    Cached for 30 s — sidecars are hand-edited rarely; the user can
+    flip a config flag if they want immediate refresh.
+    """
+    import time as _time
+    from pathlib import Path
+    cache_key = str(workspace_root)
+    cached = _GLOBAL_SCOPE_CACHE.get(cache_key)
+    if cached is not None:
+        ts, value = cached
+        if (_time.monotonic() - ts) < _GLOBAL_SCOPE_CACHE_TTL_S:
+            return value
+
+    from .ingest_meta import (
+        SCOPE_GLOBAL, SIDECAR_SUFFIX, WORKSPACE_META_SUBDIR, parse_toml,
+    )
+
+    pres: list[str] = []
+    sufs: list[str] = []
+    negs: list[str] = []
+
+    ws = Path(workspace_root)
+    candidates: list[Path] = []
+    docs_dir = ws / "docs"
+    if docs_dir.is_dir():
+        candidates.extend(docs_dir.rglob(f"*{SIDECAR_SUFFIX}"))
+    meta_dir = ws / WORKSPACE_META_SUBDIR
+    if meta_dir.is_dir():
+        candidates.extend(meta_dir.glob("*.toml"))
+
+    for p in candidates:
+        try:
+            md = parse_toml(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if md.scope != SCOPE_GLOBAL:
+            continue
+        if md.query_prefix:
+            pres.append(md.query_prefix)
+        if md.query_suffix:
+            sufs.append(md.query_suffix)
+        if md.query_negatives:
+            negs.extend(md.query_negatives)
+
+    # dict.fromkeys preserves insertion order while deduplicating,
+    # but we need lists (slicing a dict raises TypeError).
+    out = (
+        " ".join(list(dict.fromkeys(pres)))[:200],
+        " ".join(list(dict.fromkeys(sufs)))[:200],
+        ", ".join(list(dict.fromkeys(negs))[:5]),
+    )
+    _GLOBAL_SCOPE_CACHE[cache_key] = (_time.monotonic(), out)
+    return out
+
+
 def _build_user_prompt(question: str, hits: list[Hit]) -> str:
     if not hits:
         return question
@@ -123,8 +273,94 @@ def _build_user_prompt(question: str, hits: list[Hit]) -> str:
     return f"Question: {question}\n\nContext:\n{ctx}\n\nAnswer with citations."
 
 
+def _build_per_file_brief(hits: list[Hit], *, workspace_root,
+                           question: str = "") -> str:
+    """Build a short "what these sources are" preamble from per-file
+    sidecars. Fed to the LLM as a system-prompt suffix when at least
+    one hit comes from a file with a discovered title / topics /
+    entities.
+
+    Two scope rules apply here:
+      - "global"     → always include this file's brief if it's in top-K
+      - "topic-aware" → include when the question text mentions any
+                        of the file's detected_topics
+      - "file-only"  → include only when this file is the top-1 source
+
+    Result format (kept short so it doesn't blow context):
+
+        Source context:
+          • Player's Handbook (2014).pdf — D&D 5e core rules.
+            Topics: combat, spellcasting. Known entities: Fighter,
+            Wizard, Way of the Drunken Master, Bag of Holding.
+          • Volo's Guide to Monsters.pdf — Monster compendium…
+    """
+    if not hits or workspace_root is None:
+        return ""
+    try:
+        from .ingest_meta import (
+            SCOPE_FILE_ONLY, SCOPE_GLOBAL, SCOPE_TOPIC_AWARE, load,
+        )
+    except ImportError:
+        return ""
+
+    from pathlib import Path
+    ws = Path(workspace_root)
+    seen_paths: set[str] = set()
+    blocks: list[str] = []
+    ql = (question or "").lower()
+
+    for i, h in enumerate(hits):
+        path = getattr(h, "path", None) or ""
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        file_path = (ws / path).resolve()
+        try:
+            md = load(file_path, workspace_root=ws)
+        except Exception:
+            md = None
+        if md is None:
+            continue
+        # Scope filter
+        applies = False
+        if md.scope == SCOPE_GLOBAL:
+            applies = True
+        elif md.scope == SCOPE_FILE_ONLY:
+            applies = (i == 0)
+        elif md.scope == SCOPE_TOPIC_AWARE:
+            for t in md.detected_topics:
+                if t and t.lower() in ql:
+                    applies = True
+                    break
+        if not applies:
+            continue
+        # Skip files where the LLM scan didn't actually populate anything
+        if not (md.title or md.detected_topics
+                 or md.entities.all()):
+            continue
+        # Build one bullet per matching file
+        bits: list[str] = []
+        name = Path(path).name
+        title = md.title or name
+        bits.append(f"• {name} — {title}.")
+        if md.description:
+            bits.append(f"  {md.description}")
+        topic_str = ", ".join(md.detected_topics[:5])
+        if topic_str:
+            bits.append(f"  Topics: {topic_str}.")
+        ents = md.entities.all()[:12]
+        if ents:
+            bits.append(f"  Known entities: {', '.join(ents)}.")
+        blocks.append("\n".join(bits))
+
+    if not blocks:
+        return ""
+    return "Source context:\n" + "\n\n".join(blocks)
+
+
 def answer(
     *, question: str, hits: list[Hit], cfg: Config, stream: bool = False,
+    workspace_root=None,
 ) -> Answer | Iterator[str]:
     """Single-turn Q&A. Used by `ez-rag ask`."""
     backend = detect_backend(cfg)
@@ -135,6 +371,21 @@ def answer(
         )
     user_prompt = _build_user_prompt(question, hits)
     sys_prompt = SYSTEM_PROMPT_RAG if hits else SYSTEM_PROMPT_NO_RAG
+    # Auto-route list-style queries to the extraction prompt — forces
+    # the model to give back a real list of named items instead of
+    # drifting into general explanations.
+    if (hits and getattr(cfg, "auto_list_mode", True)
+            and _is_list_query(question)):
+        sys_prompt = SYSTEM_PROMPT_LIST_EXTRACTION
+    # Append per-file briefs (topic-aware + file-only sidecars) when
+    # workspace_root is known and use_file_metadata is on.
+    if (hits and getattr(cfg, "use_file_metadata", True)
+            and workspace_root is not None):
+        brief = _build_per_file_brief(
+            hits, workspace_root=workspace_root, question=question,
+        )
+        if brief:
+            sys_prompt = sys_prompt + "\n\n" + brief
     messages = [
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": user_prompt},
@@ -157,6 +408,7 @@ def chat_answer(
     hits: list[Hit],
     cfg: Config,
     stream: bool = False,
+    workspace_root=None,
 ) -> Answer | Iterator[str]:
     """Multi-turn chat. `history` is the conversation BEFORE the latest user
     turn (most recent turn first or last — order preserved as given).
@@ -168,6 +420,17 @@ def chat_answer(
             citations=hits, backend="none",
         )
     sys_prompt = SYSTEM_PROMPT_RAG if hits else SYSTEM_PROMPT_NO_RAG
+    if (hits and getattr(cfg, "auto_list_mode", True)
+            and _is_list_query(latest_question)):
+        sys_prompt = SYSTEM_PROMPT_LIST_EXTRACTION
+    if (hits and getattr(cfg, "use_file_metadata", True)
+            and workspace_root is not None):
+        brief = _build_per_file_brief(
+            hits, workspace_root=workspace_root,
+            question=latest_question,
+        )
+        if brief:
+            sys_prompt = sys_prompt + "\n\n" + brief
     messages: list[dict] = [{"role": "system", "content": sys_prompt}]
     messages.extend(history)
     messages.append({"role": "user",
@@ -186,12 +449,22 @@ def chat_answer(
 
 # ----- Ollama backend --------------------------------------------------------
 
-def _ollama_options(cfg: Config) -> dict:
+def _ollama_options(cfg: Config,
+                     messages: list[dict] | None = None) -> dict:
     """Per-request options for /api/chat and /api/generate.
 
     Includes empirically-tuned defaults that gave ~+8% throughput and
     ~-23% TTFT on a 32B model in our benchmark — see bench/ for the data.
-    `num_ctx=0` lets Ollama pick its own default for the model.
+
+    num_ctx behavior:
+      - cfg.num_ctx > 0  → user-fixed value, honored as-is
+      - cfg.num_ctx == 0 AND messages given → AUTO-SIZE: estimate the
+        prompt token count, round up to the smallest bucket that fits,
+        cap at the model's native max context. This is critical: Ollama
+        defaults num_ctx to 4096 for most models, so a 30 KB RAG prompt
+        gets SILENTLY TRUNCATED. Auto-sizing makes the model see all
+        the carefully-retrieved context that ez-rag worked to build.
+      - cfg.num_ctx == 0 AND no messages → omit num_ctx (legacy callers)
     """
     opts = {
         "temperature": cfg.temperature,
@@ -201,7 +474,76 @@ def _ollama_options(cfg: Config) -> dict:
     nc = int(getattr(cfg, "num_ctx", 0) or 0)
     if nc > 0:
         opts["num_ctx"] = nc
+    elif messages:
+        opts["num_ctx"] = _auto_num_ctx(cfg, messages)
     return opts
+
+
+# Cache the model's native max context per (url, model) so we don't
+# /api/show on every request. Cheap to populate, never changes within
+# a session for a given model.
+_MODEL_MAX_CTX_CACHE: dict[tuple[str, str], int] = {}
+
+
+def model_max_ctx(cfg: Config) -> int:
+    """Return the native max context length the configured model supports.
+
+    Asks Ollama via /api/show and parses the model_info block, looking
+    for any key ending in '.context_length' (qwen2 / llama / phi / etc.
+    each prefix it differently). Cached per (url, model). Falls back to
+    a conservative 4096 if the probe fails.
+    """
+    from .multi_gpu import resolve_url
+    url = resolve_url(cfg, cfg.llm_model, role="chat")
+    key = (url, cfg.llm_model)
+    if key in _MODEL_MAX_CTX_CACHE:
+        return _MODEL_MAX_CTX_CACHE[key]
+    found = 4096
+    try:
+        r = httpx.post(
+            url.rstrip("/") + "/api/show",
+            json={"name": cfg.llm_model},
+            timeout=5.0,
+        )
+        if r.status_code == 200:
+            info = r.json().get("model_info", {}) or {}
+            for k, v in info.items():
+                if k.endswith(".context_length"):
+                    try:
+                        found = max(found, int(v))
+                    except (TypeError, ValueError):
+                        continue
+    except Exception:
+        pass
+    _MODEL_MAX_CTX_CACHE[key] = found
+    return found
+
+
+def _auto_num_ctx(cfg: Config, messages: list[dict]) -> int:
+    """Pick a num_ctx large enough to fit the prompt + reply, rounded
+    to a standard bucket so Ollama doesn't reload the model for every
+    minor size change.
+
+    Estimate: 1 token ≈ 3.5 English chars (slight over-estimate vs
+    true tokenizer count, intentionally conservative).
+    Output reserve: cfg.max_tokens + 256 token slack.
+    Bucket sizes: 4096, 8192, 16384, 32768, 65536, 131072.
+    Cap: model's native max_ctx (or user-supplied cfg.num_ctx_cap).
+    """
+    chars = sum(len(m.get("content", "") or "") for m in messages)
+    prompt_tokens = int(chars / 3.5) + 64    # +64 for chat-format overhead
+    output_reserve = int(getattr(cfg, "max_tokens", 1024) or 1024) + 256
+    needed = prompt_tokens + output_reserve
+
+    max_ctx = model_max_ctx(cfg)
+    user_cap = int(getattr(cfg, "num_ctx_cap", 0) or 0)
+    if user_cap > 0:
+        max_ctx = min(max_ctx, user_cap)
+
+    for bucket in (4096, 8192, 16384, 32768, 65536, 131072):
+        if needed <= bucket and bucket <= max_ctx:
+            return bucket
+    return max_ctx
 
 
 def _estimate_prompt_chars(messages: list[dict]) -> int:
@@ -352,14 +694,16 @@ def _classify_ollama_error(body: str) -> str:
 
 
 def _ollama_chat(cfg: Config, messages: list[dict]) -> str:
+    from .multi_gpu import resolve_url
+    url = resolve_url(cfg, cfg.llm_model, role="chat")
     try:
         r = httpx.post(
-            cfg.llm_url.rstrip("/") + "/api/chat",
+            url.rstrip("/") + "/api/chat",
             json={
                 "model": cfg.llm_model,
                 "messages": messages,
                 "stream": False,
-                "options": _ollama_options(cfg),
+                "options": _ollama_options(cfg, messages),
             },
             timeout=300.0,
         )
@@ -392,15 +736,17 @@ def _ollama_chat_stream(cfg: Config, messages: list[dict]) -> Iterator[tuple[str
     Wraps upstream errors in OllamaChatError so the GUI can show a clear,
     actionable message instead of the raw httpx string.
     """
+    from .multi_gpu import resolve_url
+    url = resolve_url(cfg, cfg.llm_model, role="chat")
     try:
         with httpx.stream(
             "POST",
-            cfg.llm_url.rstrip("/") + "/api/chat",
+            url.rstrip("/") + "/api/chat",
             json={
                 "model": cfg.llm_model,
                 "messages": messages,
                 "stream": True,
-                "options": _ollama_options(cfg),
+                "options": _ollama_options(cfg, messages),
             },
             timeout=None,
         ) as r:
@@ -638,6 +984,50 @@ def generate_hyde(query: str, cfg: Config) -> str:
     return f"{query}\n{out.strip()}"
 
 
+def generate_list_hyde(query: str, cfg: Config) -> str:
+    """HyDE tuned for 'list X / name some X' queries.
+
+    Standard HyDE generates a summary-style answer, which embeds well
+    against explanatory prose but POORLY against the stat-block /
+    sidebar / table chunks that actually contain named entities. This
+    variant asks the LLM for an entity-rich passage instead — proper
+    nouns, capitalized names, domain-specific terminology — which
+    matches reference-book content far better.
+
+    Empirically: on a D&D 5e corpus + qwen2.5:7b, this can change "list
+    unique-sounding NPCs" from "discussion of elf naming rules" to
+    actual NPC stat-block extracts (Durnan, Bonnie, Threestrings, etc.).
+
+    The prompt is topic-anchored — it repeats the user's exact question
+    twice and explicitly forbids drifting to a different topic, since an
+    earlier looser version sometimes generated entity-rich text on a
+    related-but-wrong subject (e.g. encounter tables for "list NPCs").
+    """
+    prompt = (
+        f"User question: {query}\n\n"
+        "You are writing a hypothetical passage that, if found in a "
+        "reference book, would directly answer the user's question with "
+        "specific named examples.\n\n"
+        "Requirements:\n"
+        "1. Stay TIGHTLY on the user's literal topic. Do not drift to "
+        "an adjacent or related subject.\n"
+        "2. Pack 4-6 specific named examples (proper nouns, capitalized "
+        "names, character names, item names, place names, etc.) into "
+        "the passage.\n"
+        "3. 2-3 sentences only. No preamble. No explanation.\n"
+        "4. If the passage is about a non-topic, you have failed. "
+        "Re-read the user question and stay on it.\n\n"
+        f"Topic the passage MUST cover: {query}\n\n"
+        "Passage:"
+    )
+    out = _llm_complete(cfg, prompt, max_tokens=220)
+    if not out.strip():
+        return query
+    # Concatenate so the dense retriever sees both the original question
+    # keywords AND the entity-rich hypothetical content.
+    return f"{query}\n{out.strip()}"
+
+
 def generate_query_variations(query: str, cfg: Config, n: int = 2) -> list[str]:
     """Multi-query: ask the LLM for N alternative phrasings.
 
@@ -764,6 +1154,80 @@ def inspect_text_quality(text: str, cfg: Config) -> dict:
     if first in ("clean", "garbled", "partial"):
         return {"state": first, "raw": out.strip()[:120]}
     return {"state": "unknown", "raw": out.strip()[:120]}
+
+
+def correct_garbled_text(text: str, cfg: Config, *,
+                          context: str = "") -> str | None:
+    """Best-effort LLM correction of OCR-noisy or partially-garbled text.
+
+    Sends the passage with light surrounding context to the LLM and asks
+    for a cleaned-up version — fixing OCR misreads ("ShAMe" → "Shame"),
+    spurious whitespace ("It'sJustBusiness" → "It's Just Business"), and
+    obvious typos. The model is explicitly told NOT to invent content
+    when the source is too damaged.
+
+    Returns the corrected string, or None if:
+      - LLM is unavailable
+      - LLM refuses to correct (response too short or empty)
+      - The "correction" is the same length / very similar (no value)
+
+    Caller decides whether to use the result. Only suitable for already-
+    suspicious sections (OCR-recovered or LLM-inspect-flagged "partial");
+    don't run this on every clean page — too expensive and adds risk of
+    rewriting content the LLM already understood correctly.
+    """
+    if not text or not text.strip():
+        return None
+    if detect_backend(cfg) == "none":
+        return None
+    sample = text.strip()[:2500]
+    ctx_block = (
+        f"\n---SURROUNDING CONTEXT (do NOT include in your output)---\n"
+        f"{context.strip()[:800]}\n---END CONTEXT---\n"
+        if context.strip() else ""
+    )
+    prompt = (
+        "You are repairing text extracted from a PDF that has OCR errors "
+        "or font-encoding glitches. Below is the noisy passage, and "
+        "optionally some surrounding context for hint.\n\n"
+        "Your job: produce the cleanest plausible reconstruction, "
+        "preserving meaning. Fix obvious OCR misreads (l/1, O/0, "
+        "missing/extra spaces, wrong case). Do NOT invent content not "
+        "supported by the noisy source. Keep paragraph structure.\n\n"
+        "If the source is too damaged to clean confidently, return the "
+        "exact word UNRECOVERABLE on its own line.\n\n"
+        "Output ONLY the cleaned text — no preamble, no commentary, no "
+        "code fences. Multi-line output is fine.\n"
+        f"{ctx_block}\n"
+        "---NOISY PASSAGE---\n"
+        f"{sample}\n"
+        "---END---"
+    )
+    out = _llm_complete(cfg, prompt, max_tokens=1200)
+    if not out or not out.strip():
+        return None
+    cleaned = out.strip()
+    # Strip code fences if the model added them despite instructions.
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        # Drop opening fence line and (if present) closing fence line.
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    if cleaned.upper().startswith("UNRECOVERABLE"):
+        return None
+    # Basic sanity: must have substantive content
+    if len(cleaned) < 20:
+        return None
+    # Reject responses that look like the LLM ignored the instruction
+    # and described the input ("This passage appears to be...")
+    low = cleaned.lower()
+    if low.startswith(("this passage", "the passage", "this text",
+                        "the text", "here is", "i cannot")):
+        return None
+    return cleaned
 
 
 def contextualize_chunk(chunk_text: str, doc_summary: str, cfg: Config) -> str:

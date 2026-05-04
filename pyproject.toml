@@ -39,7 +39,14 @@ dependencies = [
 ocr = ["rapidocr-onnxruntime>=1.2", "Pillow>=10.0", "pytesseract>=0.3.10", "pypdfium2>=4.20"]
 gui = ["flet>=0.21"]
 llm = ["llama-cpp-python>=0.2.85"]
+dev = ["pytest>=8", "pytest-timeout>=2"]
 all = ["ez-rag[ocr,gui,llm]"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 300
+# Manual-script tests are skipped by tests/conftest.py — only the
+# subprocess runner is collected directly.
 
 [project.scripts]
 ez-rag = "ez_rag.cli:app"

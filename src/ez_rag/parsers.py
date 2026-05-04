@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import csv
 import email
-import io
 import re
 import zipfile
 from dataclasses import dataclass, field
@@ -127,6 +126,49 @@ _GARBLED_VOWEL_FLOOR       = 0.20   # English text is ~35-40% vowels of alpha ch
 _GARBLED_NONALNUM_CEIL     = 0.45   # >45% non-alphanumeric (excl. whitespace) → garbled
 
 
+def _looks_like_toc_fragment(text: str) -> bool:
+    """Heuristic: text is a Table-of-Contents-style index page that
+    extracted as fragmentary "label / page-number" rows.
+
+    Even when font extraction works, TOC pages are search-poison: a
+    chunk that says "Fighter\\n59\\nMonk\\n.61\\nOmin Dran.\\n..196"
+    will get retrieved for queries like "fighter abilities" and
+    waste a top-K slot on a page-number index entry.
+
+    OCR pages look like this AFTER recovery sometimes — the user
+    flagged this in a screenshot. We drop these.
+
+    Signals:
+      - many short lines (< 25 chars)
+      - many lines that are just numbers (or "..196" / ".61"
+        leftover dot-leader fragments)
+      - average line length << prose
+    """
+    if not text:
+        return False
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 6:
+        return False  # too short to confidently classify
+
+    short = sum(1 for l in lines if len(l) <= 25)
+    # Lines that are essentially a page number — possibly with leading
+    # dots from collapsed dot-leaders ("..196", ".61").
+    page_num_like = sum(
+        1 for l in lines
+        if l.lstrip(".").strip().isdigit() and len(l.lstrip(".").strip()) <= 4
+    )
+    avg_line_len = sum(len(l) for l in lines) / len(lines)
+
+    # Strong TOC signal: >40% short lines AND >15% bare page numbers
+    # AND short average line length. Tuned to match the user's example
+    # without flagging normal short-paragraph prose or bullet lists.
+    if (short / len(lines) > 0.40
+            and page_num_like / len(lines) > 0.15
+            and avg_line_len < 22):
+        return True
+    return False
+
+
 def _text_looks_garbled(text: str) -> bool:
     """Heuristic: does this page's extracted text look like font-cmap
     garbage rather than real prose?
@@ -166,7 +208,8 @@ def _text_looks_garbled(text: str) -> bool:
 
 
 @register(".pdf")
-def parse_pdf(path: Path, on_progress=None, on_recovery=None) -> list[ParsedSection]:
+def parse_pdf(path: Path, on_progress=None, on_recovery=None,
+              permissive: bool = False) -> list[ParsedSection]:
     """Parse a PDF page-by-page.
 
     `on_progress(page, total, ocr=False)` — if given, called after each page
@@ -179,6 +222,13 @@ def parse_pdf(path: Path, on_progress=None, on_recovery=None) -> list[ParsedSect
     OCR for those pages only — keeps fast pypdf extraction for clean
     pages, falls back to OCR (which reads pixels, not fonts) for the
     broken ones.
+
+    `permissive` — when True, OCR results that still look garbled or look
+    like TOC fragments are KEPT (with meta.questionable=True) instead of
+    being dropped. Caller (typically ingest.py with llm_correct_garbled
+    enabled) is expected to feed those sections through an LLM cleanup
+    pass and drop them only if the LLM also fails. Default False
+    preserves the original "drop poison upstream" behavior.
     """
     try:
         from pypdf import PdfReader  # type: ignore
@@ -240,16 +290,38 @@ def parse_pdf(path: Path, on_progress=None, on_recovery=None) -> list[ParsedSect
         for sec in sections:
             if sec.meta.get("reparse_pending") == "garbled":
                 ocr_text = ocr_map.get(sec.page or 0, "").strip()
-                if ocr_text and not _text_looks_garbled(ocr_text):
+                # Three rejection criteria — we drop the page if ANY hit:
+                #  1. OCR returned nothing
+                #  2. OCR returned text that's STILL garbled (different
+                #     glyphs from a sub-image, weird unicode, etc.)
+                #  3. OCR returned a TOC-fragment index page that's
+                #     fragmentary "label / page-number" garbage with
+                #     no retrieval value (the user's "Preface / Fighter
+                #     / 59 / Monk / .61" example)
+                still_bad = (
+                    not ocr_text
+                    or _text_looks_garbled(ocr_text)
+                    or _looks_like_toc_fragment(ocr_text)
+                )
+                if still_bad and not permissive:
+                    # Drop the page rather than poison the index.
+                    pass
+                elif still_bad and permissive and ocr_text:
+                    # Keep it but flag as questionable so the caller's
+                    # LLM-correction pass can take a shot. If the LLM
+                    # also rejects, the caller drops it then.
+                    rebuilt.append(ParsedSection(
+                        text=_normalize(ocr_text),
+                        page=sec.page,
+                        meta={"ocr": True, "reparse": "garbled",
+                              "questionable": True},
+                    ))
+                elif not still_bad:
                     rebuilt.append(ParsedSection(
                         text=_normalize(ocr_text),
                         page=sec.page,
                         meta={"ocr": True, "reparse": "garbled"},
                     ))
-                else:
-                    # Both pypdf AND OCR failed — drop the page rather
-                    # than poison the index with garbage.
-                    pass
             else:
                 rebuilt.append(sec)
         sections = rebuilt

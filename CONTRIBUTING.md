@@ -7,13 +7,31 @@ ez-rag is an experimental project. The bar for "fix" is low; the bar for "behavi
 ```bash
 git clone https://github.com/<owner>/ez-rag.git
 cd ez-rag
-python -m pip install --user -e ".[ocr,gui]"
+python -m pip install --user -e ".[ocr,gui,dev]"   # dev = pytest + pytest-timeout
 ez-rag init test-workspace
 # drop a few PDFs into test-workspace/docs/ then:
 cd test-workspace
 ez-rag ingest
 ez-rag chat
 ```
+
+### Running the test suite
+
+```bash
+pytest tests/                    # 27 manual-script tests via subprocess runner
+```
+
+The 27 `test_*.py` files in `tests/` use a custom assertion harness and
+also run directly:
+
+```bash
+python -X utf8 tests/test_round1_core_retrieval.py
+```
+
+`tests/conftest.py` hides them from pytest's direct collection so the
+runner (`tests/test_run_manual_suite.py`) is the single entry point.
+New tests can use either style — name them `test_*.py` for the
+manual harness, or use a different prefix for pytest-native fixtures.
 
 ## What kind of changes are welcome
 
@@ -22,10 +40,12 @@ ez-rag chat
 - **Bug fixes** — open a PR with a one-paragraph "before/after" describing
   what was broken.
 - **Parser additions** for new file types — `parsers.py` is the place. Each
-  parser returns `list[ParsedSection]`. Add a test file under `benchmark/` if
-  you can.
-- **Retrieval improvements** that move a number on `benchmark/bench_configs.py`
-  or `benchmark/rag_compare.py`. Please attach the before/after report.
+  parser returns `list[ParsedSection]`. Add a test under `tests/` (manual
+  script with the existing `check()` harness is fine).
+- **Retrieval improvements** that move a number on `bench/bench_ohio.py`
+  (or one of the other harnesses under [`bench/`](bench/)). Please attach
+  the before/after HTML report — `bench/ohio_html.py` regenerates it
+  automatically.
 - **GUI polish** — Flet 0.84.x, no other UI deps. New widgets need a tooltip.
 
 ## What kind of changes get pushed back

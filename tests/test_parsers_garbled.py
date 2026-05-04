@@ -12,7 +12,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ez_rag.parsers import _collapse_table_runs, _text_looks_garbled
+from ez_rag.parsers import (
+    _collapse_table_runs, _looks_like_toc_fragment, _text_looks_garbled,
+)
 
 
 PASS, FAIL = [], []
@@ -161,6 +163,78 @@ def main():
           _collapse_table_runs("") == "", "")
     check("single line -> unchanged",
           _collapse_table_runs("just one line") == "just one line", "")
+
+    print("\n[14] TOC-fragment OCR results are flagged")
+    # Reproduces the user's screenshot: an OCR'd table-of-contents page
+    # that's still useless even though it's not garbled. Should be
+    # dropped during recovery.
+    sample14 = (
+        "CONTENTS\n"
+        "Preface\n"
+        "Fighter\n"
+        "59\n"
+        "App.A: AcQ INc.\n"
+        "196\n"
+        "Ch.l:Acquisitions Incorporated.\n"
+        "Monk\n"
+        ".61\n"
+        "Omin Dran.\n"
+        "..196\n"
+        "It'sJustBusiness.\n"
+    )
+    check("user-reported TOC OCR fragment flagged",
+          _looks_like_toc_fragment(sample14) is True,
+          f"got False on:\n{sample14}")
+
+    print("\n[15] normal prose is NOT flagged as TOC")
+    sample15 = (
+        "Border collies were bred for herding sheep in the "
+        "Anglo-Scottish border region. They are widely considered "
+        "the most intelligent breed of dog, consistently topping "
+        "canine intelligence rankings. Their stare, called the eye, "
+        "is a key herding tool — they use it to control sheep "
+        "without barking. Border collies require significant mental "
+        "stimulation; without it they may develop neurotic behaviors."
+    )
+    check("normal prose NOT flagged as TOC",
+          _looks_like_toc_fragment(sample15) is False, "")
+
+    print("\n[16] short content is NOT flagged (need at least 6 lines)")
+    sample16 = "Chapter 1\nIntro\nFighter\n59"
+    check("short input NOT flagged",
+          _looks_like_toc_fragment(sample16) is False,
+          f"got True on: {sample16!r}")
+
+    print("\n[17] bullet list with prose is NOT flagged")
+    sample17 = (
+        "Things to remember about border collies:\n"
+        "- They need lots of exercise every day\n"
+        "- Mental stimulation matters more than physical\n"
+        "- They will herd children and cats given the chance\n"
+        "- Their bark is rare but loud\n"
+        "- They form strong bonds with one human\n"
+        "- They were bred from working stock in the borderlands\n"
+    )
+    check("prose-y bullet list NOT flagged",
+          _looks_like_toc_fragment(sample17) is False, "")
+
+    print("\n[18] index-like page with many bare numbers IS flagged")
+    sample18 = (
+        "INDEX\n"
+        "Tyrannosaurus rex\n"
+        "47\n"
+        "Triceratops\n"
+        "82\n"
+        "Stegosaurus\n"
+        "115\n"
+        "Allosaurus\n"
+        "39\n"
+        "Diplodocus\n"
+        "201\n"
+    )
+    check("dinosaur index page flagged",
+          _looks_like_toc_fragment(sample18) is True,
+          f"got False on:\n{sample18}")
 
     print(f"\n=== Garbled-detector summary: {len(PASS)} pass, {len(FAIL)} fail ===")
     if FAIL:

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json as _json
-import shutil
 import sys
 from pathlib import Path
 from typing import Optional
@@ -11,9 +10,6 @@ import typer
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.progress import (
-    BarColumn, Progress, TextColumn, TimeElapsedColumn,
-)
 from rich.table import Table
 
 from .config import Config
@@ -23,7 +19,7 @@ from .generate import (
 )
 from .index import Index
 from .ingest import ingest
-from .retrieve import agentic_retrieve, hybrid_search, smart_retrieve
+from .retrieve import agentic_retrieve, smart_retrieve
 from .workspace import Workspace, find_workspace, require_workspace
 
 
@@ -502,6 +498,140 @@ def help_topic(
     """Show offline manual pages."""
     from . import manual
     manual.show(topic, console=console)
+
+
+@app.command("scan")
+def scan_cmd(
+    target: str = typer.Argument(
+        ...,
+        help="Path to a file OR a workspace directory. "
+             "If a file, scan that one file. "
+             "If a directory, scan every supported document in it.",
+    ),
+    workspace: Optional[str] = typer.Option(
+        None, "--workspace", "-w",
+        help="Workspace root (default: target if it's a directory, "
+             "else the current workspace).",
+    ),
+    no_draft: bool = typer.Option(
+        False, "--no-draft",
+        help="Write the sidecar live (no .draft suffix). "
+             "Otherwise it's saved as <file>.ezrag-meta.toml.draft "
+             "and you rename it after reviewing.",
+    ),
+    prefer_workspace: bool = typer.Option(
+        False, "--prefer-workspace",
+        help="Save sidecars under <workspace>/.ezrag/file_meta/ "
+             "instead of alongside the source.",
+    ),
+    only_missing: bool = typer.Option(
+        False, "--only-missing",
+        help="Skip files that already have a sidecar.",
+    ),
+):
+    """Run the LLM discovery scan to auto-populate metadata sidecars.
+
+    The scan parses each document, samples ~12 chunks, runs an LLM
+    pass for topics + a batched LLM pass for entities, and writes a
+    .draft sidecar. Review the draft and rename it to activate.
+
+    Per-file metadata at retrieval time:
+      - query_prefix / query_suffix / query_negatives merge with the
+        workspace-level ones from your config.toml
+      - scope = "global" → applies to every query
+      - scope = "topic-aware" → applies when the query mentions a
+        detected topic
+      - scope = "file-only" → applies only when this file is top-1
+    """
+    from pathlib import Path
+    from .ingest_meta import find_sidecar
+    from .ingest_scan import scan_and_save
+    from .parsers import supported_extensions, get_parser
+    from .workspace import find_workspace, Workspace
+
+    target_path = Path(target).resolve()
+    if not target_path.exists():
+        console.print(f"[red][!] Target not found: {target_path}")
+        raise typer.Exit(1)
+
+    if target_path.is_dir():
+        ws_root = Path(workspace).resolve() if workspace else target_path
+        # Scan every supported file under target
+        exts = supported_extensions()
+        files = [p for p in target_path.rglob("*")
+                 if p.is_file() and p.suffix.lower() in exts]
+    else:
+        ws = (Path(workspace).resolve() if workspace
+              else (find_workspace(target_path.parent)
+                    or target_path.parent))
+        ws_root = ws.root if isinstance(ws, Workspace) else Path(ws)
+        files = [target_path]
+
+    if not files:
+        console.print("[yellow]No supported files found.")
+        raise typer.Exit(0)
+
+    # Resolve workspace cfg (for the LLM model + URL)
+    if isinstance(ws_root, Path):
+        ws = Workspace(ws_root) if ws_root.exists() else None
+    else:
+        ws = ws_root
+    cfg = ws.load_config() if ws else None
+    if cfg is None:
+        from .config import Config
+        cfg = Config()
+        console.print(
+            "[yellow]No workspace config found — using defaults. "
+            "The scan will still run but will use the default LLM "
+            "model and URL."
+        )
+
+    console.print(
+        f"[bold]Scanning {len(files)} file(s) with "
+        f"[accent]{cfg.llm_model}[/accent] (LLM at {cfg.llm_url})…"
+    )
+
+    scanned = 0
+    skipped = 0
+    failed = 0
+    suffix = "" if no_draft else ".draft"
+
+    for f in files:
+        if only_missing and find_sidecar(f, ws_root) is not None:
+            console.print(f"  [dim]skip (sidecar exists): {f.name}[/dim]")
+            skipped += 1
+            continue
+        if get_parser(f) is None:
+            console.print(f"  [dim]skip (no parser): {f.name}[/dim]")
+            skipped += 1
+            continue
+
+        console.print(f"  scanning: {f.name}")
+        try:
+            out = scan_and_save(
+                f, cfg,
+                workspace_root=ws_root,
+                suffix=suffix,
+                prefer_workspace=prefer_workspace,
+            )
+            scanned += 1
+            console.print(f"    [green]→[/green] {out}")
+        except Exception as ex:
+            failed += 1
+            console.print(
+                f"    [red]× failed:[/red] "
+                f"{type(ex).__name__}: {ex}"
+            )
+
+    console.print(
+        f"\n[bold]Done.[/bold] "
+        f"Scanned: {scanned} · Skipped: {skipped} · Failed: {failed}"
+    )
+    if not no_draft and scanned:
+        console.print(
+            "\n[dim]Sidecars saved as .draft. Review and rename "
+            "(remove the .draft extension) to activate.[/dim]"
+        )
 
 
 def main():  # pragma: no cover

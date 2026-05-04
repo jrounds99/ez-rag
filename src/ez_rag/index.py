@@ -8,7 +8,7 @@ import hashlib
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable
 
 import numpy as np
 
@@ -166,6 +166,49 @@ class Index:
                 ],
             )
             return file_id
+
+    def update_chunk_tokens(self, chunk_id: int, new_tokens: str) -> None:
+        """Update the BM25 `tokens` column for one chunk + refresh
+        FTS5. The base UPDATE doesn't fire the AFTER-INSERT trigger,
+        so we explicitly delete + re-insert the FTS5 row.
+
+        Used by the per-file metadata feature when a sidecar is
+        added after ingest — re-tokenizing existing chunks lets the
+        entity boost light up without a full re-ingest.
+        """
+        with self._write_lock, self.conn:
+            row = self.conn.execute(
+                "SELECT text, tokens FROM chunks WHERE id = ?",
+                (chunk_id,),
+            ).fetchone()
+            if not row:
+                return
+            old_text, old_tokens = row[0], row[1]
+            # Evict the old FTS5 entry.
+            self.conn.execute(
+                "INSERT INTO chunks_fts(chunks_fts, rowid, text, tokens) "
+                "VALUES ('delete', ?, ?, ?)",
+                (chunk_id, old_text, old_tokens),
+            )
+            self.conn.execute(
+                "UPDATE chunks SET tokens = ? WHERE id = ?",
+                (new_tokens, chunk_id),
+            )
+            # Insert the refreshed FTS5 row.
+            self.conn.execute(
+                "INSERT INTO chunks_fts(rowid, text, tokens) "
+                "VALUES (?, ?, ?)",
+                (chunk_id, old_text, new_tokens),
+            )
+
+    def chunks_for_file(self, file_id: int) -> list[tuple[int, str, str]]:
+        """Return [(chunk_id, text, tokens)] for one file. Used by
+        the per-file-metadata re-tokenize path."""
+        return list(self.conn.execute(
+            "SELECT id, text, tokens FROM chunks "
+            "WHERE file_id = ? ORDER BY ord",
+            (file_id,),
+        ).fetchall())
 
     def chapters_for_file(self, file_id: int) -> list[dict]:
         """Return the persisted chapter list for `file_id` (empty list if

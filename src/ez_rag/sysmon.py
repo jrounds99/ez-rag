@@ -18,7 +18,6 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 # psutil is BSD-licensed and runs on Win/Mac/Linux. Imported lazily so

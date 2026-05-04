@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
 from .embed import make_embedder
 from .generate import answer as gen_answer

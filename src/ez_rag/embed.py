@@ -1,7 +1,7 @@
 """Embedding providers. Tries Ollama → fastembed → fail."""
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import httpx
 import numpy as np
@@ -83,20 +83,26 @@ def make_embedder(cfg: Config) -> Embedder:
     Subsequent calls with the same provider/model/URL reuse the same instance,
     so the GUI doesn't pay fastembed init or model-download cost more than once.
     """
+    # Multi-GPU routing: when a routing table is active, the embedder
+    # can be pinned to a different GPU than chat. Resolve via
+    # role="embed". Falls through to cfg.llm_url when no table is set.
+    from .multi_gpu import resolve_url
+    embed_url = resolve_url(cfg, cfg.ollama_embed_model, role="embed")
+
     key = (
         cfg.embedder_provider,
         cfg.embedder_model,
         cfg.ollama_embed_model,
-        cfg.llm_url,
+        embed_url,
     )
     cached = _EMBEDDER_CACHE.get(key)
     if cached is not None:
         return cached
 
     provider = cfg.embedder_provider
-    if provider in ("auto", "ollama") and _ollama_alive(cfg.llm_url):
+    if provider in ("auto", "ollama") and _ollama_alive(embed_url):
         try:
-            emb = OllamaEmbedder(cfg.llm_url, cfg.ollama_embed_model)
+            emb = OllamaEmbedder(embed_url, cfg.ollama_embed_model)
             _EMBEDDER_CACHE[key] = emb
             return emb
         except Exception as e:

@@ -35,6 +35,16 @@ from ez_rag.models import (
 from ez_rag.generate import apply_query_modifiers
 from ez_rag.parsers import supported_extensions
 from ez_rag.retrieve import agentic_retrieve, hybrid_search, smart_retrieve
+from ez_rag.multi_gpu import (
+    GPU_INDEX_AUTO, GpuDaemon, ModelAssignment, RoutingTable,
+    derive_default_table, load_routing_table, save_routing_table,
+    set_active_table,
+)
+from ez_rag.daemon_supervisor import (
+    DaemonSupervisor, HealthEvent, LoadedModel, SpawnError,
+    detect_external, health_check_once, query_loaded_models,
+)
+from ez_rag.gpu_detect import detect_gpus, DetectedGpu
 from ez_rag.workspace import (
     Workspace, find_workspace,
     get_default_rags_dir, set_default_rags_dir, list_managed_rags,
@@ -283,6 +293,16 @@ TIP = {
                       "call per section, so a 200-section book is 200 "
                       "calls (use a small/fast LLM during ingest, e.g. "
                       "qwen2.5:7b, not a reasoning model). Off by default.",
+    "llm_correct_garbled": "Send OCR-recovered or LLM-flagged 'partial' "
+                      "sections back to the LLM for a best-effort cleanup "
+                      "pass before they're indexed. Fixes obvious OCR "
+                      "misreads ('ShAMe' → 'Shame', missing spaces in run-"
+                      "together words). The LLM may reject as "
+                      "UNRECOVERABLE — those sections are dropped instead "
+                      "of poisoning the index. Independent of LLM Inspect; "
+                      "turn both on for the most aggressive recovery. "
+                      "EXPENSIVE — one extra LLM call per questionable "
+                      "section. Off by default.",
 
     # Settings — Retrieval card
     "use_corpus":     "Same as the toggle above the chat — when OFF, retrieval "
@@ -1133,8 +1153,31 @@ def build_chat_view(state: AppState, *, refresh_status,
     download_picker = ft.FilePicker()
     state.page.services.append(download_picker)
 
+    # Follow-mode state for the chat list. When the user is at (or near)
+    # the bottom we auto-scroll new content into view; when they've
+    # scrolled up to read backscroll we leave them alone instead of
+    # yanking them down on every streamed token.
+    chat_follow_state = {"follow": True}
+
+    def _on_chat_scroll(e):
+        # Flet 0.84 ListView OnScrollEvent exposes pixels and max_scroll_extent.
+        # We're "following" when within 80 px of the bottom.
+        try:
+            pixels = float(getattr(e, "pixels", 0) or 0)
+            max_extent = float(getattr(e, "max_scroll_extent", 0) or 0)
+            if max_extent <= 0:
+                chat_follow_state["follow"] = True
+                return
+            chat_follow_state["follow"] = (max_extent - pixels) <= 80
+        except Exception:
+            pass
+
     chat_list = ft.ListView(
-        expand=True, spacing=12, padding=ft.padding.all(20), auto_scroll=True,
+        expand=True, spacing=12, padding=ft.padding.all(20),
+        # auto_scroll=True only fires on new appends, not in-place
+        # updates — we manage scrolling manually via _scroll_to_bottom.
+        auto_scroll=False,
+        on_scroll=_on_chat_scroll,
     )
     input_field = ft.TextField(
         hint_text="Ask anything…   Enter to send · Shift+Enter for newline",
@@ -1271,15 +1314,20 @@ def build_chat_view(state: AppState, *, refresh_status,
                 state.page.run_task(_do)
 
             def open_chapter_in_browser(_=None):
-                """Extract the chapter containing this hit and open it
-                inline in the user's default browser. Browsers (Chrome /
-                Edge / Firefox) show PDFs with built-in toolbar — they
-                can save, print, or copy text from there. Cleaner than
-                a save dialog before the user has seen what they're
-                getting.
+                """Extract a windowed PDF centered on the cited page and
+                open it in the user's default browser. The extract has:
+                  - Page 1: the cited page (cover)
+                  - Page 2: notes explaining the layout
+                  - Pages 3..: ±7 source pages around the cited page
+                Total ~17 pages instead of dumping the whole source.
+
+                Replaces the old chapter-based extract — chapter
+                metadata was unreliable on PDFs without bookmarks
+                (e.g. D&D Basic Rules indexed as one 320-page chapter,
+                so the chapter button used to dump the whole book).
 
                 Cached under ~/.ezrag/chapter_cache/ so re-clicking the
-                same chapter reuses the file. 3-day sweep cleans it up.
+                same page+window reuses the file.
                 """
                 def _bg():
                     if state.ws is None:
@@ -1287,53 +1335,36 @@ def build_chat_view(state: AppState, *, refresh_status,
                         return
                     try:
                         from ez_rag.preview import (
-                            chapter_cache_path_for, extract_pdf_pages,
+                            extract_pdf_window, window_cache_path_for,
                         )
-                        from ez_rag.embed import make_embedder
-                        from ez_rag.index import Index
-                        from ez_rag.chapters import find_chapter
-                        embedder = make_embedder(state.cfg)
-                        idx = Index(state.ws.meta_db_path,
-                                    embed_dim=embedder.dim)
-                        chapters = idx.chapters_for_file(hit.file_id)
-                        if not chapters:
+                        if not hit.page or hit.page <= 0:
                             _toast(state.page,
-                                "No chapter metadata for this file — "
-                                "re-ingest after a recent ez-rag update.")
+                                "This hit has no page number — "
+                                "windowed extract needs a target page.")
                             return
-                        row = idx.conn.execute(
-                            "SELECT ord FROM chunks WHERE id = ?",
-                            (hit.chunk_id,),
-                        ).fetchone()
-                        ord_ = row[0] if row else None
-                        ch = find_chapter(chapters, ord_) if ord_ is not None else None
-                        if ch is None:
-                            _toast(state.page,
-                                "Couldn't locate the chapter for this passage.")
-                            return
-                        sp = ch.get("start_page")
-                        ep = ch.get("end_page")
-                        if not sp or not ep:
-                            _toast(state.page,
-                                "Chapter has no page range (non-PDF source).")
-                            return
-                        title = ch.get("title") or f"pp {sp}-{ep}"
+                        WINDOW = 7
                         abs_pdf = (state.ws.root / hit.path).resolve()
-                        cache_path = chapter_cache_path_for(abs_pdf, sp, ep)
-                        # Reuse the cached extract if it's already there;
-                        # extract fresh otherwise.
+                        if not abs_pdf.is_file():
+                            _toast(state.page,
+                                f"Source PDF not found: {hit.path}")
+                            return
+                        cache_path = window_cache_path_for(
+                            abs_pdf, hit.page, WINDOW,
+                        )
+                        title = (
+                            f"{abs_pdf.stem} — page {hit.page} ±{WINDOW}"
+                        )
                         if not cache_path.exists():
-                            out = extract_pdf_pages(
-                                abs_pdf, sp, ep, cache_path, title=title,
+                            out = extract_pdf_window(
+                                abs_pdf, hit.page, cache_path,
+                                window=WINDOW, title=title,
                             )
                             if out is None:
                                 _toast(state.page,
-                                    "Chapter extract failed. pypdf may "
-                                    "be missing, or the page range "
-                                    "exceeded the document.")
+                                    "Windowed extract failed. pypdf may "
+                                    "be missing, or the page is outside "
+                                    "the document.")
                                 return
-                        # Open in the user's default browser. webbrowser
-                        # accepts file:// URLs cross-platform.
                         import webbrowser
                         url = cache_path.resolve().as_uri()
                         if not webbrowser.open(url):
@@ -1341,12 +1372,12 @@ def build_chat_view(state: AppState, *, refresh_status,
                                 f"Couldn't launch browser. PDF is at: "
                                 f"{cache_path}")
                             return
-                        pages = ep - sp + 1
                         _toast(state.page,
-                            f"Opened '{title}' ({pages} pages) in browser. "
-                            "Use the browser's Save/Print to keep it.")
+                            f"Opened page {hit.page} ±{WINDOW} from "
+                            f"{abs_pdf.name} in your browser.")
                     except Exception as ex:
-                        _toast(state.page, f"Chapter preview failed: {ex}")
+                        _toast(state.page,
+                                f"Windowed extract failed: {ex}")
                 state.page.run_thread(_bg)
 
             # Toolbar — cleaner now that chapter routes through the browser
@@ -1708,18 +1739,34 @@ def build_chat_view(state: AppState, *, refresh_status,
         turn.bubble = outer
         return outer
 
-    def _scroll_to_bottom(duration: int = 120):
+    def _scroll_to_bottom(duration: int = 120, *, force: bool = False):
         """Best-effort jump to the latest message.
 
         Flet's ListView.auto_scroll handles new appends but not full rebuilds
         or in-place updates of existing children, so we trigger explicitly.
+
+        When the user has scrolled up (chat_follow_state["follow"] is False),
+        we skip the scroll so they can read backscroll without being yanked
+        down on every streamed token. `force=True` overrides this — used
+        after submitting a new question, where we always want to land at
+        the bottom.
+
+        From Flet 0.84 worker-thread context, scroll_to alone doesn't
+        always paint without an explicit update on the ListView; we call
+        both for reliability.
         """
+        if not force and not chat_follow_state.get("follow", True):
+            return
         try:
             chat_list.scroll_to(offset=-1, duration=duration)
         except Exception:
             pass
+        try:
+            chat_list.update()
+        except Exception:
+            pass
 
-    def render_chat():
+    def render_chat(*, force_scroll: bool = False):
         """Full re-render. Call when turns are added/removed."""
         chat_list.controls.clear()
         if not state.turns:
@@ -1728,7 +1775,7 @@ def build_chat_view(state: AppState, *, refresh_status,
             for t in state.turns:
                 chat_list.controls.append(_bubble(t))
         state.page.update()
-        _scroll_to_bottom()
+        _scroll_to_bottom(force=force_scroll)
 
     def update_streaming_assistant(turn: ChatTurn):
         """In-place update for the streaming bubble. Avoids full rebuilds."""
@@ -1804,13 +1851,23 @@ def build_chat_view(state: AppState, *, refresh_status,
         state.turns.append(ChatTurn(role="user", text=text))
         assistant = ChatTurn(role="assistant", text="", streaming=True)
         state.turns.append(assistant)
-        render_chat()
+        # Refresh the workflow chip strip so it reflects current cfg
+        # (in case Settings were changed since the chat view was built).
+        render_chat_workflow_chips()
+        # Snap back to follow mode whenever the user sends a new
+        # question — they always want to see their own message + the
+        # incoming reply, even if they had scrolled up reading earlier.
+        chat_follow_state["follow"] = True
+        render_chat(force_scroll=True)
         set_busy(True)
 
         def worker():
             try:
                 # Apply prefix/suffix/negatives if the per-query toggle is on
-                effective_q = apply_query_modifiers(text, state.cfg)
+                effective_q = apply_query_modifiers(
+                    text, state.cfg,
+                    workspace_root=(state.ws.root if state.ws else None),
+                )
 
                 # Honor the "Use RAG" toggle. When OFF we skip embedding +
                 # retrieval entirely, sending the question straight to the LLM.
@@ -1823,8 +1880,24 @@ def build_chat_view(state: AppState, *, refresh_status,
                         # wait for retrieval to complete.
                         assistant.text = f"_{msg}…_"
                         update_streaming_assistant(assistant)
+                        # Best-effort match agent step → chip id.
+                        s = (msg or "").lower()
+                        if "retriev" in s or "search" in s:
+                            chat_set_active_stage("hybrid_search")
+                        elif "rerank" in s:
+                            chat_set_active_stage("rerank")
+                        elif "reflect" in s or "agent" in s:
+                            chat_set_active_stage("query_expand")
+
+                    def retrieval_status(stage_id: str):
+                        # Mirror smart_retrieve's stage events to the
+                        # chat workflow chip strip.
+                        chat_set_active_stage(
+                            None if stage_id == "done" else stage_id
+                        )
 
                     if state.cfg.agentic:
+                        chat_set_active_stage("query_expand")
                         hits = agentic_retrieve(
                             query=effective_q, embedder=embedder, index=idx,
                             cfg=state.cfg, status_cb=agent_status,
@@ -1837,6 +1910,7 @@ def build_chat_view(state: AppState, *, refresh_status,
                         hits = smart_retrieve(
                             query=effective_q, embedder=embedder,
                             index=idx, cfg=state.cfg,
+                            status_cb=retrieval_status,
                         )
                 else:
                     hits = []
@@ -1860,15 +1934,20 @@ def build_chat_view(state: AppState, *, refresh_status,
                         ans = chat_answer(
                             history=history, latest_question=effective_q,
                             hits=hits, cfg=state.cfg, stream=False,
+                            workspace_root=(state.ws.root if state.ws
+                                            else None),
                         )
                         assistant.text = ans.text  # type: ignore
                     update_streaming_assistant(assistant)
                 else:
+                    chat_set_active_stage("generate")
                     state.stop_flag = False
                     last_render = 0.0
                     for kind, piece in chat_answer(
                         history=history, latest_question=effective_q,
                         hits=hits, cfg=state.cfg, stream=True,
+                        workspace_root=(state.ws.root if state.ws
+                                         else None),
                     ):  # type: ignore
                         if state.stop_flag:
                             assistant.text += "\n\n_[stopped]_"
@@ -1883,6 +1962,7 @@ def build_chat_view(state: AppState, *, refresh_status,
                             last_render = now
                     update_streaming_assistant(assistant)
                 assistant.streaming = False
+                chat_clear_pulse()
                 # Final rebuild to splice in citation chips below the answer.
                 render_chat()
             except Exception as ex:
@@ -1913,6 +1993,7 @@ def build_chat_view(state: AppState, *, refresh_status,
                 assistant.streaming = False
                 render_chat()
             finally:
+                chat_clear_pulse()
                 set_busy(False)
                 refresh_status()
 
@@ -2265,11 +2346,213 @@ def build_chat_view(state: AppState, *, refresh_status,
         ),
     )
 
+    # ---------- Query / answer workflow chip strip ----------
+    # Mirror of the ingest pipeline strip — shows which retrieval +
+    # generation stages are active for the current cfg, hovers explain
+    # what each does, and the currently-running stage pulses while a
+    # query is in flight. Driven by status_cb events from smart_retrieve
+    # plus a "generate" stage during streaming.
+    chat_workflow_chips_by_id: dict[str, ft.Container] = {}
+    chat_workflow_state = {"active_stage": None, "pulse_phase": False}
+
+    def _chat_make_chip(stage_id, label, active, *, kind="auto", tooltip=""):
+        if kind == "auto":
+            fg = ACCENT
+            bg = ft.Colors.with_opacity(0.10, ACCENT)
+            border_color = ft.Colors.with_opacity(0.45, ACCENT)
+            icon = ft.Icons.CHECK_CIRCLE
+        elif active:
+            fg = "#FFFFFF"
+            bg = ACCENT
+            border_color = ACCENT
+            icon = ft.Icons.CHECK_CIRCLE
+        else:
+            fg = ON_SURFACE_DIM
+            bg = "transparent"
+            border_color = "#2A2E3F"
+            icon = ft.Icons.RADIO_BUTTON_UNCHECKED
+        chip = ft.Container(
+            content=ft.Row([
+                ft.Icon(icon, size=12, color=fg),
+                ft.Text(label, size=10, color=fg,
+                         weight=ft.FontWeight.W_700),
+            ], spacing=4, tight=True,
+               vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            bgcolor=bg,
+            border=ft.border.all(1, border_color),
+            border_radius=12,
+            padding=ft.padding.symmetric(horizontal=8, vertical=3),
+            tooltip=tooltip,
+            opacity=1.0,
+            animate_opacity=ft.Animation(450, ft.AnimationCurve.EASE_IN_OUT),
+            data={"id": stage_id, "active": active, "kind": kind},
+        )
+        chat_workflow_chips_by_id[stage_id] = chip
+        return chip
+
+    def _chat_arrow():
+        return ft.Icon(ft.Icons.ARROW_FORWARD, size=12, color="#3D4156")
+
+    chat_workflow_row = ft.Row(
+        [], spacing=4, wrap=True,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+    )
+    chat_workflow_label = ft.Text(
+        "QUERY PIPELINE", size=10, color=ON_SURFACE_DIM,
+        weight=ft.FontWeight.W_700,
+    )
+    chat_workflow_legend = ft.Text(
+        "Hover a stage for details. The active stage pulses while answering.",
+        size=10, color=ON_SURFACE_DIM, italic=True,
+    )
+    chat_workflow_card = ft.Container(
+        padding=ft.padding.symmetric(horizontal=10, vertical=8),
+        margin=ft.margin.symmetric(horizontal=20, vertical=4),
+        bgcolor="#13151E",
+        border=ft.border.all(1, "#1E2130"),
+        border_radius=8,
+        content=ft.Column(
+            [chat_workflow_label, chat_workflow_row, chat_workflow_legend],
+            spacing=6, tight=True),
+    )
+
+    CHAT_STAGE_INFO = {
+        "query_expand": (
+            "Optional. When enabled (auto-list mode, HyDE, or multi-query), "
+            "the LLM rewrites or expands your question before search. "
+            "For 'list X / give examples' queries, generates an entity-rich "
+            "hypothetical passage that retrieves stat-blocks and tables "
+            "instead of explanatory prose. Costs one extra LLM call."
+        ),
+        "use_rag": (
+            "Always on while RAG is enabled. Toggle it off in the toolbar "
+            "to ask the LLM directly with no corpus retrieval."
+        ),
+        "hybrid_search": (
+            "Always on. BM25 keyword search + dense vector search run in "
+            "parallel and are fused via Reciprocal Rank Fusion. The single "
+            "biggest quality lift over either method alone."
+        ),
+        "rerank": (
+            "Optional. Cross-encoder model re-scores the top candidates "
+            "with full attention to (query, passage) pairs — catches "
+            "relevance that embedding similarity misses. Highest-ROI "
+            "retrieval improvement per ~50–200 ms latency."
+        ),
+        "diversify": (
+            "Optional. Caps the number of chunks returned from any single "
+            "source file (default 3) so the LLM sees varied evidence "
+            "instead of letting one PDF dominate top-K. Forces grounding "
+            "across multiple sources."
+        ),
+        "expand": (
+            "Optional. After top-K is selected, expand each hit's text — "
+            "either to its full chapter (capped by chapter_max_chars) or "
+            "with ±N neighbor chunks. Bigger context but risks dilution."
+        ),
+        "reorder": (
+            "Optional. Reorders retrieved chunks so the most-relevant ones "
+            "are at the START and END of the prompt — combats the "
+            "well-documented 'lost in the middle' effect where LLMs "
+            "ignore content in the middle of long contexts. Free quality "
+            "lift, no extra calls."
+        ),
+        "generate": (
+            "Always on. The LLM produces the final answer using the "
+            "retrieved chunks as context. For list-style queries the "
+            "system prompt switches to extraction mode to force a clean "
+            "list of named items with citations."
+        ),
+    }
+
+    def render_chat_workflow_chips():
+        chat_workflow_chips_by_id.clear()
+        c = state.cfg or Config()
+
+        def tip(stage_id: str, on: bool, *, always_on: bool = False) -> str:
+            if always_on:
+                head = "ON (always)"
+            else:
+                head = "ON" if on else "OFF"
+            return f"{head} · {CHAT_STAGE_INFO[stage_id]}"
+
+        chips: list[ft.Control] = []
+        # Query expansion (HyDE / multi-query / auto-list)
+        qe_on = (
+            bool(getattr(c, "use_hyde", False))
+            or bool(getattr(c, "multi_query", False))
+            or bool(getattr(c, "auto_list_mode", True))
+        )
+        chips.append(_chat_make_chip(
+            "query_expand", "query expand", qe_on, kind="opt",
+            tooltip=tip("query_expand", qe_on)))
+        chips.append(_chat_arrow())
+        # Hybrid search (always on)
+        chips.append(_chat_make_chip(
+            "hybrid_search", "hybrid search", True, kind="auto",
+            tooltip=tip("hybrid_search", True, always_on=True)))
+        # Rerank (opt)
+        chips.append(_chat_arrow())
+        rr_on = bool(getattr(c, "rerank", True))
+        chips.append(_chat_make_chip(
+            "rerank", "rerank", rr_on, kind="opt",
+            tooltip=tip("rerank", rr_on)))
+        # Diversify (opt)
+        chips.append(_chat_arrow())
+        div_on = int(getattr(c, "diversify_per_source", 3) or 0) > 0
+        chips.append(_chat_make_chip(
+            "diversify", "diversify", div_on, kind="opt",
+            tooltip=tip("diversify", div_on)))
+        # Expand chapter / neighbor (opt)
+        chips.append(_chat_arrow())
+        exp_on = (bool(getattr(c, "expand_to_chapter", False))
+                   or int(getattr(c, "context_window", 0) or 0) > 0)
+        chips.append(_chat_make_chip(
+            "expand", "expand", exp_on, kind="opt",
+            tooltip=tip("expand", exp_on)))
+        # Reorder (opt)
+        chips.append(_chat_arrow())
+        ro_on = bool(getattr(c, "reorder_for_attention", True))
+        chips.append(_chat_make_chip(
+            "reorder", "reorder", ro_on, kind="opt",
+            tooltip=tip("reorder", ro_on)))
+        # Generate (always on)
+        chips.append(_chat_arrow())
+        chips.append(_chat_make_chip(
+            "generate", "generate", True, kind="auto",
+            tooltip=tip("generate", True, always_on=True)))
+        chat_workflow_row.controls = chips
+
+    render_chat_workflow_chips()
+
+    def chat_set_active_stage(stage_id: str | None):
+        """Light up a chip and dim the others. None = clear all pulses."""
+        prev = chat_workflow_state["active_stage"]
+        if prev and prev in chat_workflow_chips_by_id:
+            chat_workflow_chips_by_id[prev].opacity = 1.0
+        chat_workflow_state["active_stage"] = stage_id
+        if stage_id and stage_id in chat_workflow_chips_by_id:
+            chat_workflow_chips_by_id[stage_id].opacity = 0.45
+        try:
+            state.page.update()
+        except Exception:
+            pass
+
+    def chat_clear_pulse():
+        for chip in chat_workflow_chips_by_id.values():
+            chip.opacity = 1.0
+        chat_workflow_state["active_stage"] = None
+        try:
+            state.page.update()
+        except Exception:
+            pass
+
     container = ft.Container(
         bgcolor=BG_DARK,
         expand=True,
         content=ft.Column(
-            [chat_toolbar, ft.Divider(height=1, color="#1E2130"),
+            [chat_toolbar, chat_workflow_card,
+             ft.Divider(height=1, color="#1E2130"),
              chat_list, composer],
             expand=True, spacing=0,
         ),
@@ -2455,6 +2738,187 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
     ingest_progress = ft.ProgressBar(
         value=0, color=ACCENT, bgcolor="#262938", visible=False,
     )
+
+    # Workflow chip strip — visual map of which ingest stages are active
+    # for the current config. Each chip lights up (accent fill) when its
+    # gate is on, dims when off, and pulses when that stage is the
+    # currently-running one. Re-rendered after Settings save and when
+    # ingest starts.
+    #
+    # Each chip is a Container with `data` = {"id": stage_id, "active": bool}
+    # so the watchdog can find it later and toggle opacity for the pulse.
+    workflow_chips_by_id: dict[str, ft.Container] = {}
+
+    def _make_chip(stage_id, label, active, *, kind="auto", tooltip=""):
+        # kind="auto" → always-on stages get a subdued check + ACCENT
+        #               outline so they read as "always runs"
+        # kind="opt"  → user-toggleable stages get full ACCENT fill when
+        #               on, dim outline when off
+        if kind == "auto":
+            fg = ACCENT
+            bg = ft.Colors.with_opacity(0.10, ACCENT)
+            border_color = ft.Colors.with_opacity(0.45, ACCENT)
+            icon = ft.Icons.CHECK_CIRCLE
+        elif active:
+            fg = "#FFFFFF"
+            bg = ACCENT
+            border_color = ACCENT
+            icon = ft.Icons.CHECK_CIRCLE
+        else:
+            fg = ON_SURFACE_DIM
+            bg = "transparent"
+            border_color = "#2A2E3F"
+            icon = ft.Icons.RADIO_BUTTON_UNCHECKED
+        chip = ft.Container(
+            content=ft.Row([
+                ft.Icon(icon, size=12, color=fg),
+                ft.Text(label, size=10, color=fg,
+                         weight=ft.FontWeight.W_700),
+            ], spacing=4, tight=True,
+               vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            bgcolor=bg,
+            border=ft.border.all(1, border_color),
+            border_radius=12,
+            padding=ft.padding.symmetric(horizontal=8, vertical=3),
+            tooltip=tooltip,
+            opacity=1.0,
+            # Smooth fade between pulse states so the blink looks
+            # designed, not janky.
+            animate_opacity=ft.Animation(450, ft.AnimationCurve.EASE_IN_OUT),
+            data={"id": stage_id, "active": active, "kind": kind,
+                  "base_bg": bg, "base_border": border_color},
+        )
+        workflow_chips_by_id[stage_id] = chip
+        return chip
+
+    def _arrow():
+        return ft.Icon(ft.Icons.ARROW_FORWARD, size=12,
+                        color="#3D4156")
+
+    workflow_row = ft.Row(
+        [], spacing=4, wrap=True,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+    )
+    workflow_label = ft.Text(
+        "PIPELINE", size=10, color=ON_SURFACE_DIM,
+        weight=ft.FontWeight.W_700,
+    )
+    workflow_legend = ft.Text(
+        "Hover a stage for details. The active stage pulses while ingest runs.",
+        size=10, color=ON_SURFACE_DIM, italic=True,
+    )
+    workflow_card = ft.Container(
+        padding=ft.padding.symmetric(horizontal=10, vertical=8),
+        bgcolor="#13151E",
+        border=ft.border.all(1, "#1E2130"),
+        border_radius=8,
+        content=ft.Column([workflow_label, workflow_row, workflow_legend],
+                           spacing=6, tight=True),
+    )
+
+    # Tooltips per stage. Two halves: what the stage does + when it runs.
+    # The current on/off state is appended dynamically in render_workflow_chips
+    # so users can hover and see "ON · this stage…" or "OFF · this stage…"
+    STAGE_INFO = {
+        "pypdf": (
+            "Always on. The first pass — pypdf walks the PDF's content "
+            "stream and extracts text via the font's ToUnicode cmap. Fast "
+            "(~10–50 ms/page). Produces perfect output on ~90% of PDFs."
+        ),
+        "garbled": (
+            "Always on. Per-page heuristic detector. Flags pypdf output "
+            "as garbled when replacement-char ratio, backslash-escape "
+            "ratio, low vowel ratio, or symbol-soup ratio breach safe "
+            "thresholds. Triggers OCR fallback for just those pages."
+        ),
+        "ocr": (
+            "Optional. When pypdf returns nothing or the heuristic flags "
+            "a page as garbled, OCR re-extracts that page from a 2× "
+            "rendered image (RapidOCR primary, Tesseract fallback). "
+            "Slow (~500 ms–2 s per page), so only runs on bad pages."
+        ),
+        "llm_inspect": (
+            "Optional. After parsing, sends each section to the LLM "
+            "with a 'is this clean / garbled / partial?' prompt. "
+            "Garbled → drop. Partial → keep + flag for correction. "
+            "EXPENSIVE — one LLM call per section."
+        ),
+        "llm_correct": (
+            "Optional. Sends OCR-recovered, partial-flagged, or "
+            "questionable sections back to the LLM for a best-effort "
+            "cleanup pass. UNRECOVERABLE responses are dropped instead "
+            "of poisoning the index. EXPENSIVE — one extra LLM call "
+            "per questionable section. Also makes upstream parsing "
+            "permissive: TOC fragments and still-garbled OCR are sent "
+            "to the LLM instead of being dropped silently."
+        ),
+        "contextual": (
+            "Optional. Anthropic-style Contextual Retrieval — the LLM "
+            "writes a one-sentence situational prefix for every chunk "
+            "before embedding. Materially better recall on technical "
+            "docs. EXPENSIVE — one LLM call per chunk; a 200-page book "
+            "is hundreds of calls."
+        ),
+        "preview": (
+            "Display-only. When on, the parser saves rendered page "
+            "images and emits before/after/corrected payloads so the "
+            "GUI can show a live recovery card for each fixed page. "
+            "Costs ~50 ms + ~200 KB disk per recovered page."
+        ),
+    }
+
+    def render_workflow_chips():
+        workflow_chips_by_id.clear()
+        c = state.cfg or Config()
+
+        def tip(stage_id: str, on: bool, *, always_on: bool = False) -> str:
+            if always_on:
+                head = "ON (always)"
+            else:
+                head = "ON" if on else "OFF"
+            return f"{head} · {STAGE_INFO[stage_id]}"
+
+        chips: list[ft.Control] = []
+        # Always-on backbone — these stages run on every PDF.
+        chips += [_make_chip("pypdf", "pypdf", True, kind="auto",
+                              tooltip=tip("pypdf", True, always_on=True)),
+                  _arrow()]
+        chips += [_make_chip("garbled", "garbled detector", True,
+                              kind="auto",
+                              tooltip=tip("garbled", True, always_on=True)),
+                  _arrow()]
+        # OCR fallback (toggleable).
+        ocr_on = bool(getattr(c, "enable_ocr", True))
+        chips.append(_make_chip("ocr", "OCR fallback", ocr_on, kind="opt",
+                                 tooltip=tip("ocr", ocr_on)))
+        # LLM inspect (opt-in).
+        chips.append(_arrow())
+        ins_on = bool(getattr(c, "llm_inspect_pages", False))
+        chips.append(_make_chip("llm_inspect", "LLM inspect", ins_on,
+                                 kind="opt",
+                                 tooltip=tip("llm_inspect", ins_on)))
+        # LLM correct (opt-in).
+        chips.append(_arrow())
+        cor_on = bool(getattr(c, "llm_correct_garbled", False))
+        chips.append(_make_chip("llm_correct", "LLM correct", cor_on,
+                                 kind="opt",
+                                 tooltip=tip("llm_correct", cor_on)))
+        # Contextual retrieval (opt-in, costly).
+        chips.append(_arrow())
+        ctx_on = bool(getattr(c, "enable_contextual", False))
+        chips.append(_make_chip("contextual", "Contextual", ctx_on,
+                                 kind="opt",
+                                 tooltip=tip("contextual", ctx_on)))
+        # Live preview (display-only flag, separate cluster).
+        chips.append(ft.Container(width=10))
+        prev_on = bool(getattr(c, "preview_garbled_recoveries", False))
+        chips.append(_make_chip("preview", "Live preview", prev_on,
+                                 kind="opt",
+                                 tooltip=tip("preview", prev_on)))
+        workflow_row.controls = chips
+
+    render_workflow_chips()
+
     ingest_status = ft.Text("", size=12, color=ON_SURFACE_DIM)
     ingest_meta = ft.Text(
         "", size=11, color=ON_SURFACE_DIM, weight=ft.FontWeight.W_500,
@@ -2500,6 +2964,24 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
     ingest_recovery_after = ft.Text(
         "", size=11, color=ON_SURFACE, max_lines=12,
     )
+    # Third panel — populated when LLM correction runs on the page.
+    # Hidden by default; flipped on by the watchdog when a "correction"
+    # recovery event arrives for the currently-displayed page.
+    ingest_recovery_corrected = ft.Text(
+        "", size=11, color=ON_SURFACE, max_lines=12,
+    )
+    ingest_recovery_corrected_label = ft.Text(
+        "After — LLM-corrected text",
+        size=10, color=ACCENT, weight=ft.FontWeight.W_700,
+    )
+    ingest_recovery_corrected_box = ft.Container(
+        content=ingest_recovery_corrected,
+        bgcolor=ft.Colors.with_opacity(0.10, ACCENT),
+        border=ft.border.all(1, ft.Colors.with_opacity(0.3, ACCENT)),
+        border_radius=4, padding=8, expand=True,
+    )
+    ingest_recovery_corrected_label.visible = False
+    ingest_recovery_corrected_box.visible = False
     ingest_recovery_card = ft.Container(
         visible=False,
         padding=ft.padding.symmetric(horizontal=12, vertical=10),
@@ -2529,6 +3011,8 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                         border=ft.border.all(1, ft.Colors.with_opacity(0.3, SUCCESS)),
                         border_radius=4, padding=8, expand=True,
                     ),
+                    ingest_recovery_corrected_label,
+                    ingest_recovery_corrected_box,
                 ], spacing=4, expand=True, tight=True),
             ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.START),
         ], spacing=8, tight=True),
@@ -2745,6 +3229,11 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
         )
 
     def refresh_files():
+        # Re-render the pipeline chips here too — the workspace's config
+        # might have just loaded in (set_workspace_path calls this), so
+        # the chips need to mirror whatever the user actually has saved
+        # rather than the default Config the view was built with.
+        render_workflow_chips()
         file_rows.controls.clear()
         if state.ws is None:
             file_rows.controls.append(ft.Text(
@@ -2787,6 +3276,9 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
             return
         ingest_log.controls.clear()
         reset_ingest_panel_for_run()
+        # Re-render the workflow chips so the user sees the active config
+        # at the top of the run, even if Settings were toggled mid-session.
+        render_workflow_chips()
         ingest_progress.visible = True
         ingest_progress.value = None
         # More descriptive than "Starting…" — tells the user what's
@@ -2808,6 +3300,19 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
             "last_stall_log_t": 0.0,
             "stall_severity": 0,         # 0=ok, 1=slow, 2=stalled
             "current_prog": None,        # latest IngestProgress snapshot
+            "last_recovery": None,       # latest IngestProgress.recovery payload
+            "last_recovery_applied": None,  # what's actually painted on the card
+            # Accumulated panel state per (file, page) — merges OCR and
+            # subsequent LLM-correction events so all three panels can stay
+            # in sync. Maps "<file>::<page>" → dict of {kind, image_path,
+            # before, after, corrected, unrecoverable}.
+            "recovery_pages": {},
+            "current_recovery_key": None,  # which (file, page) is on screen now
+            # Workflow-chip pulse state: id of the chip currently lit
+            # ("pypdf" / "ocr" / "llm_inspect" / etc.) and the boolean
+            # toggled by the watchdog every tick to drive the blink.
+            "active_stage": None,
+            "pulse_phase": False,
             "started_at": time.monotonic(),
             "running": True,
         }
@@ -2901,30 +3406,14 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                 ingest_snippet_card.visible = True
                 ingest_state["last_snippet_t"] = now
 
-            # Garbled-page recovery preview: when the parser fixes a
-            # bad page via OCR, it fires a snapshot with prog.recovery
-            # populated. Show what it looked like before vs after.
+            # Garbled-page recovery preview: just stash the latest payload
+            # in shared state. The async watchdog actually paints the
+            # card — same reason all other dynamic values do, since
+            # page.update() from a worker thread doesn't reliably
+            # trigger a frame on Windows Flutter Desktop.
             rec = getattr(prog, "recovery", None)
             if rec:
-                fname = Path(rec.get("file") or prog.current_path).name
-                ingest_recovery_header.value = (
-                    f"Recovered page {rec.get('page')} of {fname} via OCR"
-                )
-                img_path = rec.get("image_path") or ""
-                if img_path:
-                    ingest_recovery_image.src = img_path
-                    ingest_recovery_image_wrap.visible = True
-                else:
-                    ingest_recovery_image_wrap.visible = False
-                before = (rec.get("before") or "").strip()
-                after = (rec.get("after") or "").strip()
-                ingest_recovery_before.value = (
-                    before[:1200] + ("…" if len(before) > 1200 else "")
-                ) or "(no text — extraction failed entirely)"
-                ingest_recovery_after.value = (
-                    after[:1200] + ("…" if len(after) > 1200 else "")
-                ) or "(OCR also returned nothing — page dropped)"
-                ingest_recovery_card.visible = True
+                ingest_state["last_recovery"] = rec
 
             state.page.update()
 
@@ -2975,6 +3464,138 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                 ingest_meta.value = fmt_meta_line(
                     prog, override_elapsed=live_elapsed, extra=stall_msg,
                 )
+
+                # Pipeline pulse — figure out which stage is currently
+                # running from the status text and pulse that chip's
+                # opacity. Substring-matched (cheap + tolerant of the
+                # status-text variants ingest emits).
+                status_l = (prog.status or "").lower()
+                running = ingest_state.get("running")
+                active_stage = None
+                if running and prog.current_path:
+                    if ("ocr'ing" in status_l
+                            or "recovered garbled page" in status_l
+                            or "via ocr" in status_l):
+                        active_stage = "ocr"
+                    elif "llm-inspecting" in status_l or "llm inspect" in status_l:
+                        active_stage = "llm_inspect"
+                    elif ("llm-correcting" in status_l
+                            or "llm corrected" in status_l
+                            or "llm declined" in status_l
+                            or "llm correction" in status_l):
+                        active_stage = "llm_correct"
+                    elif "contextualizing" in status_l:
+                        active_stage = "contextual"
+                    elif "parsing" in status_l or "parsed" in status_l:
+                        active_stage = "pypdf"
+                    elif "preview" in status_l:
+                        active_stage = "preview"
+
+                # Switch which chip is "active" — un-pulse the previous one.
+                prev_stage = ingest_state.get("active_stage")
+                if active_stage != prev_stage:
+                    if prev_stage and prev_stage in workflow_chips_by_id:
+                        workflow_chips_by_id[prev_stage].opacity = 1.0
+                    ingest_state["active_stage"] = active_stage
+
+                # Toggle pulse phase every tick. Setting opacity drives
+                # the animate_opacity transition we configured on the
+                # chip — a 450ms ease-in-out fade between 0.45 and 1.0.
+                ingest_state["pulse_phase"] = not ingest_state["pulse_phase"]
+                if active_stage and active_stage in workflow_chips_by_id:
+                    chip = workflow_chips_by_id[active_stage]
+                    chip.opacity = 0.45 if ingest_state["pulse_phase"] else 1.0
+
+                # Mirror the latest recovery event onto the card. Only
+                # touch the controls when the payload actually changed,
+                # so we don't repaint identical content every tick.
+                #
+                # Two event kinds share this channel:
+                #   kind="ocr"        — fired during parse, has image+before+after
+                #   kind="correction" — fired after parse when LLM correction
+                #                       runs; has before (=pre-correction text)
+                #                       + after (=cleaned text)
+                # We merge per-page so a correction event for a previously-
+                # OCR'd page just adds the third panel without clobbering
+                # the image and original before/after.
+                rec = ingest_state.get("last_recovery")
+                if rec and rec is not ingest_state.get("last_recovery_applied"):
+                    file_key = rec.get("file") or prog.current_path or ""
+                    page_key = rec.get("page")
+                    key = f"{file_key}::{page_key}"
+                    page_state = ingest_state["recovery_pages"].setdefault(
+                        key, {"file": file_key, "page": page_key}
+                    )
+                    kind = rec.get("kind", "ocr")
+                    if kind == "correction":
+                        page_state["corrected"] = rec.get("after") or ""
+                        page_state["unrecoverable"] = bool(
+                            rec.get("unrecoverable")
+                        )
+                        # If we have no prior OCR record, also keep the
+                        # before-text from the correction event so the
+                        # card has something to show in the "before" slot.
+                        if "before" not in page_state:
+                            page_state["before"] = rec.get("before") or ""
+                            page_state["after"] = rec.get("before") or ""
+                    else:
+                        page_state["image_path"] = rec.get("image_path") or ""
+                        page_state["before"] = rec.get("before") or ""
+                        page_state["after"] = rec.get("after") or ""
+
+                    fname = Path(file_key).name
+                    has_correction = "corrected" in page_state
+                    if has_correction:
+                        ingest_recovery_header.value = (
+                            f"Recovered + corrected page {page_key} of {fname}"
+                        )
+                    else:
+                        ingest_recovery_header.value = (
+                            f"Recovered page {page_key} of {fname} via OCR"
+                        )
+                    img_path = page_state.get("image_path") or ""
+                    if img_path:
+                        ingest_recovery_image.src = img_path
+                        ingest_recovery_image_wrap.visible = True
+                    else:
+                        ingest_recovery_image_wrap.visible = False
+                    before = (page_state.get("before") or "").strip()
+                    after = (page_state.get("after") or "").strip()
+                    ingest_recovery_before.value = (
+                        before[:1200] + ("…" if len(before) > 1200 else "")
+                    ) or "(no text — extraction failed entirely)"
+                    ingest_recovery_after.value = (
+                        after[:1200] + ("…" if len(after) > 1200 else "")
+                    ) or "(OCR also returned nothing — page dropped)"
+
+                    if has_correction:
+                        if page_state.get("unrecoverable"):
+                            ingest_recovery_corrected_label.value = (
+                                "After — LLM declined "
+                                "(UNRECOVERABLE; original kept)"
+                            )
+                            ingest_recovery_corrected.value = (
+                                "(no cleanup applied)"
+                            )
+                        else:
+                            ingest_recovery_corrected_label.value = (
+                                "After — LLM-corrected text"
+                            )
+                            corrected = (page_state.get("corrected")
+                                         or "").strip()
+                            ingest_recovery_corrected.value = (
+                                corrected[:1200]
+                                + ("…" if len(corrected) > 1200 else "")
+                            ) or "(empty)"
+                        ingest_recovery_corrected_label.visible = True
+                        ingest_recovery_corrected_box.visible = True
+                    else:
+                        ingest_recovery_corrected_label.visible = False
+                        ingest_recovery_corrected_box.visible = False
+
+                    ingest_recovery_card.visible = True
+                    ingest_state["current_recovery_key"] = key
+                    ingest_state["last_recovery_applied"] = rec
 
                 # Update the OS window title so the user can see ingest
                 # progress in the taskbar / dock even when ez-rag is
@@ -3057,6 +3678,10 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
             finally:
                 ingest_state["running"] = False
                 ingest_progress.visible = False
+                # Stop the pulse and restore every chip to full opacity.
+                ingest_state["active_stage"] = None
+                for chip in workflow_chips_by_id.values():
+                    chip.opacity = 1.0
                 try:
                     state.page.title = "ez-rag"
                 except Exception:
@@ -3085,6 +3710,7 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                               on_click=lambda _: do_ingest(True),
                               tooltip=TIP["reingest_btn"]),
         ], spacing=10),
+        workflow_card,
         ingest_progress,
         ingest_status,
         ingest_meta,
@@ -3130,6 +3756,115 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
         padding=18,
     )
 
+    # Split between the file list (left) and the status / ingest pane
+    # (right). Stepped through five fixed presets via two arrow buttons
+    # on a center divider. Hardcoded because Flet 0.84 silently ignores
+    # post-construction width / expand mutations on Container — the
+    # bulletproof workaround is to rebuild the row's controls list with
+    # NEW Container instances, which is exactly what apply_split does.
+    SPLIT_PRESETS = [0.20, 0.35, 0.55, 0.70, 0.82]
+    split_state = {"idx": 2}   # default = balanced (0.55)
+
+    def _make_pane(content, flex):
+        return ft.Container(content=content, expand=flex)
+
+    def _split_panes():
+        ratio = SPLIT_PRESETS[split_state["idx"]]
+        left = max(1, int(ratio * 100))
+        right = max(1, 100 - left)
+        return _make_pane(docs_card, left), _make_pane(ingest_card, right)
+
+    docs_pane, ingest_pane = _split_panes()
+
+    def can_grow_left():
+        return split_state["idx"] < len(SPLIT_PRESETS) - 1
+
+    def can_grow_right():
+        return split_state["idx"] > 0
+
+    def step(direction: int):
+        # +1 grows the LEFT pane (files); -1 grows the RIGHT pane (status).
+        new_idx = max(0, min(len(SPLIT_PRESETS) - 1,
+                              split_state["idx"] + direction))
+        if new_idx == split_state["idx"]:
+            return
+        split_state["idx"] = new_idx
+        nonlocal docs_pane, ingest_pane
+        docs_pane, ingest_pane = _split_panes()
+        # Rebuild the row's controls list — NEW Container instances force
+        # Flet to relayout. Mutating expand on existing instances doesn't.
+        split_row.controls = [docs_pane, divider, ingest_pane]
+        update_arrow_state()
+        try:
+            split_row.update()
+        except Exception:
+            state.page.update()
+
+    def update_arrow_state():
+        btn_left.disabled = not can_grow_left()
+        btn_right.disabled = not can_grow_right()
+        btn_left.opacity = 1.0 if can_grow_left() else 0.35
+        btn_right.opacity = 1.0 if can_grow_right() else 0.35
+        ratio_label.value = (
+            f"{int(SPLIT_PRESETS[split_state['idx']]*100)}"
+            f" / {int((1-SPLIT_PRESETS[split_state['idx']])*100)}"
+        )
+
+    btn_left = ft.IconButton(
+        icon=ft.Icons.CHEVRON_LEFT, icon_size=16, icon_color=ON_SURFACE,
+        bgcolor="#1E2130",
+        tooltip="Grow file list (shrink status pane)",
+        on_click=lambda _: step(+1),
+        style=ft.ButtonStyle(shape=ft.CircleBorder(), padding=4),
+    )
+    btn_right = ft.IconButton(
+        icon=ft.Icons.CHEVRON_RIGHT, icon_size=16, icon_color=ON_SURFACE,
+        bgcolor="#1E2130",
+        tooltip="Grow status pane (shrink file list)",
+        on_click=lambda _: step(-1),
+        style=ft.ButtonStyle(shape=ft.CircleBorder(), padding=4),
+    )
+    ratio_label = ft.Text(
+        "", size=9, color=ON_SURFACE_DIM, weight=ft.FontWeight.W_700,
+    )
+
+    divider_rail_top = ft.Container(width=2, expand=True,
+                                     bgcolor="#2A2E3F", border_radius=1)
+    divider_rail_bot = ft.Container(width=2, expand=True,
+                                     bgcolor="#2A2E3F", border_radius=1)
+    divider = ft.Container(
+        width=24,
+        content=ft.Column(
+            [
+                divider_rail_top,
+                ft.Container(
+                    content=ft.Column(
+                        [btn_left, ratio_label, btn_right],
+                        spacing=2, tight=True,
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    bgcolor="#13151E",
+                    border=ft.border.all(1, "#262938"),
+                    border_radius=14,
+                    padding=ft.padding.symmetric(horizontal=2, vertical=4),
+                ),
+                divider_rail_bot,
+            ],
+            spacing=4,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            expand=True,
+        ),
+    )
+
+    split_row = ft.Row(
+        [docs_pane, divider, ingest_pane],
+        spacing=0,
+        vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+        expand=True,
+    )
+
+    update_arrow_state()
+
     container = ft.Container(
         bgcolor=BG_DARK,
         expand=True,
@@ -3139,15 +3874,12 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                 ft.Text("Files", size=18, weight=ft.FontWeight.W_700,
                         color=ON_SURFACE),
                 ft.Container(height=12),
-                ft.Row([
-                    ft.Container(content=docs_card, expand=2),
-                    ft.Container(content=ingest_card, expand=1),
-                ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.STRETCH,
-                expand=True),
+                split_row,
             ],
             expand=True,
         ),
     )
+
     return container, refresh_files
 
 
@@ -3587,6 +4319,26 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         multiline=True, min_lines=1, max_lines=4,
         tooltip=TIP["query_negatives"],
     )
+    use_file_metadata_sw = ft.Switch(
+        label="Per-file metadata (.ezrag-meta.toml sidecars)",
+        value=True,
+        active_color=ACCENT,
+        tooltip=(
+            "When ON, ez-rag reads <filename>.ezrag-meta.toml sidecars "
+            "alongside your source documents (or in <workspace>/.ezrag/"
+            "file_meta/) and applies per-file query_prefix / query_suffix "
+            "/ query_negatives on top of the workspace-level ones above. "
+            "Three scope rules:\n"
+            "  • global → applies to every query\n"
+            "  • topic-aware → applies when the question mentions a "
+            "discovered topic\n"
+            "  • file-only → applies only when this file is top-1\n\n"
+            "Auto-populate sidecars by running:\n"
+            "  python -m ez_rag.cli scan <workspace>\n\n"
+            "Hand-edit the .ezrag-meta.toml.draft files to taste, then "
+            "rename to remove the .draft extension to activate."
+        ),
+    )
     enable_ocr = ft.Switch(label="OCR images / scanned PDFs", value=True,
                            active_color=ACCENT, tooltip=TIP["enable_ocr"])
     contextual = ft.Switch(label="Contextual Retrieval (slower ingest, better recall)",
@@ -3596,6 +4348,11 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         label="LLM inspect pages (very slow — drops garbled text)",
         value=False, active_color=ACCENT,
         tooltip=TIP["llm_inspect_pages"],
+    )
+    llm_correct_garbled_sw = ft.Switch(
+        label="LLM correct questionable sections (slow — repairs OCR/partial text)",
+        value=False, active_color=ACCENT,
+        tooltip=TIP["llm_correct_garbled"],
     )
     preview_recoveries_sw = ft.Switch(
         label="Preview garbled-page recoveries during ingest",
@@ -4211,6 +4968,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         query_prefix_field.value = c.query_prefix
         query_suffix_field.value = c.query_suffix
         query_negatives_field.value = c.query_negatives
+        use_file_metadata_sw.value = getattr(c, "use_file_metadata", True)
         unload_llm_sw.value = c.unload_llm_during_ingest
         embed_batch_field.value = str(c.embed_batch_size)
         num_batch_field.value = str(getattr(c, "num_batch", 1024))
@@ -4219,6 +4977,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         enable_ocr.value = c.enable_ocr
         contextual.value = c.enable_contextual
         llm_inspect_pages_sw.value = getattr(c, "llm_inspect_pages", False)
+        llm_correct_garbled_sw.value = getattr(c, "llm_correct_garbled", False)
         preview_recoveries_sw.value = getattr(c, "preview_garbled_recoveries", False)
         ollama_url.value = c.llm_url
         embed_provider.value = c.embedder_provider
@@ -4236,6 +4995,39 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
             installed, c.ollama_embed_model, embed_only=True,
         )
         ollama_embed_model.value = _norm_tag(c.ollama_embed_model)
+
+        # ---- Multi-GPU / routing-table refresh ----
+        # Reload the routing table for the current workspace, probe
+        # hardware, adopt any leftover managed daemons, and re-render
+        # the Hardware card. set_workspace_path already installed the
+        # raw table; this populates the UI.
+        try:
+            hw_load_from_workspace()
+            hw_rescan_gpus()
+            hw_render()
+            # Phase 5: paint an initial /api/ps snapshot so the user
+            # doesn't see an empty "Live placement" section for the
+            # first 5 s, then start the polling ticker.
+            try:
+                initial_snapshot: dict[int, list] = {}
+                for d in hw_state["table"].daemons:
+                    initial_snapshot[d.gpu_index] = query_loaded_models(
+                        d.url, timeout=2.0,
+                    )
+                hw_render_live_placement(initial_snapshot)
+            except Exception:
+                pass
+            start_live_placement()
+            start_health_watchdog()
+        except Exception as ex:
+            # Hardware card is purely additive — never let a probe
+            # failure block Settings load.
+            try:
+                _toast(state.page,
+                       f"Hardware probe error (continuing): {ex}")
+            except Exception:
+                pass
+
         page.update()
 
     def save(_):
@@ -4282,6 +5074,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
             c.query_prefix = query_prefix_field.value or ""
             c.query_suffix = query_suffix_field.value or ""
             c.query_negatives = query_negatives_field.value or ""
+            c.use_file_metadata = bool(use_file_metadata_sw.value)
             c.unload_llm_during_ingest = bool(unload_llm_sw.value)
             try:
                 c.embed_batch_size = max(1, int(embed_batch_field.value or 16))
@@ -4299,6 +5092,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
             c.enable_ocr = bool(enable_ocr.value)
             c.enable_contextual = bool(contextual.value)
             c.llm_inspect_pages = bool(llm_inspect_pages_sw.value)
+            c.llm_correct_garbled = bool(llm_correct_garbled_sw.value)
             c.preview_garbled_recoveries = bool(preview_recoveries_sw.value)
             c.llm_model = llm_model.value or c.llm_model
             c.llm_url = ollama_url.value
@@ -4357,8 +5151,707 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
 
             _toast(state.page, "Settings saved")
             refresh_status()
+            # NB: don't call render_workflow_chips() here — it's defined
+            # inside build_files_view's closure and isn't visible from
+            # the Settings save handler. The Files-tab and chat-tab
+            # workflow chip strips re-render on workspace open, ingest
+            # start, and chat send, so the user will see updated chips
+            # next time they hit one of those — no need to wire a
+            # cross-view callback for instant refresh.
+            state.page.update()
         except ValueError as ex:
             _toast(state.page, f"Bad value: {ex}")
+
+    # ========================================================================
+    # HARDWARE / GPU ROUTING card (Phases 4 + 5 of multi-GPU plan)
+    # ========================================================================
+    # State held in a closure dict so spawn/stop handlers can mutate it
+    # and the re-render reads from one source of truth.
+    hw_state: dict = {
+        "table": RoutingTable(),
+        "supervisor": DaemonSupervisor(),
+        "detected_gpus": [],            # list[DetectedGpu]
+        "external": None,                # ExternalDetection or None
+    }
+
+    # ----- Containers we'll re-render into -----
+    hw_gpu_list = ft.Column(spacing=4, tight=True)
+    hw_daemon_list = ft.Column(spacing=4, tight=True)
+    hw_assignment_list = ft.Column(spacing=4, tight=True)
+    hw_status_text = ft.Text("", size=11, color=ON_SURFACE_DIM, italic=True)
+
+    hw_spawn_managed_sw = ft.Switch(
+        label="Spawn managed daemons for additional GPUs",
+        value=True,
+        active_color=ACCENT,
+        tooltip=("When ON, ez-rag spawns one ollama serve per GPU you "
+                 "tick, each pinned to that GPU via CUDA_VISIBLE_DEVICES. "
+                 "Per-model GPU pinning requires this. Mutually exclusive "
+                 "with OLLAMA_SCHED_SPREAD mode."),
+    )
+    hw_sched_spread_sw = ft.Switch(
+        label="Use OLLAMA_SCHED_SPREAD across all GPUs (single-daemon mode)",
+        value=False,
+        active_color=ACCENT,
+        tooltip=("When ON, ez-rag sets OLLAMA_SCHED_SPREAD=1 on the "
+                 "single external daemon so it splits model layers "
+                 "across all visible GPUs by free VRAM. No per-model "
+                 "pinning. Mutually exclusive with managed-spawn mode."),
+    )
+
+    def _ws_root_or_none():
+        return state.ws.root if state.ws is not None else None
+
+    def hw_load_from_workspace():
+        """Read the routing table off disk for the current workspace
+        and snapshot it into hw_state['table']."""
+        ws_root = _ws_root_or_none()
+        if ws_root is None:
+            hw_state["table"] = RoutingTable()
+            return
+        try:
+            hw_state["table"] = load_routing_table(ws_root)
+        except Exception:
+            hw_state["table"] = RoutingTable()
+
+    def hw_save_to_workspace():
+        """Persist the in-memory table + activate it for the resolver."""
+        ws_root = _ws_root_or_none()
+        if ws_root is None:
+            return
+        try:
+            save_routing_table(ws_root, hw_state["table"])
+            set_active_table(hw_state["table"])
+        except Exception as ex:
+            _toast(state.page, f"Saving routing table failed: {ex}")
+
+    def hw_rescan_gpus():
+        """Probe hardware + adopt any leftover daemons from a previous
+        run. Updates hw_state in place."""
+        try:
+            hw_state["detected_gpus"] = detect_gpus()
+        except Exception:
+            hw_state["detected_gpus"] = []
+        try:
+            external_url = (state.cfg.llm_url
+                            if state.cfg else "http://127.0.0.1:11434")
+            hw_state["external"] = detect_external(external_url)
+        except Exception:
+            hw_state["external"] = None
+        # Adopt previously-spawned managed daemons (if our PID files
+        # are still pointing at live processes).
+        try:
+            adopted = hw_state["supervisor"].adopt_previous()
+            for d in adopted:
+                hw_state["table"].upsert_daemon(d)
+        except Exception:
+            pass
+        # Make sure the external daemon has a slot in the table at GPU 0
+        # so single-GPU users see at least one daemon listed.
+        ext = hw_state["external"]
+        if ext and ext.reachable:
+            existing = hw_state["table"].daemon_for_gpu(0)
+            if existing is None:
+                # Use the first detected GPU's name if we have it.
+                gpus = hw_state["detected_gpus"]
+                gpu_name = gpus[0].name if gpus else ""
+                vram = gpus[0].vram_total_mb if gpus else 0
+                hw_state["table"].upsert_daemon(GpuDaemon(
+                    gpu_index=0, gpu_name=gpu_name,
+                    vram_total_mb=int(vram or 0),
+                    url=ext.url, pid=None, managed=False,
+                    notes="external daemon (auto-detected)",
+                ))
+        hw_save_to_workspace()
+
+    def _gpu_row_label(gpu: DetectedGpu) -> str:
+        vram_gb = (gpu.vram_total_mb or 0) / 1024.0
+        return (f"GPU {gpu.index} · {gpu.name or gpu.vendor.upper()} · "
+                f"{vram_gb:.0f} GB · {gpu.runtime}")
+
+    def _make_spawn_btn(gpu_index: int, gpu_name: str,
+                         vram_total_mb: int, disabled: bool):
+        def _click(_e=None):
+            def _bg():
+                try:
+                    daemon = hw_state["supervisor"].ensure_running(
+                        gpu_index=gpu_index, gpu_name=gpu_name,
+                        vram_total_mb=vram_total_mb,
+                    )
+                    hw_state["table"].upsert_daemon(daemon)
+                    hw_save_to_workspace()
+                    _toast(state.page,
+                           f"Spawned daemon for GPU {gpu_index} at "
+                           f"{daemon.url}")
+                except SpawnError as ex:
+                    _toast(state.page, f"Spawn failed: {ex}")
+                except Exception as ex:
+                    _toast(state.page, f"Spawn failed: {ex}")
+                hw_render()
+            state.page.run_thread(_bg)
+        return ft.OutlinedButton(
+            "Spawn daemon", icon=ft.Icons.PLAY_CIRCLE_OUTLINE,
+            on_click=_click, disabled=disabled,
+            tooltip=("Start a new ollama serve pinned to this GPU on the "
+                     "next free port. Models pinned to this GPU will route "
+                     "to it.") if not disabled else (
+                "Already running" if disabled else ""
+            ),
+        )
+
+    def _make_stop_btn(gpu_index: int):
+        def _click(_e=None):
+            def _bg():
+                try:
+                    hw_state["supervisor"].shutdown(gpu_index)
+                    hw_state["table"].remove_daemon(gpu_index)
+                    hw_save_to_workspace()
+                    _toast(state.page,
+                           f"Stopped daemon for GPU {gpu_index}")
+                except Exception as ex:
+                    _toast(state.page, f"Stop failed: {ex}")
+                hw_render()
+            state.page.run_thread(_bg)
+        return ft.IconButton(
+            icon=ft.Icons.STOP_CIRCLE_OUTLINED, icon_color=DANGER,
+            on_click=_click,
+            tooltip="Stop this managed daemon",
+        )
+
+    def hw_render():
+        """Re-render the Hardware card from hw_state."""
+        # ----- Detected GPUs -----
+        hw_gpu_list.controls.clear()
+        gpus = hw_state["detected_gpus"]
+        if not gpus:
+            hw_gpu_list.controls.append(ft.Text(
+                "No compatible GPU detected — ez-rag will run in "
+                "CPU mode.",
+                size=12, color=ON_SURFACE_DIM, italic=True,
+            ))
+        for g in gpus:
+            daemon_for_g = hw_state["table"].daemon_for_gpu(g.index)
+            has_daemon = daemon_for_g is not None
+            spawn_disabled = (
+                has_daemon
+                or not bool(hw_spawn_managed_sw.value)
+                or g.index == 0   # GPU 0 is the external daemon's slot
+            )
+            spawn_btn = _make_spawn_btn(
+                g.index, g.name or "", int(g.vram_total_mb or 0),
+                spawn_disabled,
+            )
+            indicator = ft.Container(
+                width=8, height=8, border_radius=999,
+                bgcolor=(SUCCESS if g.is_compatible else DANGER),
+                margin=ft.margin.only(right=8, top=6),
+            )
+            row = ft.Row(
+                [
+                    indicator,
+                    ft.Text(_gpu_row_label(g), size=12,
+                             color=ON_SURFACE,
+                             expand=True),
+                    spawn_btn,
+                ],
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=4,
+            )
+            hw_gpu_list.controls.append(row)
+
+        # ----- Daemons -----
+        hw_daemon_list.controls.clear()
+        if not hw_state["table"].daemons:
+            hw_daemon_list.controls.append(ft.Text(
+                "No daemons registered yet. Click 'Re-scan' to detect "
+                "your existing ollama serve, or 'Spawn daemon' for a "
+                "GPU above.",
+                size=12, color=ON_SURFACE_DIM, italic=True,
+            ))
+        for d in sorted(hw_state["table"].daemons,
+                         key=lambda x: x.gpu_index):
+            tag = "managed" if d.managed else "external"
+            tag_color = ACCENT if d.managed else SUCCESS
+            line_left = ft.Row([
+                ft.Container(
+                    content=ft.Text(tag, size=10,
+                                     color="#FFFFFF",
+                                     weight=ft.FontWeight.W_700),
+                    bgcolor=tag_color,
+                    padding=ft.padding.symmetric(horizontal=6, vertical=2),
+                    border_radius=999,
+                ),
+                ft.Text(
+                    f"GPU {d.gpu_index}: {d.gpu_name or '?'} · "
+                    f"{d.url}"
+                    + (f" · pid {d.pid}" if d.pid else ""),
+                    size=12, color=ON_SURFACE,
+                ),
+            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            row_controls: list[ft.Control] = [
+                ft.Container(content=line_left, expand=True),
+            ]
+            if d.managed:
+                row_controls.append(_make_stop_btn(d.gpu_index))
+            hw_daemon_list.controls.append(ft.Row(
+                row_controls,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=4,
+            ))
+
+        # ----- Per-model assignment table (Phase 5) -----
+        hw_render_assignments()
+
+        # ----- Toggle states from table -----
+        hw_spawn_managed_sw.value = bool(
+            hw_state["table"].spawn_managed_daemons
+        )
+        hw_sched_spread_sw.value = bool(
+            hw_state["table"].use_sched_spread
+        )
+
+        # ----- Status line -----
+        ext = hw_state["external"]
+        if ext is None or not ext.reachable:
+            hw_status_text.value = (
+                "External Ollama: NOT detected. ez-rag will fall back "
+                "to localhost:11434 by default."
+            )
+        else:
+            hw_status_text.value = (
+                f"External Ollama: {ext.url} (version {ext.version})"
+            )
+
+        try:
+            state.page.update()
+        except Exception:
+            pass
+
+    # ----- Per-model assignment table -----
+
+    def hw_render_assignments():
+        """Render the per-model GPU assignment rows (Phase 5)."""
+        hw_assignment_list.controls.clear()
+        gpus = hw_state["detected_gpus"]
+        if not gpus or len(gpus) < 2:
+            hw_assignment_list.controls.append(ft.Text(
+                "Per-model GPU assignment becomes useful with 2+ GPUs. "
+                "Until then, every model uses the default GPU.",
+                size=12, color=ON_SURFACE_DIM, italic=True,
+            ))
+            return
+
+        # Build the dropdown options (one entry per registered daemon
+        # plus the auto sentinel and the default-GPU option).
+        gpu_options: list[ft.dropdown.Option] = [
+            ft.dropdown.Option(
+                key=str(GPU_INDEX_AUTO), text="auto (pick at runtime)",
+            ),
+        ]
+        for g in gpus:
+            label = (f"GPU {g.index} · "
+                     f"{g.name or g.vendor.upper()} · "
+                     f"{(g.vram_total_mb or 0) / 1024:.0f} GB")
+            gpu_options.append(ft.dropdown.Option(
+                key=str(g.index), text=label,
+            ))
+
+        # Header row
+        hw_assignment_list.controls.append(ft.Row([
+            ft.Text("MODEL", size=10, color=ON_SURFACE_DIM,
+                    weight=ft.FontWeight.W_700, expand=2),
+            ft.Text("ROLE", size=10, color=ON_SURFACE_DIM,
+                    weight=ft.FontWeight.W_700, width=80),
+            ft.Text("GPU", size=10, color=ON_SURFACE_DIM,
+                    weight=ft.FontWeight.W_700, expand=2),
+            ft.Container(width=40),    # for the remove button
+        ], spacing=8))
+
+        # Each existing assignment
+        for a in list(hw_state["table"].assignments):
+            def _on_change(model_tag, role):
+                def handler(e):
+                    try:
+                        new_idx = int(e.control.value)
+                    except (TypeError, ValueError):
+                        return
+                    hw_state["table"].upsert_assignment(
+                        model_tag, new_idx, role=role,
+                    )
+                    hw_save_to_workspace()
+                return handler
+
+            def _on_remove(model_tag, role):
+                def handler(_e=None):
+                    hw_state["table"].remove_assignment(
+                        model_tag, role=role,
+                    )
+                    hw_save_to_workspace()
+                    hw_render()
+                return handler
+
+            dd = ft.Dropdown(
+                value=str(a.gpu_index),
+                options=gpu_options,
+                expand=2, dense=True,
+                on_change=_on_change(a.model_tag, a.role),
+            )
+            hw_assignment_list.controls.append(ft.Row([
+                ft.Text(a.model_tag, size=12, color=ON_SURFACE,
+                         expand=2,
+                         font_family="monospace"),
+                ft.Text(a.role, size=11, color=ON_SURFACE_DIM, width=80),
+                dd,
+                ft.IconButton(
+                    icon=ft.Icons.CLOSE, icon_size=14,
+                    icon_color=DANGER,
+                    tooltip="Remove this assignment",
+                    on_click=_on_remove(a.model_tag, a.role),
+                ),
+            ], spacing=8,
+              vertical_alignment=ft.CrossAxisAlignment.CENTER))
+
+        # "Add" row — model field + role dropdown + GPU dropdown + + button
+        new_model_field = ft.TextField(
+            hint_text="model tag (e.g. qwen2.5:14b)",
+            dense=True, expand=2, text_size=12,
+        )
+        new_role_dd = ft.Dropdown(
+            value="any",
+            options=[
+                ft.dropdown.Option("any"),
+                ft.dropdown.Option("chat"),
+                ft.dropdown.Option("embed"),
+            ],
+            width=80, dense=True,
+        )
+        new_gpu_dd = ft.Dropdown(
+            value=str(GPU_INDEX_AUTO),
+            options=gpu_options,
+            expand=2, dense=True,
+        )
+        def _on_add(_e=None):
+            tag = (new_model_field.value or "").strip()
+            if not tag:
+                _toast(state.page, "Enter a model tag")
+                return
+            try:
+                gpu_idx = int(new_gpu_dd.value)
+            except (TypeError, ValueError):
+                gpu_idx = GPU_INDEX_AUTO
+            hw_state["table"].upsert_assignment(
+                tag, gpu_idx, role=new_role_dd.value or "any",
+            )
+            hw_save_to_workspace()
+            hw_render()
+        hw_assignment_list.controls.append(ft.Row([
+            new_model_field, new_role_dd, new_gpu_dd,
+            ft.IconButton(
+                icon=ft.Icons.ADD, icon_color=ACCENT,
+                tooltip="Add assignment",
+                on_click=_on_add,
+            ),
+        ], spacing=8,
+          vertical_alignment=ft.CrossAxisAlignment.CENTER))
+
+    # ----- Wire toggle handlers -----
+    def _on_spawn_managed_change(_e=None):
+        # Mutually exclusive with sched-spread
+        if hw_spawn_managed_sw.value and hw_sched_spread_sw.value:
+            hw_sched_spread_sw.value = False
+        hw_state["table"].spawn_managed_daemons = bool(
+            hw_spawn_managed_sw.value
+        )
+        hw_state["table"].use_sched_spread = bool(
+            hw_sched_spread_sw.value
+        )
+        hw_save_to_workspace()
+        hw_render()
+
+    def _on_sched_spread_change(_e=None):
+        if hw_sched_spread_sw.value and hw_spawn_managed_sw.value:
+            hw_spawn_managed_sw.value = False
+        hw_state["table"].spawn_managed_daemons = bool(
+            hw_spawn_managed_sw.value
+        )
+        hw_state["table"].use_sched_spread = bool(
+            hw_sched_spread_sw.value
+        )
+        hw_save_to_workspace()
+        hw_render()
+
+    hw_spawn_managed_sw.on_change = _on_spawn_managed_change
+    hw_sched_spread_sw.on_change = _on_sched_spread_change
+
+    rescan_btn = ft.OutlinedButton(
+        "Re-scan hardware", icon=ft.Icons.REFRESH,
+        on_click=lambda _e=None: (hw_rescan_gpus(), hw_render()),
+        tooltip=("Probe nvidia-smi / rocm-smi / xpu-smi again, look "
+                 "for an external ollama daemon, and adopt any managed "
+                 "daemons left over from a previous ez-rag run."),
+    )
+
+    # ----- Live placement panel (Phase 5) -----
+    # Polls /api/ps on each registered daemon every ~5 s while
+    # Settings is visible. Tells the user which models are currently
+    # resident on which GPU, with VRAM use + expiry.
+    hw_live_placement = ft.Column(spacing=4, tight=True)
+    hw_live_placement_status = ft.Text(
+        "", size=11, color=ON_SURFACE_DIM, italic=True,
+    )
+    hw_live_state: dict = {
+        "polling": False,    # set True while the ticker is running
+        "last_update": 0.0,
+    }
+
+    def _fmt_bytes(n: int) -> str:
+        if not n:
+            return "0 B"
+        for unit, thresh in (("GB", 1 << 30), ("MB", 1 << 20),
+                             ("KB", 1 << 10)):
+            if n >= thresh:
+                return f"{n / thresh:.1f} {unit}"
+        return f"{n} B"
+
+    def _fmt_expires(iso_ts: str) -> str:
+        """Return a human-readable 'expires in Xm' from an ISO ts.
+        Empty string = no keep-alive timer."""
+        if not iso_ts:
+            return ""
+        from datetime import datetime, timezone
+        try:
+            # Ollama may emit either a timezone-aware or naive UTC string.
+            ts = iso_ts.replace("Z", "+00:00")
+            t = datetime.fromisoformat(ts)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            secs = int((t - now).total_seconds())
+            if secs <= 0:
+                return "expiring"
+            if secs < 60:
+                return f"{secs}s left"
+            if secs < 3600:
+                return f"{secs // 60}m left"
+            return f"{secs // 3600}h{(secs % 3600) // 60:02d}m left"
+        except Exception:
+            return ""
+
+    def hw_render_live_placement(snapshot: dict[int, list]):
+        """Re-render the live placement column from a snapshot:
+            { gpu_index: [LoadedModel, …], … }
+        """
+        hw_live_placement.controls.clear()
+        if not hw_state["table"].daemons:
+            hw_live_placement.controls.append(ft.Text(
+                "(no daemons registered yet — re-scan to detect)",
+                size=12, color=ON_SURFACE_DIM, italic=True,
+            ))
+            return
+
+        any_loaded = False
+        for d in sorted(hw_state["table"].daemons,
+                         key=lambda x: x.gpu_index):
+            models = snapshot.get(d.gpu_index, [])
+            header = ft.Row([
+                ft.Icon(ft.Icons.MEMORY, size=14, color=ACCENT),
+                ft.Text(
+                    f"GPU {d.gpu_index} · {d.gpu_name or '?'} · {d.url}",
+                    size=12, color=ON_SURFACE,
+                    weight=ft.FontWeight.W_700,
+                ),
+                ft.Container(expand=True),
+                ft.Text(
+                    f"{len(models)} model(s) loaded" if models
+                    else "idle",
+                    size=11,
+                    color=(SUCCESS if models else ON_SURFACE_DIM),
+                ),
+            ], spacing=6,
+              vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            hw_live_placement.controls.append(header)
+
+            if not models:
+                hw_live_placement.controls.append(ft.Container(
+                    margin=ft.margin.only(left=20),
+                    content=ft.Text(
+                        "no models resident on this daemon",
+                        size=11, color=ON_SURFACE_DIM, italic=True,
+                    ),
+                ))
+                continue
+
+            any_loaded = True
+            for m in models:
+                vram_pct = (
+                    (m.size_vram_bytes / m.size_bytes * 100)
+                    if m.size_bytes else 0
+                )
+                where = "GPU" if m.size_vram_bytes > 0 else "CPU"
+                expires = _fmt_expires(m.expires_at)
+                line = ft.Row([
+                    ft.Container(width=12),   # indent
+                    ft.Text(
+                        m.name, size=12, color=ON_SURFACE,
+                        font_family="monospace", expand=2,
+                    ),
+                    ft.Container(
+                        content=ft.Text(where, size=10,
+                                         color="#FFFFFF",
+                                         weight=ft.FontWeight.W_700),
+                        bgcolor=(SUCCESS if where == "GPU" else WARNING),
+                        padding=ft.padding.symmetric(
+                            horizontal=6, vertical=1,
+                        ),
+                        border_radius=999,
+                    ),
+                    ft.Text(
+                        f"{_fmt_bytes(m.size_vram_bytes)} VRAM"
+                        + (f" / {_fmt_bytes(m.size_bytes)}"
+                           if m.size_bytes != m.size_vram_bytes else "")
+                        + (f"  ({vram_pct:.0f}% on GPU)"
+                           if 0 < vram_pct < 100 else ""),
+                        size=11, color=ON_SURFACE_DIM,
+                    ),
+                    ft.Container(expand=True),
+                    ft.Text(expires, size=11, color=ON_SURFACE_DIM),
+                ], spacing=8,
+                  vertical_alignment=ft.CrossAxisAlignment.CENTER)
+                hw_live_placement.controls.append(line)
+
+        if not any_loaded:
+            hw_live_placement_status.value = (
+                "Updated just now · no models currently loaded "
+                "(daemons load on first request)"
+            )
+        else:
+            hw_live_placement_status.value = (
+                f"Updated just now · refreshing every 5s"
+            )
+        try:
+            state.page.update()
+        except Exception:
+            pass
+
+    async def hw_live_placement_ticker():
+        """Async polling loop. Owned by the supervisor for the
+        lifetime of this Settings view. Stops when hw_live_state
+        ['polling'] flips False (e.g. workspace switch)."""
+        import asyncio
+        while hw_live_state.get("polling", False):
+            try:
+                snapshot: dict[int, list] = {}
+                for d in hw_state["table"].daemons:
+                    snapshot[d.gpu_index] = query_loaded_models(
+                        d.url, timeout=2.0,
+                    )
+                hw_render_live_placement(snapshot)
+                hw_live_state["last_update"] = time.monotonic()
+            except Exception:
+                # never let a polling glitch kill the ticker
+                pass
+            await asyncio.sleep(5.0)
+
+    def start_live_placement():
+        if hw_live_state.get("polling"):
+            return
+        hw_live_state["polling"] = True
+        try:
+            state.page.run_task(hw_live_placement_ticker)
+        except Exception:
+            hw_live_state["polling"] = False
+
+    def stop_live_placement():
+        hw_live_state["polling"] = False
+
+    # ----- Health-check watchdog (Phase 7) -----
+    # Sweeps every registered daemon every HEALTH_CHECK_INTERVAL_S
+    # seconds. When a daemon stops responding consecutively, removes
+    # it from the routing table + demotes its assignments to AUTO so
+    # the picker reroutes. Restores them when the daemon recovers.
+    hw_health_state: dict = {
+        "running": False,
+        "fail_counts": {},          # gpu_index -> consecutive misses
+        "stranded": {},             # (model_tag, role) -> original_gpu
+    }
+
+    async def hw_health_ticker():
+        import asyncio
+        while hw_health_state.get("running", False):
+            try:
+                events = health_check_once(
+                    hw_state["table"],
+                    fail_counts=hw_health_state["fail_counts"],
+                    stranded_backup=hw_health_state["stranded"],
+                )
+                if events:
+                    # Persist mutated table + repaint UI.
+                    hw_save_to_workspace()
+                    hw_render()
+                    for ev in events:
+                        if ev.kind == "down":
+                            _toast(state.page,
+                                   f"⚠ Daemon for GPU {ev.gpu_index} "
+                                   f"stopped responding — "
+                                   f"assignments demoted to auto.")
+                        elif ev.kind == "back":
+                            _toast(state.page,
+                                   f"✓ Daemon recovered: "
+                                   f"GPU {ev.gpu_index}")
+            except Exception:
+                # Watchdog never crashes the GUI on a probe glitch.
+                pass
+            await asyncio.sleep(8.0)
+
+    def start_health_watchdog():
+        if hw_health_state.get("running"):
+            return
+        hw_health_state["running"] = True
+        try:
+            state.page.run_task(hw_health_ticker)
+        except Exception:
+            hw_health_state["running"] = False
+
+    def stop_health_watchdog():
+        hw_health_state["running"] = False
+
+    hardware_card = section_card(
+        "HARDWARE / GPU ROUTING",
+        ft.Row([
+            ft.Text("Detected GPUs", size=12,
+                    weight=ft.FontWeight.W_700,
+                    color=ON_SURFACE),
+            ft.Container(expand=True),
+            rescan_btn,
+        ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        hw_gpu_list,
+        ft.Divider(height=1, color="#262938"),
+        ft.Text("Daemons", size=12,
+                weight=ft.FontWeight.W_700,
+                color=ON_SURFACE),
+        hw_daemon_list,
+        hw_status_text,
+        ft.Divider(height=1, color="#262938"),
+        ft.Text("Per-model GPU assignment", size=12,
+                weight=ft.FontWeight.W_700,
+                color=ON_SURFACE),
+        hw_assignment_list,
+        ft.Divider(height=1, color="#262938"),
+        ft.Row([
+            ft.Text("Live placement", size=12,
+                    weight=ft.FontWeight.W_700,
+                    color=ON_SURFACE),
+            ft.Container(expand=True),
+            hw_live_placement_status,
+        ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        hw_live_placement,
+        ft.Divider(height=1, color="#262938"),
+        hw_spawn_managed_sw,
+        hw_sched_spread_sw,
+    )
+
+    # Initial population — done lazily on the first Settings open via
+    # load_settings (defined below). hw_render() is called from there.
 
     body = ft.ListView(
         spacing=14,
@@ -4367,6 +5860,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         controls=[
             ft.Text("Settings", size=18, weight=ft.FontWeight.W_700,
                     color=ON_SURFACE),
+            hardware_card,
             ft.Row(
                 [
                     ft.Container(
@@ -4377,6 +5871,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                             enable_ocr,
                             contextual,
                             llm_inspect_pages_sw,
+                            llm_correct_garbled_sw,
                             preview_recoveries_sw,
                         ),
                     ),
@@ -4449,6 +5944,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                         expand=1,
                         content=section_card(
                             "QUERY MODIFIERS (toggle in chat composer)",
+                            use_file_metadata_sw,
                             query_prefix_field,
                             query_suffix_field,
                             query_negatives_field,
@@ -5587,6 +7083,16 @@ def app(page: ft.Page):
         state.cfg = ws.load_config()
         add_recent(ws.root)
         clear_embedder_cache()
+        # Multi-GPU routing: load this workspace's routing table and
+        # install it as the active table so every Ollama call routes
+        # through it. If the file doesn't exist yet (single-GPU users
+        # / fresh workspace) the table is empty and resolve_url falls
+        # back to cfg.llm_url — preserving today's behavior.
+        try:
+            table = load_routing_table(ws.root)
+            set_active_table(table)
+        except Exception:
+            set_active_table(None)
         if "fn" in refresh_files_cb:
             refresh_files_cb["fn"]()
         if "fn" in load_settings_cb:

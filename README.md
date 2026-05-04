@@ -1,7 +1,7 @@
 # ez-rag
 
 > **🧪 Status: experimental / alpha.** Working end-to-end on Windows / macOS / Linux,
-> verified by [a benchmark suite](benchmark/) that runs every release. APIs,
+> verified by [a quality + throughput bench suite](bench/) that runs every release. APIs,
 > file layouts, and config keys may change without notice. See
 > [docs/STATUS.md](docs/STATUS.md) for what's solid vs. what's flaky.
 
@@ -155,32 +155,56 @@ Defaults are tuned for "drop docs, get good answers." See `ez-rag help retrieval
 
 See [docs/EXAMPLES.md](docs/EXAMPLES.md).
 
-## Benchmark
+## How ingest reads PDFs
 
-Two harnesses, both reproducible:
+Walkthrough of every step the parser takes — from "pypdf got perfect text"
+to "the page is garbled, OCR it, validate the OCR, optionally let the LLM
+clean it up" — and the reasoning for each choice.
+
+See [docs/PDF_PIPELINE.md](docs/PDF_PIPELINE.md). A printable
+[PDF version](docs/PDF_PIPELINE.pdf) is checked in alongside it.
+
+## Benchmarks
+
+A reproducible bench suite lives under [`bench/`](bench/), with cross-platform
+power sampling and an LLM-as-judge scorer. Two flavors:
 
 ```bash
-python benchmark/run_benchmark.py            # public-document corpus, RAG end-to-end
-python benchmark/rag_compare.py              # RAG-on / RAG-off comparison across models
-python benchmark/bench_configs.py            # measure each retrieval option on/off
+# 1) System bench — probe hardware, measure throughput across configs
+python -m bench.cli probe                    # hardware fingerprint
+python -m bench.cli quick                    # fast smoke benchmark
+python -m bench.cli full                     # full sweep + diagnostic bundle
+
+# 2) Quality bench — multi-model × multi-embedder × judged answers
+python sample_data/fetch.py                  # ~76 MB public-domain corpus
+python -X utf8 bench/bench_ohio.py           # 23 models × 3 embedders × 20 Qs
 ```
 
-Reports land in `benchmark/reports/`.
+The Ohio quality bench produces an interactive HTML report with a
+recommendation card, model × question heatmap, gold-truth vs rubric
+disagreement check, latency percentiles, tokens/sec, and per-family
+rollups. See a showcase report at
+[`bench/reports/ohio-20260503-211733/report.html`](bench/reports/ohio-20260503-211733/report.html)
+and full docs at [`docs/BENCH.md`](docs/BENCH.md).
 
 ## Architecture
 
-See [PLAN.md](PLAN.md) for the module map. Short version:
+See [PLAN.md](PLAN.md) for the full module map. Short version:
 
 - `parsers.py` — PDF / DOCX / XLSX / HTML / MD / EPUB / images
 - `ocr.py` — RapidOCR primary, Tesseract fallback
-- `chunker.py` — recursive split with token-target + overlap
 - `embed.py` — Ollama embed if reachable, else fastembed; cross-encoder reranker
 - `index.py` — SQLite + FTS5 + numpy cosine
 - `retrieve.py` — hybrid BM25 + dense, RRF, optional rerank / MMR / HyDE / multi-query / neighbor expansion
 - `generate.py` — Ollama → llama-cpp → retrieval-only; reasoning-model `thinking` field surfaced separately
+- `ingest_meta.py` / `ingest_scan.py` — per-file `.ezrag-meta.toml` sidecars + LLM auto-discovery
+- `multi_gpu.py` / `daemon_supervisor.py` — per-model GPU pinning across multiple Ollama daemons
+- `gpu_detect.py` / `gpu_catalog.py` / `gpu_recommend.py` — hardware probe + tier-based model picks
 - `models.py` — Ollama listing/pull, library scraper, VRAM estimator
+- `export.py` — workspace → portable chatbot bundle (`.zip`)
 - `server.py` — OpenAI-compatible `/v1/chat/completions`
 - `gui/ez_rag_gui/main.py` — Flet desktop app
+- `bench/` — quality + throughput benchmarks (see [`docs/BENCH.md`](docs/BENCH.md))
 
 ## Project status, in plain English
 

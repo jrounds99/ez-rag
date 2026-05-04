@@ -92,25 +92,57 @@ on real documents and real models on a real RTX 5090, but expect rough edges.
 
 - **Watch mode that uses filesystem events** — current `--watch` polls
   `docs/` every ~2 s.
-- **Workspace import/export** — copy your index between machines.
 - **Conversation persistence** — chats live only in memory.
-- **Multi-workspace switching in the running GUI** — works but each session
-  is a single workspace.
 - **Native installers** — no `.msi` / `.dmg` / `.AppImage` yet. Use pipx.
 - **Code signing** — explicitly out of scope; documented unsigned-binary UX
   in [docs/INSTALL.md](INSTALL.md).
-- **GraphRAG / Self-RAG / agentic retrieval** — possible future work, not
-  on the immediate roadmap.
+- **GraphRAG / Self-RAG** — possible future work, not on the immediate
+  roadmap. (Agentic retrieval is shipped — opt-in via `agentic` config.)
+- **Self-tuning ingestion** — Part B of `PLAN_INGEST_INTELLIGENCE.md`
+  (auto-pick chunk size + chunker per file type) is not yet built. Per-file
+  metadata sidecars (Part A) are shipped.
+
+## ✅ Recently shipped (was on this list, now isn't)
+
+- **Multi-workspace switching in the running GUI** — Manage RAGs overlay.
+- **Workspace import/export** — `ez-rag export` (portable chatbot bundle
+  with vendored `ezrag_lib/`) and `ez-rag import`.
+- **Multi-GPU routing** — per-model GPU pinning across multiple Ollama
+  daemons with auto-placement and free-VRAM picker. See
+  [`docs/HARDWARE.md`](HARDWARE.md).
+- **Per-file metadata sidecars** — `<file>.ezrag-meta.toml` with
+  prefix/suffix/negatives + scope rules. LLM auto-discovery via
+  `ez-rag scan`.
+- **Themes**, **citation page-image preview**, **suggested questions**,
+  **error recovery actions**, **chapter-aware retrieval**, **live system
+  telemetry footer** — all shipped.
 
 ## How we actually test this
 
-Three reproducible benchmarks live under [`benchmark/`](../benchmark/):
+A reproducible bench suite lives under [`bench/`](../bench/) — see
+[`docs/BENCH.md`](BENCH.md) for the full guide.
 
 ```bash
-python benchmark/run_benchmark.py            # public-doc corpus, RAG end-to-end
-python benchmark/rag_compare.py              # RAG on vs off, multiple models
-python benchmark/bench_configs.py            # retrieval-option matrix
+# System bench — hardware probe + throughput sweep
+python -m bench.cli probe
+python -m bench.cli quick
+python -m bench.cli full
+
+# Quality bench — multi-model × multi-embedder × judged answers
+python sample_data/fetch.py                  # ~76 MB public-domain corpus
+python -X utf8 bench/bench_ohio.py           # 23 models × 3 embedders × 20 Qs
 ```
 
-Reports go to `benchmark/reports/`. Read them before believing anything we
-say about quality.
+The Ohio quality bench produces an interactive HTML report with a
+recommendation card, latency percentiles, gold-truth vs rubric
+disagreement check, and per-family rollups. A showcase bundle is
+checked in at
+[`bench/reports/ohio-20260503-211733/`](../bench/reports/ohio-20260503-211733/)
+— browse `report.html` for the latest numbers.
+
+Test suite (27 manual scripts, all also pytest-callable):
+
+```bash
+pytest tests/                               # 27 tests in ~50 s
+python -X utf8 tests/test_round1_core_retrieval.py   # or run any individually
+```

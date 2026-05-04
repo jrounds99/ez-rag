@@ -14,7 +14,8 @@ import numpy as np
 from .config import Config
 from .embed import DEFAULT_RERANKER, Embedder, cosine_top_k, rerank_hits
 from .generate import (
-    agent_complete, detect_backend, generate_hyde, generate_query_variations,
+    _is_list_query, agent_complete, detect_backend, generate_hyde,
+    generate_list_hyde, generate_query_variations,
 )
 from .index import Hit, Index
 
@@ -244,12 +245,176 @@ def mmr_select(
     return [hits[i] for i in selected]
 
 
+def crag_filter_chunks(query: str, hits: list[Hit], cfg: Config,
+                        *, max_keep: int | None = None) -> list[Hit]:
+    """CRAG-style chunk relevance filter (Corrective Retrieval AG).
+
+    After retrieval, ask the LLM in ONE batched call which of the
+    retrieved chunks are actually relevant to the query. Drop the
+    irrelevant ones before they reach the answer prompt.
+
+    Single call, not N — chunks are presented as a numbered list and
+    the LLM returns the kept IDs as a comma-separated list. Costs ~1
+    extra small LLM call per query.
+
+    Returns the filtered hits in their original rank order. If parsing
+    fails or the LLM is unavailable, returns the input unchanged
+    (degrades gracefully).
+    """
+    from .generate import _llm_complete, detect_backend
+    if not hits or detect_backend(cfg) == "none":
+        return hits
+    # Cap each chunk at ~400 chars in the filter prompt so it stays
+    # cheap and the LLM can scan all of them in one pass.
+    snippets = []
+    for i, h in enumerate(hits, start=1):
+        snippet = (h.text or "").strip().replace("\n", " ")[:400]
+        snippets.append(f"[{i}] {snippet}")
+    chunks_block = "\n\n".join(snippets)
+    prompt = (
+        "You are filtering search results for relevance. The user has a "
+        "question and we retrieved several candidate passages. Mark "
+        "which ones are actually relevant to answering the question.\n\n"
+        f"QUESTION: {query}\n\n"
+        f"PASSAGES:\n{chunks_block}\n\n"
+        "Reply with ONLY a comma-separated list of the passage numbers "
+        "that are RELEVANT — no commentary, no preamble. If none are "
+        "relevant reply with 'none'. If you're unsure about a passage, "
+        "include it (we'd rather over-include than under-include)."
+    )
+    raw = _llm_complete(cfg, prompt, max_tokens=80) or ""
+    raw = raw.strip().lower()
+    if "none" in raw and not any(c.isdigit() for c in raw):
+        return []   # explicit refusal — nothing relevant
+    # Parse digits out
+    keep_ids = set()
+    cur = ""
+    for ch in raw + ",":
+        if ch.isdigit():
+            cur += ch
+        else:
+            if cur:
+                try:
+                    n = int(cur)
+                    if 1 <= n <= len(hits):
+                        keep_ids.add(n - 1)
+                except ValueError:
+                    pass
+                cur = ""
+    if not keep_ids:
+        return hits   # parse failure → keep everything (don't drop the answer)
+    filtered = [h for i, h in enumerate(hits) if i in keep_ids]
+    if max_keep:
+        filtered = filtered[:max_keep]
+    return filtered
+
+
+def reorder_for_attention(hits: list[Hit]) -> list[Hit]:
+    """Reorder a ranked hit list to combat the 'lost in the middle' effect.
+
+    Stanford 2023 (arXiv:2307.03172) showed LLMs attend strongly to
+    content at the START and END of the prompt, less to the middle. So
+    we interleave the ranking: most-relevant FIRST, second-most-relevant
+    LAST, third in second position, fourth in second-to-last, etc.
+
+    For ranks [0, 1, 2, 3, 4, 5, 6, 7] this yields:
+        [0, 2, 4, 6, 7, 5, 3, 1]
+        ─────high-attention bookends────
+
+    Free win: zero LLM calls, zero retrieval changes. Documented to lift
+    quality on long-context RAG by 5-15% in the original paper.
+    """
+    if len(hits) <= 2:
+        return hits
+    front: list[Hit] = []
+    back: list[Hit] = []
+    for i, h in enumerate(hits):
+        if i % 2 == 0:
+            front.append(h)
+        else:
+            back.append(h)
+    return front + list(reversed(back))
+
+
+def diversify_by_source(hits: list[Hit], *, cap_per_source: int = 3,
+                          target_k: int = 0) -> list[Hit]:
+    """Rebalance a ranked hit list so no single source file dominates.
+
+    Walks the input in rank order. Each path gets at most `cap_per_source`
+    chunks in the output before we start skipping. Once the diversified
+    list is shorter than `target_k` (because too many candidates came
+    from few sources), it back-fills by relaxing the cap one slot at a
+    time on the highest-ranked sources.
+
+    Why this matters: on a corpus with 100+ PDFs, an unfiltered top-K
+    can come back with all 8 chunks from the same source, which gives
+    the LLM no diversity to extract from. A cap of 3 per source forces
+    the answer to be grounded across multiple books.
+
+    Pass `cap_per_source=0` to disable (returns hits unchanged).
+    """
+    if cap_per_source <= 0 or not hits:
+        return hits
+    counts: dict[str, int] = {}
+    kept: list[Hit] = []
+    skipped: list[Hit] = []
+    for h in hits:
+        path = h.path or ""
+        if counts.get(path, 0) < cap_per_source:
+            kept.append(h)
+            counts[path] = counts.get(path, 0) + 1
+        else:
+            skipped.append(h)
+    # If diversification dropped us below the requested top_k, back-fill
+    # from the skipped pile in original rank order — better to slightly
+    # over-represent a strong source than to return too few hits.
+    if target_k and len(kept) < target_k and skipped:
+        backfill = skipped[: target_k - len(kept)]
+        kept.extend(backfill)
+    return kept
+
+
+def copy_cfg_for_list(cfg: Config) -> Config:
+    """Return a shallow copy of cfg adjusted for list queries.
+
+    Three changes from the user's normal cfg:
+
+    1. **top_k bumped to ≥16** — list answers extract named entities
+       from across many chunks, so they benefit from a wider candidate
+       pool.
+
+    2. **chapter_max_chars capped at 4000** — without this cap, a
+       chapter-expanded retrieval at top_k=8 gives ~128 KB of context
+       and the LLM summarizes the chapters instead of extracting
+       specific named items (this is the failure mode the user saw —
+       getting "summaries of whole manuals"). Capping each chapter
+       expansion to ~4 KB keeps the per-chunk-anchor benefit but
+       prevents any single source from drowning the others. At
+       top_k=16 the total context stays around 64 KB.
+
+    3. **context_window forced to 0** — neighbor expansion compounds
+       with chapter expansion to inflate context further. Off for
+       list queries.
+
+    Non-list queries keep the user's normal cfg (full chapter expansion
+    is great for "explain this rule" type questions).
+    """
+    import copy as _copy
+    bumped = _copy.copy(cfg)
+    bumped.top_k = max(16, getattr(cfg, "top_k", 8))
+    bumped.chapter_max_chars = min(4000,
+                                    getattr(cfg, "chapter_max_chars", 16000))
+    bumped.context_window = 0
+    return bumped
+
+
 def smart_retrieve(
     *,
     query: str,
     embedder: Embedder,
     index: Index,
     cfg: Config,
+    status_cb=None,
 ) -> list[Hit]:
     """End-to-end retrieval honoring all `cfg` retrieval flags.
 
@@ -258,44 +423,100 @@ def smart_retrieve(
         if multi_query:    fan out to N paraphrases
         for each query:    hybrid search → top-K candidates
         merge + rerank (cross-encoder) if enabled
+        diversify (cap chunks per source)
+        expand (chapter / neighbors)
+        reorder (lost-in-middle)
+
+    `status_cb(stage_id)` — optional. Fires as the pipeline enters each
+    stage so a UI can pulse the active step. Stage ids:
+      "query_expand" | "hybrid_search" | "rerank" | "diversify" |
+      "expand" | "reorder" | "done"
     """
+    def _emit(stage):
+        if status_cb is None:
+            return
+        try:
+            status_cb(stage)
+        except Exception:
+            pass
+
     queries: list[str] = [query]
 
-    if getattr(cfg, "use_hyde", False):
+    # Auto-detect list-style queries — they retrieve dramatically better
+    # with the entity-rich HyDE variant than with the bare question.
+    # Falls back to the generic HyDE when the user has explicitly opted
+    # in via cfg.use_hyde.
+    auto_list = (getattr(cfg, "auto_list_mode", True)
+                  and _is_list_query(query))
+    if auto_list:
+        _emit("query_expand")
+        queries = [generate_list_hyde(query, cfg)]
+        # List answers benefit from more context — every chunk is a
+        # potential source of additional named items to extract.
+        # Bump top_k for THIS retrieval only, never below the user's
+        # configured value.
+        cfg = copy_cfg_for_list(cfg)
+    elif getattr(cfg, "use_hyde", False):
+        _emit("query_expand")
         queries = [generate_hyde(query, cfg)]
 
     if getattr(cfg, "multi_query", False):
+        _emit("query_expand")
         # Generate variations of the (post-HyDE) query
         variations = generate_query_variations(queries[0], cfg, n=2)
         # always include the original raw question too, so we never lose it
         queries = list(dict.fromkeys(variations + [query]))
 
     if len(queries) == 1:
-        # When MMR is enabled, fetch a wider candidate pool so it has
-        # something to diversify across.
-        fetch_k = max(cfg.top_k * 3, 20) if getattr(cfg, "use_mmr", False) else cfg.top_k
+        # When MMR or diversification is enabled, fetch a wider candidate
+        # pool so we have something to diversify / re-select across.
+        diversify_n = int(getattr(cfg, "diversify_per_source", 3) or 0)
+        fetch_k = cfg.top_k
+        if getattr(cfg, "use_mmr", False):
+            fetch_k = max(fetch_k, cfg.top_k * 3, 20)
+        if diversify_n > 0:
+            fetch_k = max(fetch_k, cfg.top_k * 2 + 6)
+        _emit("hybrid_search")
         hits = hybrid_search(
             query=queries[0], embedder=embedder, index=index,
             k=fetch_k, use_hybrid=cfg.hybrid,
             rerank=cfg.rerank,
         )
+        if cfg.rerank:
+            _emit("rerank")
         if getattr(cfg, "use_mmr", False) and len(hits) > cfg.top_k:
+            _emit("diversify")
             hits = mmr_select(
                 hits, embedder, top_k=cfg.top_k,
                 lambda_=getattr(cfg, "mmr_lambda", 0.5),
             )
+        elif diversify_n > 0:
+            _emit("diversify")
+            hits = diversify_by_source(
+                hits, cap_per_source=diversify_n, target_k=cfg.top_k,
+            )[:cfg.top_k]
         else:
             hits = hits[:cfg.top_k]
+        if getattr(cfg, "crag_filter", False):
+            _emit("crag")
+            hits = crag_filter_chunks(query, hits, cfg) or hits
         if getattr(cfg, "context_window", 0) > 0:
+            _emit("expand")
             hits = expand_with_neighbors(hits, index, cfg.context_window)
         if getattr(cfg, "expand_to_chapter", False):
+            _emit("expand")
             hits = expand_to_chapter(
                 hits, index,
                 max_chars=int(getattr(cfg, "chapter_max_chars", 16000)),
             )
+        if getattr(cfg, "reorder_for_attention", False):
+            _emit("reorder")
+            hits = reorder_for_attention(hits)
+        _emit("done")
         return hits
 
     # Multi-query: search each, fuse with RRF.
+    _emit("hybrid_search")
     rank_maps: list[dict[int, int]] = []
     by_id: dict[int, Hit] = {}
     for q in queries:
@@ -312,24 +533,38 @@ def smart_retrieve(
     candidates = [by_id[cid] for cid in fused_ids if cid in by_id]
 
     if cfg.rerank and len(candidates) > 1:
+        _emit("rerank")
         candidates = rerank_hits(
             query, candidates[:max(30, cfg.top_k * 4)],
             top_k=max(cfg.top_k * 3, 20) if getattr(cfg, "use_mmr", False) else cfg.top_k,
         )
+    diversify_n = int(getattr(cfg, "diversify_per_source", 3) or 0)
     if getattr(cfg, "use_mmr", False) and len(candidates) > cfg.top_k:
+        _emit("diversify")
         candidates = mmr_select(
             candidates, embedder, top_k=cfg.top_k,
             lambda_=getattr(cfg, "mmr_lambda", 0.5),
         )
+    elif diversify_n > 0:
+        _emit("diversify")
+        candidates = diversify_by_source(
+            candidates, cap_per_source=diversify_n, target_k=cfg.top_k,
+        )[:cfg.top_k]
     else:
         candidates = candidates[:cfg.top_k]
     if getattr(cfg, "context_window", 0) > 0:
+        _emit("expand")
         candidates = expand_with_neighbors(candidates, index, cfg.context_window)
     if getattr(cfg, "expand_to_chapter", False):
+        _emit("expand")
         candidates = expand_to_chapter(
             candidates, index,
             max_chars=int(getattr(cfg, "chapter_max_chars", 16000)),
         )
+    if getattr(cfg, "reorder_for_attention", True):
+        _emit("reorder")
+        candidates = reorder_for_attention(candidates)
+    _emit("done")
     return candidates
 
 

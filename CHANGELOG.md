@@ -7,7 +7,25 @@ versions follow nothing yet because this is alpha.
 
 ## [Unreleased]
 
-### Added
+### Added — release-prep cycle (2026-05)
+
+- **Multi-GPU routing** — `multi_gpu.py` + `daemon_supervisor.py`. TOML routing table (`<workspace>/.ezrag/routing.toml`) pins models to GPUs across multiple Ollama daemons. Auto-picker (sticky → most-free-VRAM → first daemon), `/api/ps` cache, daemon adoption from previous sessions. Settings → Hardware UI. 117 unit tests across `tests/test_multi_gpu.py`, `test_daemon_supervisor.py`, `test_auto_placement.py`, `test_health_check.py`, `test_unload_on_switch.py`, `test_gpu_*` (catalog/detect/recommend/runtime).
+- **Per-file metadata sidecars** — `ingest_meta.py` introduces `<file>.ezrag-meta.toml` companions with `prefix`, `suffix`, `negatives`, optional `topic` and `entities`, and a `scope` (`global` / `topic-aware` / `file-only`). Read at retrieval time — no re-ingest needed to update modifiers. FTS5 entity boost wired in at chunk-write time.
+- **LLM ingest scan** — `ingest_scan.py` plus the `ez-rag scan` subcommand. Samples chunks per file, asks the LLM for topic + entities + suggested modifiers, hallucination-filtered, written as `.ezrag-meta.toml.draft` for the user to review before adopting.
+- **Cross-platform bench suite** — `bench/cli.py` (`probe` / `quick` / `search` / `full`), `bench/run.py` orchestrator, `bench/sysinfo.py` (CPU/RAM/GPU/Ollama version capture), `bench/power.py` (NVIDIA via nvidia-smi, Linux via Intel RAPL), `bench/run.sh` and `bench/run.ps1` launchers. Diagnostic bundles for AI-agent forwarding.
+- **Ohio quality benchmark** — `bench/bench_ohio.py`, `bench/ohio_html.py`, `bench/ohio_questions.json`. Sweeps every chat model × every embedder × every question against the public-domain Ohio + Appalachian geology corpus. Captures per-cell `prompt_tokens` / `eval_tokens` / `tokens_per_sec` (Ollama meta), retry-once-skip-twice on errors, `think=false` for fair apples-to-apples on reasoning models. Rule-based **gold-truth** check (must-contain factual phrases on 8 questions) runs alongside the LLM-as-judge rubric so the report can flag rubric-vs-factual disagreement. Report includes a top-of-page **recommendation card** with four picks (default · highest quality · tightest VRAM · highest factual accuracy · embedder), latency p50/p95, model × question heatmap, model × embedder heatmap, family rollup, per-category bars, per-model factual cards, and a glossary.
+- **Sample data fetcher** — `sample_data/curation.json` + `sample_data/fetch.py`. Curated public-domain government datasets (~76 MB default; ~190 MB with `--include-optional`): USGS bedrock geology, Appalachian coal resources, Ohio mineral industries, EIA energy data, BLS QCEW, Project Gutenberg geology classics. Powers the Ohio bench with a single command.
+- **Test infrastructure** — `pyproject.toml` `[dev]` extras (pytest, pytest-timeout). `tests/conftest.py` skips manual scripts from direct collection; `tests/test_run_manual_suite.py` parametrizes over each `test_*.py` and runs it as a subprocess so `pytest tests/` is the single CI-friendly entry point. All 27 manual tests now run via `pytest` in ~50 s.
+
+### Fixed — release-prep cycle (2026-05)
+
+- **`multi_gpu.py` not vendored** in chatbot exports → exported chatbots crashed on first request with `ModuleNotFoundError: No module named 'ezrag_lib.multi_gpu'`. `src/ez_rag/export.py` now adds it to `_VENDORED_MODULES`.
+- **xpu-smi MiB key parsed as bytes** → Intel Arc A770 (16384 MiB VRAM) reported as 0 MB. The unit-detection check `"mb" not in "memory_physical_size_mib"` was True (suffix is `_mib`, not `_mb`), so 16384 got divided by 1MB. Replaced with explicit `_mib` / `_mb` suffix detection in `gpu_detect.py`.
+- **`estimate_required_vram` returned wrong model** → `qwen2.5:7b-instruct` resolved to `qwen2.5:0.5b` (first prefix match in size-ordered table), making `min_vram_gb=2 GB` for a 7B model. Every export warning was wrong. Fixed with two-pass lookup in `gpu_recommend.py`: exact tag match first, prefix fallback second.
+- **Duplicate `set_active_table` definition** in `multi_gpu.py` — the first def was shadowed by a second cache-aware version with `# noqa: F811`. Consolidated into one canonical definition.
+- **~20 dead imports** removed across `cli.py`, `embed.py`, `daemon_supervisor.py`, `gpu_catalog.py`, `gpu_detect.py`, `index.py`, `ingest.py`, `ingest_meta.py`, `ingest_scan.py`, `multi_gpu.py`, `parsers.py`, `server.py`, `sysmon.py`.
+
+### Added — earlier in this cycle
 
 - **Themes** — 10 preset palettes (`dark`, `light`, `midnight`, `forest`, `solarized_dark`, `solarized_light`, `nord`, `dracula`, `rose_pine`, `rainbow`) loaded from `gui/ez_rag_gui/themes.toml`. Switchable from Settings → Appearance with a live swatch preview. Custom palettes by editing the TOML.
 - **Live system telemetry footer** — pinned bar showing CPU %, CPU temp, RAM, GPU compute %, VRAM, GPU temp, power draw. Updates at 1 Hz. nvidia-smi for GPU, psutil for CPU/RAM. Hides per-field when unavailable (e.g. CPU temp on Windows).
@@ -51,7 +69,7 @@ versions follow nothing yet because this is alpha.
 
 ### Tests
 
-- 12 test suites, 292 assertions: round1–5 (core retrieval + modifiers + agent + ingest + storage), export-chatbot, export-sources, preview, chapters, suggestions, sysmon, ollama-errors, unload-on-switch.
+- 27 test suites covering: round1–5 (core retrieval + modifiers + agent + ingest + storage), export-chatbot, export-sources, preview, chapters, suggestions, sysmon, ollama-errors, unload-on-switch, parsers-garbled, llm-correct, llm-inspect, ingest-meta, ingest-scan, gpu-catalog, gpu-detect, gpu-recommend, gpu-runtime, multi-gpu, daemon-supervisor, auto-placement, health-check, bench-orchestrator. Run with `pytest tests/` or directly via `python tests/test_<name>.py`.
 
 ## [0.1.0] — Initial experimental release
 

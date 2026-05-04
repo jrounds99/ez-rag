@@ -31,6 +31,7 @@ _VENDORED_MODULES = [
     "embed.py",
     "generate.py",
     "index.py",
+    "multi_gpu.py",  # resolve_url() — chat-time URL routing
     "retrieve.py",
 ]
 

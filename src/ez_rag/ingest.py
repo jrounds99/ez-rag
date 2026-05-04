@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from .chapters import detect_chapters
-from .chunker import Chunk, chunk_sections
+from .chunker import chunk_sections
 from .config import Config
-from .embed import Embedder, make_embedder
-from .generate import contextualize_chunk, detect_backend, inspect_text_quality
+from .embed import make_embedder
+from .generate import (
+    contextualize_chunk, correct_garbled_text, detect_backend,
+    inspect_text_quality,
+)
 from .index import Index, file_sha256
 from .models import unload_ollama_model
 from .parsers import ParsedSection, get_parser, supported_extensions
@@ -247,7 +250,14 @@ def ingest(
             f"unloading chat LLM '{cfg.llm_model}' from VRAM "
             "(frees ~22 GB for the embedder)…"
         )))
-        unload_ollama_model(cfg.llm_url, cfg.llm_model)
+        # Route the unload to the daemon actually hosting the chat model
+        # — under multi-GPU, the chat model and the embedder may be on
+        # different daemons, so cfg.llm_url isn't always the right URL.
+        from .multi_gpu import resolve_url
+        unload_ollama_model(
+            resolve_url(cfg, cfg.llm_model, role="chat"),
+            cfg.llm_model,
+        )
         _emit(progress, _early_snap(
             f"  ↪ unloaded in {time.perf_counter() - t:.1f}s"
         ))
@@ -443,23 +453,33 @@ def ingest(
                                 f" via OCR"),
                         page=payload.get("page"),
                     )
-                    snap.recovery = payload
+                    snap.recovery = {**payload, "kind": "ocr"}
                     _emit(progress, snap)
                 recovery_cb = _on_recovery
 
             parse_t0 = time.perf_counter()
+            # When LLM correction is enabled, parse permissively — keep
+            # questionable OCR results in the section list so the LLM
+            # can take a shot at them instead of having them dropped
+            # upstream as TOC fragments / still-garbled.
+            permissive = getattr(cfg, "llm_correct_garbled", False)
+            parser_kwargs = {"on_progress": page_cb}
+            if recovery_cb is not None:
+                parser_kwargs["on_recovery"] = recovery_cb
+            if permissive:
+                parser_kwargs["permissive"] = True
             try:
-                if recovery_cb is not None:
-                    sections = parser(
-                        path, on_progress=page_cb, on_recovery=recovery_cb,
-                    )
-                else:
-                    sections = parser(path, on_progress=page_cb)
+                sections = parser(path, **parser_kwargs)
             except TypeError:
-                # Parser predates one or both kwargs — fall back gracefully.
-                try:
-                    sections = parser(path, on_progress=page_cb)
-                except TypeError:
+                # Parser predates one or more kwargs — degrade gracefully.
+                for drop in ("permissive", "on_recovery", "on_progress"):
+                    parser_kwargs.pop(drop, None)
+                    try:
+                        sections = parser(path, **parser_kwargs)
+                        break
+                    except TypeError:
+                        continue
+                else:
                     sections = parser(path)
             parse_s = time.perf_counter() - parse_t0
             if not sections:
@@ -538,6 +558,114 @@ def ingest(
                         status="all sections rejected by LLM inspect",
                     ))
                     continue
+
+            # Optional LLM-assisted correction of questionable sections.
+            # Targets:
+            #   - sections that came back from OCR recovery (meta.ocr=True)
+            #   - sections the LLM inspect pass flagged as "partial"
+            # Each candidate is sent to the LLM with a small surrounding
+            # context window for a best-effort cleanup. UNRECOVERABLE
+            # responses cause the section to be dropped. Skipped when the
+            # LLM backend isn't reachable so this is safe to leave on.
+            if (getattr(cfg, "llm_correct_garbled", False)
+                    and detect_backend(cfg) != "none"
+                    and len(sections) > 0):
+                candidates = [
+                    si for si, sec in enumerate(sections)
+                    if (sec.text or "").strip() and (
+                        (sec.meta or {}).get("ocr") is True
+                        or (sec.meta or {}).get("llm_inspect") == "partial"
+                        or (sec.meta or {}).get("questionable") is True
+                    )
+                ]
+                if candidates:
+                    corr_t0 = time.perf_counter()
+                    fixed = 0
+                    dropped = 0
+                    drop_idx: set[int] = set()
+                    # When previews are on, also fire a recovery event for
+                    # each successful correction so the GUI can show the
+                    # LLM-cleaned text as a third panel on the recovery card.
+                    preview_on = getattr(cfg, "preview_garbled_recoveries",
+                                          False)
+                    for n, si in enumerate(candidates, start=1):
+                        sec = sections[si]
+                        # Build small surrounding context from neighbors
+                        # (skipping placeholders / empty meta).
+                        before_ctx = sections[si - 1].text if si > 0 else ""
+                        after_ctx = (sections[si + 1].text
+                                     if si + 1 < len(sections) else "")
+                        context = (before_ctx[-400:] + "\n\n"
+                                   + after_ctx[:400]).strip()
+                        original_text = sec.text
+                        cleaned = correct_garbled_text(
+                            original_text, cfg, context=context,
+                        )
+                        if cleaned is None:
+                            dropped += 1
+                            drop_idx.add(si)
+                            if preview_on:
+                                snap = snapshot(
+                                    current_path=rel,
+                                    status=(f"LLM declined to correct page "
+                                            f"{sec.page} (kept original)"),
+                                    page=sec.page,
+                                )
+                                snap.recovery = {
+                                    "kind": "correction",
+                                    "file": rel,
+                                    "page": sec.page,
+                                    "before": original_text,
+                                    "after": "",
+                                    "unrecoverable": True,
+                                }
+                                _emit(progress, snap)
+                        else:
+                            sec.text = cleaned
+                            sec.meta = {**(sec.meta or {}),
+                                        "llm_corrected": True}
+                            fixed += 1
+                            if preview_on:
+                                snap = snapshot(
+                                    current_path=rel,
+                                    status=(f"LLM corrected page {sec.page}"),
+                                    page=sec.page,
+                                )
+                                snap.recovery = {
+                                    "kind": "correction",
+                                    "file": rel,
+                                    "page": sec.page,
+                                    "before": original_text,
+                                    "after": cleaned,
+                                }
+                                _emit(progress, snap)
+                        if n == len(candidates) or n % 3 == 0:
+                            _emit(progress, snapshot(
+                                current_path=rel,
+                                status=(f"LLM-correcting section {n}/"
+                                        f"{len(candidates)} "
+                                        f"(fixed {fixed}, dropped {dropped})"),
+                                page=sec.page,
+                            ))
+                    if drop_idx:
+                        sections = [s for i, s in enumerate(sections)
+                                    if i not in drop_idx]
+                    corr_s = time.perf_counter() - corr_t0
+                    _emit(progress, snapshot(
+                        current_path=rel,
+                        status=(f"LLM correction done in {corr_s:.1f}s — "
+                                f"fixed {fixed}, dropped {dropped} "
+                                f"unrecoverable from {len(candidates)} "
+                                f"questionable section(s)"),
+                    ))
+                    if not sections:
+                        bytes_done += file_size
+                        files_done += 1
+                        _emit(progress, snapshot(
+                            current_path=rel,
+                            status="all sections rejected by LLM correct",
+                        ))
+                        continue
 
             chunk_t0 = time.perf_counter()
             chunks = chunk_sections(
@@ -635,9 +763,53 @@ def ingest(
                 ))
             vecs = np.concatenate(vec_chunks, axis=0) if vec_chunks else \
                    np.zeros((0, embedder.dim), dtype=np.float32)
+
+            # Per-file metadata FTS5 boost: if a sidecar exists for
+            # this file, prepend matching entity terms to the chunk's
+            # `tokens` column so BM25 lights up on entity names even
+            # when the user's query phrasing differs. This is a free
+            # quality lift — costs nothing at retrieval time, costs
+            # one TOML read here at ingest. Failures are silent.
+            entities_for_file: list[str] = []
+            priority_for_file: list[str] = []
+            try:
+                if getattr(cfg, "use_file_metadata", True):
+                    from .ingest_meta import load as _load_meta
+                    md = _load_meta(path, workspace_root=ws.root)
+                    if md is not None:
+                        entities_for_file = md.entities.all()
+                        priority_for_file = list(md.priority_terms)
+            except Exception:
+                # Never let a sidecar parse error block ingest.
+                pass
+            entity_set = entities_for_file + priority_for_file
+
             rows = []
             for c, v in zip(chunks, vecs):
-                rows.append((c.ord, c.page, c.section, c.text, _tokenize(c.text), v))
+                tokens = _tokenize(c.text)
+                # Inject matching entities into the FTS tokens. Cheap
+                # case-insensitive substring scan against the chunk's
+                # text. We only inject entities ALREADY PRESENT in the
+                # chunk (no false positives), so BM25 still respects
+                # locality.
+                if entity_set:
+                    text_lower = (c.text or "").lower()
+                    matched: list[str] = []
+                    for term in entity_set:
+                        if term and term.lower() in text_lower:
+                            matched.append(term)
+                    if matched:
+                        # Lowercase + dedupe for the FTS5 column.
+                        seen: set[str] = set()
+                        boost: list[str] = []
+                        for t in matched:
+                            tl = t.lower()
+                            if tl in seen:
+                                continue
+                            seen.add(tl)
+                            boost.append(tl)
+                        tokens = tokens + " " + " ".join(boost)
+                rows.append((c.ord, c.page, c.section, c.text, tokens, v))
 
             # Chapter boundaries (PDF outline / heading sections / fallback
             # 'Document'). Cheap — pypdf already opened the file in the

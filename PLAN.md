@@ -31,9 +31,13 @@
 ```
 my-rag/
 ├── docs/                         # user files
+│   ├── handbook.pdf
+│   └── handbook.pdf.ezrag-meta.toml   # optional per-file metadata
 └── .ezrag/
     ├── config.toml               # chunk size, top-k, model, …
+    ├── routing.toml              # multi-GPU daemon assignments (optional)
     ├── meta.sqlite               # files, chunks, FTS index, embeddings
+    ├── preview_cache/            # PDF page-image cache (3-day rolling)
     └── ingest.log
 ```
 
@@ -41,20 +45,31 @@ my-rag/
 
 | File | Responsibility |
 |---|---|
-| `cli.py` | Typer app: `init`, `ingest`, `ask`, `chat`, `status`, `models`, `serve`, `doctor`, `reindex`, `help` |
+| `cli.py` | Typer app: `init`, `ingest`, `ask`, `chat`, `status`, `models`, `serve`, `doctor`, `reindex`, `export`, `import`, `scan`, `help` |
 | `config.py` | TOML config dataclass |
 | `workspace.py` | Find / create the `.ezrag/` workspace |
 | `parsers.py` | PDF · DOCX · XLSX/CSV · HTML · MD/TXT · EPUB · EML · images |
 | `ocr.py` | RapidOCR primary, Tesseract fallback |
-| `chunker.py` | Recursive split with token-target + overlap |
 | `embed.py` | Ollama embed if reachable, else fastembed |
 | `index.py` | SQLite + FTS5; embeddings as BLOBs of float32 |
-| `retrieve.py` | Hybrid BM25 + cosine fused with RRF |
-| `generate.py` | Ollama → llama-cpp → retrieval-only fallback |
+| `retrieve.py` | Hybrid BM25 + cosine fused with RRF, optional rerank/MMR/HyDE/multi-query/neighbor expansion |
+| `generate.py` | Ollama → llama-cpp → retrieval-only fallback; reasoning-model `thinking` field surfaced separately |
 | `ingest.py` | Orchestrates the whole ingest pipeline |
+| `ingest_meta.py` | Per-file `.ezrag-meta.toml` sidecars: prefix / suffix / negatives + scope (global/topic/file-only) |
+| `ingest_scan.py` | LLM discovery scan that auto-populates sidecars from corpus content |
+| `models.py` | Ollama listing/pull, library scraper, VRAM estimator, running-model unload |
+| `multi_gpu.py` | Routing table (TOML), per-model GPU pinning, free-VRAM auto-picker |
+| `daemon_supervisor.py` | Spawn / detect / adopt / shutdown per-GPU Ollama daemons |
+| `gpu_detect.py` | nvidia-smi · rocm-smi · xpu-smi · WMI fallback |
+| `gpu_catalog.py` | Static GPU spec catalog (VRAM, bandwidth, FP16 TFLOPS) |
+| `gpu_recommend.py` | Match detected hardware → tier → recommended models + estimated tps |
+| `gpu_runtime.py` | Runtime detection (CUDA / ROCm / Metal / CPU) for binary preflight |
 | `server.py` | OpenAI-compatible `/v1/chat/completions` (stdlib HTTP) |
+| `export.py` | Workspace → portable `.zip` chatbot bundle (vendored ezrag_lib + HTML/CSS/JS chat UI) |
+| `preview.py` | On-demand PDF page-image rendering (pypdfium2) with 3-day disk cache |
+| `sysmon.py` | 1 Hz CPU/RAM/GPU telemetry sampler for the GUI footer |
 | `manual/*.md` | In-tool offline manual pages |
-| `gui/ez_rag_gui/main.py` | Flet GUI (Workspace · Ingest · Chat · Settings · Models tabs) |
+| `gui/ez_rag_gui/main.py` | Flet GUI (Workspace · Files · Chat · Settings · Doctor tabs) |
 
 ## Choices
 
