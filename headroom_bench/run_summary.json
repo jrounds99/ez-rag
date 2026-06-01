@@ -1,0 +1,19 @@
+{
+  "n_cases": 240,
+  "errors": 0,
+  "tokens_before": 1683458,
+  "tokens_after": 863141,
+  "tokens_saved": 820317,
+  "overall_reduction_pct": 48.7,
+  "mean_ratio_pct": 48.8,
+  "compress_latency_mean_s": 3.73,
+  "quality_n": 40,
+  "quality_avg_orig": 10.75,
+  "quality_avg_comp": 10.35,
+  "quality_delta": -0.4,
+  "quality_within_1pt": 35,
+  "headroom_version": "0.22.3",
+  "relevance_model": "answerdotai/ModernBERT-base",
+  "corpus": "Ohio + Appalachian geology (public domain)",
+  "config": "3 embedders x 20 questions x 4 depths (top-k 5/10/15/20)"
+}

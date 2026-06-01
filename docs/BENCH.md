@@ -299,6 +299,53 @@ A showcase run is checked in at
 
 ---
 
+## Compression bench
+
+A third harness ([`headroom_bench/`](../headroom_bench/)) measures the
+optional context-compression feature (see
+[`docs/COMPRESSION.md`](COMPRESSION.md)). It compresses real ez-rag
+retrieval prompts with [headroom-ai](https://github.com/chopratejas/headroom)
+and reports token savings + answer-quality preservation.
+
+### Pipeline
+
+```bash
+# 1) Build realistic prompts from the Ohio corpus (native retrieval)
+python headroom_bench/build_cases.py
+#    -> cases.json : 3 embedders x 20 questions x 4 depths = 240 prompts
+
+# 2) Compress with real headroom (Linux/WSL — needs the [ml] extra)
+python3 headroom_bench/compress_wsl.py --in cases.json --out compressed.json
+
+# 3) Quality check: orig vs compressed answers, LLM-judged (needs Ollama)
+python headroom_bench/quality_check.py --sample 40
+
+# 4) Build the PDF impact report (reportlab + matplotlib)
+python headroom_bench/make_report.py
+#    -> headroom_bench/headroom_impact_report.pdf
+```
+
+### Result (Ohio corpus, headroom 0.22.3, ModernBERT relevance model)
+
+| Metric | Value |
+|---|---|
+| Prompts compressed | 240 (0 errors) |
+| Tokens before → after | 1,683,458 → 863,141 |
+| **Overall reduction** | **48.7%** (820,317 tokens) |
+| Mean per-case ratio | ~49% (every case compressed) |
+| Quality delta (judged) | within judge noise (~0.4/12) |
+
+Savings climb with context depth — more top-k chunks means more
+redundancy for the relevance scorer to prune. The compression seam is
+off by default and fail-open; this bench only measures the upside.
+
+> **Platform note.** headroom ships Linux + macOS wheels (cp310–cp313).
+> On Windows / Python 3.14 there's no wheel, so step 2 runs under WSL.
+> The ez-rag integration itself is pure-Python and no-ops cleanly when
+> headroom can't load.
+
+---
+
 ## Cross-system consolidation
 
 After running on multiple machines, you can compare them. Currently
