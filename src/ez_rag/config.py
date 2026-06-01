@@ -138,6 +138,20 @@ class Config:
     # are applied post-retrieval.
     use_file_metadata: bool = True
 
+    # Context compression (optional, off by default) — when True and the
+    # `headroom-ai` package is installed, retrieved context is compressed
+    # before it is sent to the LLM. Fail-open: if headroom is missing or
+    # errors, the original (uncompressed) messages are sent unchanged.
+    # Install with: pip install "ez-rag[compress]"
+    compress_context: bool = False
+    # Don't bother compressing prompts smaller than this (tokens). Tiny
+    # contexts compress poorly and the model-load overhead isn't worth it.
+    compress_context_min_tokens: int = 250
+    # Target compression ratio (0.0 = let headroom decide). e.g. 0.5 =
+    # aim to keep ~50% of tokens. Higher pressure = more savings, more
+    # risk of dropping relevant detail.
+    compress_context_target_ratio: float = 0.0
+
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod

@@ -390,6 +390,9 @@ def answer(
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": user_prompt},
     ]
+    # Optional context compression (off by default; fail-open).
+    from .compression import maybe_compress_messages
+    messages = maybe_compress_messages(cfg, messages)
     if backend == "ollama":
         if stream:
             return _ollama_chat_stream(cfg, messages)
@@ -435,6 +438,10 @@ def chat_answer(
     messages.extend(history)
     messages.append({"role": "user",
                      "content": _build_user_prompt(latest_question, hits)})
+
+    # Optional context compression (off by default; fail-open).
+    from .compression import maybe_compress_messages
+    messages = maybe_compress_messages(cfg, messages)
 
     if backend == "ollama":
         if stream:

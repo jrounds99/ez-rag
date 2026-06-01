@@ -81,3 +81,13 @@ bench/reports/ohio-20260503-184645/
 # bytes are not. Re-fetchable via `python sample_data/fetch.py`.
 sample_data/fetched/
 sample_data/manifest.json
+
+# Headroom compression bench — commit the scripts + the PDF report +
+# the small run summary, not the heavy regenerable intermediates.
+.headroom-venv/
+headroom_bench/cases.json
+headroom_bench/compressed.json
+headroom_bench/quality.json
+headroom_bench/quality_8k.json
+headroom_bench/_assets/
+# (headroom_impact_report.pdf and run_summary.json ARE committed)

@@ -7,6 +7,31 @@ versions follow nothing yet because this is alpha.
 
 ## [Unreleased]
 
+### Added — context compression (2026-06)
+
+- **Optional context compression** via [headroom-ai](https://github.com/chopratejas/headroom).
+  New `src/ez_rag/compression.py` seam compresses retrieved context
+  before it reaches the LLM, cutting prompt tokens (and therefore
+  prompt-eval time, KV-cache memory, and hosted-API input cost) while
+  preserving answer-relevant content. **Off by default, optional
+  dependency, fail-open**: enable with `compress_context = true` +
+  `pip install "ez-rag[compress]"`; if headroom is missing or errors,
+  ez-rag sends the original context unchanged. New config keys:
+  `compress_context`, `compress_context_min_tokens`,
+  `compress_context_target_ratio`. Wired into `generate.answer()` and
+  `generate.chat_answer()`. 16 integration tests in
+  `tests/test_compression.py` (off-path, happy-path, every fail-open
+  branch). See [`docs/COMPRESSION.md`](docs/COMPRESSION.md).
+- **Compression benchmark** (`headroom_bench/`). Evaluates headroom on
+  240 real ez-rag retrieval prompts (3 embedders × 20 Ohio questions ×
+  4 context depths). Result: **~49% token reduction** (820k of 1.68M
+  tokens, 0 errors) with negligible answer-quality change under an LLM
+  judge. Produces a PDF impact report
+  (`headroom_bench/make_report.py`). Harness: `build_cases.py`
+  (Windows/native retrieval) → `compress_wsl.py` (real headroom under
+  WSL — Linux wheels) → `quality_check.py` (orig-vs-compressed judged)
+  → `make_report.py` (reportlab + matplotlib PDF).
+
 ### Added — release-prep cycle (2026-05)
 
 - **Multi-GPU routing** — `multi_gpu.py` + `daemon_supervisor.py`. TOML routing table (`<workspace>/.ezrag/routing.toml`) pins models to GPUs across multiple Ollama daemons. Auto-picker (sticky → most-free-VRAM → first daemon), `/api/ps` cache, daemon adoption from previous sessions. Settings → Hardware UI. 117 unit tests across `tests/test_multi_gpu.py`, `test_daemon_supervisor.py`, `test_auto_placement.py`, `test_health_check.py`, `test_unload_on_switch.py`, `test_gpu_*` (catalog/detect/recommend/runtime).

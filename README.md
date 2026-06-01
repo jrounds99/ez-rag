@@ -138,6 +138,7 @@ question → [HyDE]? → [multi-query]? → hybrid (BM25 + dense, RRF)
 | **Agentic mode** | ☐ | LLM iteratively reflects + re-searches when initial hits look weak. Uses your chat model by default; OpenAI / Anthropic / OpenAI-compat supported as upgrades |
 | **Query modifiers** *(prefix · suffix · negatives)* | ☐ | persistent persona / formatting / "avoid X" wrappers around every question. Per-query checkbox in the chat composer |
 | **Use RAG** | ✅ | toggle OFF in the Chat tab to A/B compare model-only vs RAG-augmented |
+| **Context compression** *(optional)* | ☐ | shrink the retrieved context ~49% before it hits the LLM via [headroom-ai](https://github.com/chopratejas/headroom). Off by default; opt in with `pip install "ez-rag[compress]"` + `compress_context = true`. Fail-open. See [docs/COMPRESSION.md](docs/COMPRESSION.md) |
 
 Defaults are tuned for "drop docs, get good answers." See `ez-rag help retrieval` or the GUI's Help (?) for the empirical config matrix and when to flip what.
 
@@ -240,6 +241,9 @@ name them — they know who they are.
 - **SQLite + FTS5 + numpy** — still the right answer ten years later
 - **Anthropic** — for the contextual-retrieval idea even though we ship without
   their model
+- **headroom-ai** (Apache-2.0) — powers the *optional* context-compression
+  feature. Off by default; see [docs/COMPRESSION.md](docs/COMPRESSION.md) and
+  [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 
 ### Special thanks to
 
@@ -253,3 +257,7 @@ name them — they know who they are.
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE). Use it, fork it, name your goldfish after it.
+
+Third-party dependency licenses and attributions (including the optional
+`headroom-ai` compression dependency and its NOTICE) are documented in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
