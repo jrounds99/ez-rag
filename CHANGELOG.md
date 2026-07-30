@@ -7,6 +7,47 @@ versions follow nothing yet because this is alpha.
 
 ## [Unreleased]
 
+### Performance — query hot path (2026-06)
+
+- **Embedding-matrix cache.** The dense half of hybrid search no longer
+  re-reads and deserializes every chunk embedding BLOB from SQLite on
+  every question. `Index.all_embeddings()` now keeps a single-slot,
+  module-level cache of the L2-normalized matrix, invalidated explicitly
+  by every mutating index method (including the SQLite rowid-reuse edge
+  where `(COUNT, MAX(id))` can't detect a same-size file replacement)
+  plus a cheap freshness token. Measured on the Ohio workspace: matrix
+  step 13 ms → 0.016 ms per query (~800×); the win scales linearly with
+  corpus size and multiplies under multi-query / agentic retrieval.
+- **Cosine skips the per-row norm pass** — `cosine_top_k(...,
+  assume_normalized=True)` on the pre-normalized cached matrix removes a
+  full O(N·D) sweep per query.
+- **GUI no longer constructs a new `Index` per chat question** (connect +
+  schema + migrations + dim-detect per send, which also defeated the
+  matrix cache). Cached on app state, reset on workspace switch.
+- **MMR diversifies from stored vectors** — `mmr_select(index=...)`
+  fetches hit embeddings from SQLite in one batched SELECT instead of
+  re-embedding every hit text (one HTTP round-trip per hit with the
+  Ollama embedder). Embedder fallback retained.
+- **Chapter expansion ord lookup batched** (`Index.ords_for`) — replaces
+  a per-hit N+1 SELECT.
+- **Compression pre-gate** — prompts obviously below
+  `compress_context_min_tokens` skip the headroom pipeline entirely
+  (no import, tokenizer, or relevance-model work on small questions).
+
+### Refactor (2026-06)
+
+- Deduplicated `_ollama_alive` (embed.py is canonical; generate.py
+  imports it) and `_toml_str` (new shared `toml_util.py`, used by
+  multi_gpu + ingest_meta; dead `_BASIC_NEEDS_ESCAPE` regex removed).
+- `toml_util.py` added to the chatbot-export vendor list, and the
+  export test now imports every module in `_VENDORED_MODULES`
+  dynamically so the vendor list can't silently drift from the import
+  graph again.
+- New `tests/test_matrix_cache.py` (19 assertions: cache identity,
+  normalization, both invalidation paths incl. rowid reuse, ranking
+  parity vs brute force, batched lookups, MMR-from-stored-vectors).
+  Suite: 29 files green.
+
 ### Added — context compression (2026-06)
 
 - **Optional context compression** via [headroom-ai](https://github.com/chopratejas/headroom).

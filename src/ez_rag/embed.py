@@ -66,9 +66,14 @@ class FastEmbedEmbedder(Embedder):
         return np.array(vecs, dtype=np.float32)
 
 
-def _ollama_alive(url: str) -> bool:
+def _ollama_alive(url: str, timeout: float = 2.0) -> bool:
+    """Cheap liveness probe for an Ollama daemon.
+
+    Canonical implementation — generate.py imports this rather than
+    keeping its own copy.
+    """
     try:
-        r = httpx.get(url.rstrip("/") + "/api/tags", timeout=2.0)
+        r = httpx.get(url.rstrip("/") + "/api/tags", timeout=timeout)
         return r.status_code == 200
     except Exception:
         return False
@@ -169,13 +174,21 @@ def rerank_hits(query: str, hits: list, top_k: int = 8,
     return sorted(hits, key=lambda h: -h.score)[:top_k]
 
 
-def cosine_top_k(query_vec: np.ndarray, mat: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
-    """Return (indices, scores) of top-k cosine similarities. mat is (N, D)."""
+def cosine_top_k(query_vec: np.ndarray, mat: np.ndarray, k: int,
+                 *, assume_normalized: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """Return (indices, scores) of top-k cosine similarities. mat is (N, D).
+
+    `assume_normalized=True` skips the per-row norm pass — pass it when
+    `mat` came from `Index.all_embeddings()`, which pre-normalizes rows
+    (saves a full O(N·D) sweep per query)."""
     if mat.size == 0 or k <= 0:
         return np.array([], dtype=np.int64), np.array([], dtype=np.float32)
     q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
-    norms = np.linalg.norm(mat, axis=1) + 1e-12
-    sims = (mat @ q) / norms
+    if assume_normalized:
+        sims = mat @ q
+    else:
+        norms = np.linalg.norm(mat, axis=1) + 1e-12
+        sims = (mat @ q) / norms
     k = min(k, sims.shape[0])
     if k <= 0:
         return np.array([], dtype=np.int64), np.array([], dtype=np.float32)

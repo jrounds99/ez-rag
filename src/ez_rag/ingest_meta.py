@@ -280,14 +280,7 @@ def load(file_path: Path,
 # Write
 # ============================================================================
 
-def _toml_str(v: str) -> str:
-    """Render a string for TOML. Single-quoted literal preserves
-    backslashes; double-quoted with escapes when value contains a
-    single quote."""
-    if "'" in v:
-        escaped = v.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
-    return f"'{v}'"
+from .toml_util import toml_str as _toml_str  # shared canonical impl
 
 
 def render_toml(md: FileMetadata) -> str:

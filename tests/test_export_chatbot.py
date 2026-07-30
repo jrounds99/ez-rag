@@ -135,11 +135,16 @@ def main():
         # ezrag_lib should be importable from the extracted root
         env = os.environ.copy()
         env["PYTHONPATH"] = str(extracted)
+        # Import EVERY vendored module (driven by the export's own list so
+        # this can't drift when _VENDORED_MODULES grows). Catches missing
+        # transitive vendored deps that lazy imports would hide until the
+        # exported server actually boots — e.g. multi_gpu -> toml_util.
+        from ez_rag.export import _VENDORED_MODULES
+        mods = ", ".join(
+            f"ezrag_lib.{m[:-3]}" for m in _VENDORED_MODULES
+        )
         rc = subprocess.run(
-            [sys.executable, "-c",
-             "import ezrag_lib.config, ezrag_lib.embed, ezrag_lib.generate, "
-             "ezrag_lib.index, ezrag_lib.retrieve; "
-             "print('ok')"],
+            [sys.executable, "-c", f"import {mods}; print('ok')"],
             env=env, capture_output=True, text=True, timeout=30,
         )
         check("vendored ezrag_lib imports cleanly",

@@ -69,7 +69,9 @@ def hybrid_search(
             f"the index{prev_str}, then retry the question."
         )
 
-    vec_idx, vec_scores = cosine_top_k(qvec, mat, fetch_n)
+    # mat rows come pre-normalized from the index's matrix cache.
+    vec_idx, vec_scores = cosine_top_k(qvec, mat, fetch_n,
+                                        assume_normalized=True)
     vec_chunk_ids = [ids[i] for i in vec_idx.tolist()]
     vec_scores_l = vec_scores.tolist()
 
@@ -119,6 +121,8 @@ def expand_to_chapter(
 
     seen_ids: dict[int, str] = {}     # file_id → chapter title already used
     chapters_by_file: dict[int, list[dict]] = {}
+    # One batched lookup instead of a per-hit SELECT (N+1 fix).
+    ords = index.ords_for(h.chunk_id for h in hits)
     for h in hits:
         if h.file_id not in chapters_by_file:
             chapters_by_file[h.file_id] = index.chapters_for_file(h.file_id)
@@ -126,13 +130,9 @@ def expand_to_chapter(
         if not chapters:
             continue
 
-        # Get the hit's ord from the chunks table.
-        row = index.conn.execute(
-            "SELECT ord FROM chunks WHERE id = ?", (h.chunk_id,),
-        ).fetchone()
-        if not row:
+        ord_ = ords.get(h.chunk_id)
+        if ord_ is None:
             continue
-        ord_ = row[0]
         ch = find_chapter(chapters, ord_)
         if ch is None:
             continue
@@ -206,21 +206,34 @@ def mmr_select(
     embedder: Embedder | None,
     top_k: int,
     lambda_: float = 0.5,
+    index: "Index | None" = None,
 ) -> list[Hit]:
     """Maximum Marginal Relevance — pick `top_k` hits that balance relevance
     (existing scores) with diversity (low pairwise similarity).
 
-    Falls back to relevance-only ordering if `embedder` is None or any
-    embedding step fails.
+    When `index` is given, diversity vectors come from the chunk embeddings
+    already stored in SQLite (one batched SELECT) instead of re-embedding
+    every hit text — which was one HTTP round-trip per hit with the Ollama
+    embedder. Falls back to the embedder for any hit without a stored
+    vector, and to relevance-only ordering if everything fails.
     """
     if len(hits) <= top_k:
         return hits
-    if embedder is None:
-        return hits[:top_k]
-    try:
-        embs = embedder.embed([h.text for h in hits])
-    except Exception:
-        return hits[:top_k]
+    embs = None
+    if index is not None:
+        try:
+            stored = index.embeddings_for(h.chunk_id for h in hits)
+            if all(h.chunk_id in stored for h in hits):
+                embs = [stored[h.chunk_id] for h in hits]
+        except Exception:
+            embs = None
+    if embs is None:
+        if embedder is None:
+            return hits[:top_k]
+        try:
+            embs = embedder.embed([h.text for h in hits])
+        except Exception:
+            return hits[:top_k]
     embs = np.asarray(embs, dtype=np.float32)
     norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12
     embs_n = embs / norms
@@ -489,6 +502,7 @@ def smart_retrieve(
             hits = mmr_select(
                 hits, embedder, top_k=cfg.top_k,
                 lambda_=getattr(cfg, "mmr_lambda", 0.5),
+                index=index,
             )
         elif diversify_n > 0:
             _emit("diversify")
@@ -544,6 +558,7 @@ def smart_retrieve(
         candidates = mmr_select(
             candidates, embedder, top_k=cfg.top_k,
             lambda_=getattr(cfg, "mmr_lambda", 0.5),
+            index=index,
         )
     elif diversify_n > 0:
         _emit("diversify")

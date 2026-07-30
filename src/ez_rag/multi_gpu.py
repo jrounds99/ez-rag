@@ -27,7 +27,6 @@ behavior wired up yet, just the data structures and file format.
 from __future__ import annotations
 
 import os
-import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -225,23 +224,7 @@ class RoutingTable:
 # ============================================================================
 
 # Match a fragment that needs escaping when written as a TOML basic string.
-_BASIC_NEEDS_ESCAPE = re.compile(r'[\x00-\x1f"\\]')
-
-
-def _toml_str(value: str) -> str:
-    """Render a string for the TOML output.
-
-    Prefers single-quoted *literal* strings (Windows paths and URLs
-    with backslashes round-trip cleanly). Falls back to double-quoted
-    when the value contains a literal single quote.
-    """
-    if "'" in value:
-        # Escape only what TOML basic-string syntax requires: \\, \"
-        # plus control chars. We keep this intentionally minimal so
-        # human-edited files stay readable.
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
-    return f"'{value}'"
+from .toml_util import toml_str as _toml_str  # shared canonical impl
 
 
 def _render_daemon(d: GpuDaemon) -> str:

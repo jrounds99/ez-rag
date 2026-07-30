@@ -608,6 +608,20 @@ class AppState:
     # outlive the dialog that started it. Surfaces in the header badge
     # and resyncs the dialog when reopened.
     active_pulls: dict = field(default_factory=dict)
+    # Cached Index for the open workspace. Constructing an Index per chat
+    # question re-ran connect + schema + migrations + dim-detect every
+    # send AND defeated the module-level embedding-matrix cache. Keyed by
+    # (db_path, embed_dim); reset when the workspace changes.
+    _idx_cache: dict = field(default_factory=dict)
+
+    def get_index(self, embed_dim: int) -> "Index":
+        key = (str(self.ws.meta_db_path), embed_dim)
+        idx = self._idx_cache.get(key)
+        if idx is None:
+            self._idx_cache.clear()      # one workspace at a time
+            idx = Index(self.ws.meta_db_path, embed_dim=embed_dim)
+            self._idx_cache[key] = idx
+        return idx
 
 
 # ============================================================================
@@ -1873,7 +1887,7 @@ def build_chat_view(state: AppState, *, refresh_status,
                 # retrieval entirely, sending the question straight to the LLM.
                 if state.cfg.use_rag:
                     embedder = make_embedder(state.cfg)
-                    idx = Index(state.ws.meta_db_path, embed_dim=embedder.dim)
+                    idx = state.get_index(embedder.dim)
 
                     def agent_status(msg):
                         # Surface agent steps in the streaming bubble while we
@@ -7081,6 +7095,7 @@ def app(page: ft.Page):
             ws.initialize()
         state.ws = ws
         state.cfg = ws.load_config()
+        state._idx_cache.clear()      # new workspace -> fresh Index
         add_recent(ws.root)
         clear_embedder_cache()
         # Multi-GPU routing: load this workspace's routing table and

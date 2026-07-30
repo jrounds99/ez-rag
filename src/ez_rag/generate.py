@@ -122,12 +122,7 @@ def _format_context(hits: list[Hit]) -> str:
 
 # ----- backend detection -----------------------------------------------------
 
-def _ollama_alive(url: str) -> bool:
-    try:
-        r = httpx.get(url.rstrip("/") + "/api/tags", timeout=1.5)
-        return r.status_code == 200
-    except Exception:
-        return False
+from .embed import _ollama_alive  # canonical liveness probe (dedup)
 
 
 def _llama_cpp_available() -> bool:

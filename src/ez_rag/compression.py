@@ -61,6 +61,19 @@ def maybe_compress_messages(cfg, messages: list[dict]) -> list[dict]:
     """
     if not getattr(cfg, "compress_context", False):
         return messages
+
+    # Cheap pre-gate: skip the whole headroom pipeline (import, tokenizer,
+    # relevance model) when the prompt is obviously below the min-tokens
+    # threshold anyway. ~4 chars/token is a safe UNDER-estimate divisor —
+    # if chars/4 already clears the bar we let headroom decide precisely.
+    min_tokens = int(getattr(cfg, "compress_context_min_tokens", 250) or 250)
+    approx_chars = sum(
+        len(m.get("content", "")) for m in messages
+        if isinstance(m.get("content"), str)
+    )
+    if approx_chars // 4 < min_tokens:
+        return messages
+
     compress = _resolve_compress_fn()
     if not compress:
         return messages

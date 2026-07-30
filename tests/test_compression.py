@@ -149,6 +149,34 @@ def test_stats_helper():
     _reset_cache()
 
 
+def test_tiny_prompt_pregate():
+    print("\n[8] tiny prompts skip headroom entirely (pre-gate)")
+    _reset_cache()
+
+    def _boom(messages, **kw):
+        raise AssertionError("headroom must not be invoked below min tokens")
+
+    compression._COMPRESS_FN = _boom
+    cfg = Config()
+    cfg.compress_context = True
+    cfg.compress_context_min_tokens = 250
+    tiny = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Question: hi?"},   # « 250 tokens
+    ]
+    out = compression.maybe_compress_messages(cfg, tiny)
+    check("tiny prompt returned unchanged", out is tiny)
+    # A prompt clearly over the bar must still reach the compressor.
+    called = {}
+    def _record(messages, **kw):
+        called["yes"] = True
+        return _FakeResult(messages)
+    compression._COMPRESS_FN = _record
+    out2 = compression.maybe_compress_messages(cfg, MESSAGES)
+    check("large prompt still reaches compressor", called.get("yes") is True)
+    _reset_cache()
+
+
 def test_config_roundtrip(tmp_path=None):
     print("\n[7] config round-trips compression fields")
     import tempfile
@@ -175,6 +203,7 @@ def main():
     test_fail_open_on_garbage()
     test_fail_open_when_missing()
     test_stats_helper()
+    test_tiny_prompt_pregate()
     test_config_roundtrip()
     print(f"\n=== compression summary: {len(PASS)} pass, {len(FAIL)} fail ===")
     for name, det in FAIL:

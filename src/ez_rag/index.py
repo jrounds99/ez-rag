@@ -82,6 +82,31 @@ class Hit:
     source_kind: str   # "vec" | "fts" | "hybrid"
 
 
+# ----- embedding-matrix cache -----------------------------------------------
+# The dense half of hybrid search needs the full (N, D) embedding matrix on
+# every query. Re-reading and deserializing every chunk BLOB per question is
+# O(corpus) — it dominated retrieval latency and ran once per sub-query under
+# multi-query / agentic retrieval. We keep a single-slot, module-level cache
+# of the L2-NORMALIZED matrix instead (single slot: one workspace's matrix in
+# RAM at a time, which matches how the GUI/CLI/bench actually run).
+#
+# Freshness = explicit invalidation from every mutating Index method, plus a
+# cheap (COUNT, MAX(id)) token check per lookup. The token alone is NOT
+# sufficient — SQLite reuses rowids, so replacing the most recently ingested
+# file can produce the same (count, max) with different vectors — which is
+# why the mutators call invalidate_matrix_cache() directly.
+_MATRIX_CACHE: dict[str, object] = {}
+
+
+def invalidate_matrix_cache(db_path: Path | str | None = None) -> None:
+    """Drop the cached embedding matrix.
+
+    Pass the db_path that changed (no-op if some other DB is cached), or
+    None to clear unconditionally."""
+    if db_path is None or _MATRIX_CACHE.get("key") == str(db_path):
+        _MATRIX_CACHE.clear()
+
+
 class Index:
     def __init__(self, db_path: Path, embed_dim: int):
         self.db_path = db_path
@@ -165,6 +190,7 @@ class Index:
                     for (ord_, page, section, text, tokens, vec) in chunks
                 ],
             )
+            invalidate_matrix_cache(self.db_path)
             return file_id
 
     def update_chunk_tokens(self, chunk_id: int, new_tokens: str) -> None:
@@ -234,11 +260,30 @@ class Index:
                 "DELETE FROM files WHERE id = ?",
                 [(i,) for i in ids_to_drop],
             )
+        invalidate_matrix_cache(self.db_path)
         return len(ids_to_drop)
 
     # ----- search ----------------------------------------------------------
 
+    def _chunks_token(self) -> tuple:
+        """Cheap freshness token for the matrix cache (two indexed lookups)."""
+        row = self.conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM chunks"
+        ).fetchone()
+        return (row[0], row[1])
+
     def all_embeddings(self) -> tuple[np.ndarray, list[int]]:
+        """Return (matrix, chunk_ids) for the dense search.
+
+        The matrix rows are L2-NORMALIZED float32 (callers should pass
+        `assume_normalized=True` to `cosine_top_k`) and the result is
+        cached between queries — see `_MATRIX_CACHE` above.
+        """
+        key = str(self.db_path)
+        token = self._chunks_token()
+        if (_MATRIX_CACHE.get("key") == key
+                and _MATRIX_CACHE.get("token") == token):
+            return _MATRIX_CACHE["mat"], _MATRIX_CACHE["ids"]  # type: ignore[return-value]
         rows = self.conn.execute(
             "SELECT id, embedding FROM chunks"
         ).fetchall()
@@ -246,7 +291,37 @@ class Index:
             return np.zeros((0, self.embed_dim), dtype=np.float32), []
         ids = [r[0] for r in rows]
         mat = np.stack([_from_blob(r[1], self.embed_dim) for r in rows])
+        norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
+        mat = np.ascontiguousarray(mat / norms, dtype=np.float32)
+        _MATRIX_CACHE.clear()
+        _MATRIX_CACHE.update(key=key, token=token, mat=mat, ids=ids)
         return mat, ids
+
+    def embeddings_for(self, ids: Iterable[int]) -> dict[int, np.ndarray]:
+        """Fetch stored (raw, unnormalized) vectors for specific chunk ids.
+
+        Used by MMR so it can diversify over vectors that already exist in
+        the index instead of re-embedding hit texts (which was one HTTP
+        round-trip per hit with the Ollama embedder)."""
+        ids = [int(i) for i in ids]
+        if not ids:
+            return {}
+        q = (f"SELECT id, embedding FROM chunks "
+             f"WHERE id IN ({','.join('?' * len(ids))})")
+        return {
+            r[0]: _from_blob(r[1], self.embed_dim)
+            for r in self.conn.execute(q, ids).fetchall()
+        }
+
+    def ords_for(self, ids: Iterable[int]) -> dict[int, int]:
+        """Batched chunk_id -> ord lookup (replaces a per-hit N+1 query in
+        chapter expansion)."""
+        ids = [int(i) for i in ids]
+        if not ids:
+            return {}
+        q = (f"SELECT id, ord FROM chunks "
+             f"WHERE id IN ({','.join('?' * len(ids))})")
+        return dict(self.conn.execute(q, ids).fetchall())
 
     def get_chunks(self, ids: Iterable[int]) -> list[Hit]:
         ids = list(ids)

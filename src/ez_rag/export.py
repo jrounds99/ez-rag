@@ -33,6 +33,7 @@ _VENDORED_MODULES = [
     "index.py",
     "multi_gpu.py",  # resolve_url() — chat-time URL routing
     "retrieve.py",
+    "toml_util.py",  # shared TOML quoting — imported by multi_gpu
 ]
 
 
