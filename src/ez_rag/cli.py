@@ -634,6 +634,100 @@ def scan_cmd(
         )
 
 
+@app.command("preset")
+def preset_cmd(
+    preset_id: Optional[str] = typer.Argument(
+        None,
+        help="Preset id. Omit to list all presets. "
+             "Give an id alone for the full explanation ('more info'); "
+             "add --apply to write it into this workspace's config.",
+    ),
+    apply: bool = typer.Option(
+        False, "--apply",
+        help="Apply the preset to the current workspace's config.toml.",
+    ),
+):
+    """Benchmark-backed setting bundles: list, explain, or apply.
+
+    \b
+      ez-rag preset                 list presets
+      ez-rag preset balanced        full details for one preset
+      ez-rag preset balanced --apply   write it to config
+    """
+    from .presets import PRESETS, apply_preset, get_preset
+
+    if preset_id is None:
+        t = Table(title="ez-rag presets (all numbers from this repo's benchmarks)")
+        t.add_column("id", style="bold")
+        t.add_column("name")
+        t.add_column("what it optimizes")
+        t.add_column("~VRAM", justify="right")
+        for p in PRESETS:
+            t.add_row(p.id, p.name, p.tagline, f"{p.requires_vram_gb} GB")
+        console.print(t)
+        console.print(
+            "\n[dim]More info: ez-rag preset <id>   ·   "
+            "Apply: ez-rag preset <id> --apply[/dim]"
+        )
+        return
+
+    p = get_preset(preset_id)
+    if p is None:
+        console.print(f"[red]Unknown preset '{preset_id}'.[/red] "
+                      f"Available: {', '.join(x.id for x in PRESETS)}")
+        raise typer.Exit(1)
+
+    if not apply:
+        console.print(Panel(
+            f"[bold]{p.name}[/bold]\n[dim]{p.tagline}[/dim]\n\n{p.details}",
+            title=f"preset · {p.id}",
+        ))
+        st = Table(title="settings this preset writes")
+        st.add_column("field"); st.add_column("value")
+        for k, v in p.settings.items():
+            st.add_row(k, repr(v))
+        console.print(st)
+        console.print(f"\n[dim]Apply with: ez-rag preset {p.id} --apply[/dim]")
+        return
+
+    ws = require_workspace()
+    cfg = ws.load_config()
+    changed = apply_preset(cfg, p.id)
+    cfg.save(ws.config_path)
+    if changed:
+        t = Table(title=f"applied preset '{p.id}'")
+        t.add_column("field"); t.add_column("was"); t.add_column("now")
+        for k, old, new in changed:
+            t.add_row(k, repr(old), repr(new))
+        console.print(t)
+    else:
+        console.print(f"[green]Config already matches preset '{p.id}'.[/green]")
+
+    # Best-effort: tell the user which models still need pulling.
+    try:
+        import httpx as _hx
+        r = _hx.get(cfg.llm_url.rstrip("/") + "/api/tags", timeout=3.0)
+        installed = {m.get("name", "") for m in r.json().get("models", [])}
+        missing = [m for m in p.models_needed
+                   if m not in installed and (m + ":latest") not in installed]
+        if missing:
+            console.print(
+                "\n[yellow]Models not installed yet:[/yellow] "
+                + ", ".join(missing)
+                + "\n[dim]Pull with: "
+                + "  ·  ".join(f"ollama pull {m}" for m in missing)
+                + "[/dim]"
+            )
+    except Exception:
+        pass
+    if p.settings.get("compress_context"):
+        console.print(
+            "[dim]This preset enables context compression — install with "
+            "pip install \"ez-rag[compress]\" (it no-ops safely if "
+            "missing).[/dim]"
+        )
+
+
 def main():  # pragma: no cover
     app()
 

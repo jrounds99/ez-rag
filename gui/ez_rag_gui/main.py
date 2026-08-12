@@ -4044,6 +4044,116 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
             ),
         )
 
+    def _build_presets_card(_state: AppState) -> ft.Control:
+        """Benchmark-backed setting bundles. Applying a preset fills the
+        form fields (via load_from_cfg) but does NOT save — the user
+        reviews and clicks Save settings, same as manual edits."""
+        from ez_rag.presets import PRESETS, apply_preset, get_preset
+
+        tagline = ft.Text(PRESETS[0].tagline, size=11,
+                          color=ON_SURFACE_DIM, italic=True)
+        # Inline expandable "More info" — full details + the exact
+        # fields the preset writes. Hidden until requested.
+        details_text = ft.Text("", size=11, color=ON_SURFACE_DIM,
+                               selectable=True)
+        details_box = ft.Container(
+            visible=False, padding=10, border_radius=8,
+            bgcolor="#00000022",
+            content=ft.Column([details_text], spacing=4,
+                              scroll=ft.ScrollMode.AUTO),
+            height=260,
+        )
+        status_text = ft.Text("", size=11, color=ON_SURFACE_DIM, italic=True)
+
+        dd = ft.Dropdown(
+            label="Preset",
+            value=PRESETS[0].id,
+            options=[ft.dropdown.Option(p.id, p.name) for p in PRESETS],
+            width=280, dense=True,
+            tooltip="Setting bundles derived from this repo's benchmarks "
+                    "(23 models × 3 embedders × 20 questions, plus the "
+                    "compression bench). Pick an intent; every number in "
+                    "More info is a measured result.",
+        )
+
+        def _sync(_=None):
+            p = get_preset(dd.value or "")
+            if p:
+                tagline.value = p.tagline
+                if details_box.visible:
+                    _fill_details(p)
+            page.update()
+
+        def _fill_details(p):
+            fields = "\n".join(f"    {k} = {v!r}"
+                               for k, v in p.settings.items())
+            models = ", ".join(p.models_needed)
+            details_text.value = (
+                f"{p.details}\n\n"
+                f"SETTINGS THIS PRESET WRITES\n{fields}\n\n"
+                f"MODELS NEEDED (pull via Settings → Browse Ollama "
+                f"library, or `ollama pull …`): {models}\n"
+                f"Approx. VRAM: {p.requires_vram_gb} GB"
+            )
+
+        def toggle_info(_):
+            p = get_preset(dd.value or "")
+            if p is None:
+                return
+            details_box.visible = not details_box.visible
+            if details_box.visible:
+                _fill_details(p)
+            page.update()
+
+        def apply_clicked(_):
+            p = get_preset(dd.value or "")
+            if p is None:
+                return
+            changed = apply_preset(_state.cfg, p.id)
+            # Repopulate the form so the user SEES what the preset set,
+            # then let them commit with the normal Save settings button.
+            try:
+                load_from_cfg()
+            except Exception:
+                pass
+            if changed:
+                names = ", ".join(k for k, _, _ in changed)
+                status_text.value = (
+                    f"Preset '{p.id}' filled {len(changed)} field(s): "
+                    f"{names}. Review above, then click Save settings."
+                )
+            else:
+                status_text.value = f"Config already matches '{p.id}'."
+            page.update()
+
+        dd.on_change = _sync
+
+        return section_card(
+            "PRESETS — BENCHMARK-BACKED BUNDLES",
+            ft.Row([
+                ft.Icon(ft.Icons.TUNE, size=16, color=ACCENT),
+                ft.Text("One choice instead of twenty knobs", size=11,
+                        color=ON_SURFACE_DIM, weight=ft.FontWeight.W_700),
+            ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            dd,
+            tagline,
+            ft.Row([
+                ft.FilledButton("Apply preset", icon=ft.Icons.CHECK,
+                                on_click=apply_clicked,
+                                bgcolor=ACCENT, color="#FFFFFF",
+                                tooltip="Fill the settings form with this "
+                                        "preset's values. Nothing is saved "
+                                        "until you click Save settings."),
+                ft.TextButton("More info", icon=ft.Icons.INFO_OUTLINE,
+                              on_click=toggle_info,
+                              tooltip="Full rationale: which benchmark "
+                                      "produced these numbers, what's "
+                                      "on/off, and the trade-offs."),
+            ], spacing=8),
+            details_box,
+            status_text,
+        )
+
     def _build_storage_card(_state: AppState) -> ft.Control:
         path_text = ft.Text(
             str(get_default_rags_dir()),
@@ -5995,6 +6105,16 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                     ft.Container(
                         expand=1,
                         content=_build_storage_card(state),
+                    ),
+                ],
+                spacing=14,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            ),
+            ft.Row(
+                [
+                    ft.Container(
+                        expand=1,
+                        content=_build_presets_card(state),
                     ),
                 ],
                 spacing=14,

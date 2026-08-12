@@ -81,6 +81,8 @@ ez-rag serve                  OpenAI-compatible HTTP endpoint on :11533
 ez-rag doctor                 diagnose env (GPU, OCR, Ollama, deps)
 ez-rag reindex                re-chunk/re-embed without re-parsing
 ez-rag help <topic>           offline manual pages
+ez-rag preset                 benchmark-backed setting bundles
+                              (preset <id> for details, --apply to use)
 ```
 
 Topics for `ez-rag help`: `getting-started`, `workflow`, `ingestion`, `retrieval`, `models`, `chat`, `gui`, `ocr`, `cli`.

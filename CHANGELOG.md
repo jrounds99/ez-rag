@@ -28,6 +28,25 @@ chunker version so toggling re-ingests affected files):**
   skipped at ingest. Within-file only, so deleting one file can never
   orphan another file's content. Original ords preserved.
 
+**New — presets (benchmark-backed setting bundles):**
+
+- `src/ez_rag/presets.py` + `ez-rag preset` CLI + a Settings-tab card
+  in the GUI. Four bundles, every number traceable to this repo's own
+  benchmarks (Ohio 23×3×20 sweep, compression bench, retrieval matrix):
+  - **balanced** — granite3.3:2b + bge-m3 (10.95/12, best measured
+    quality per GB; ~4 GB)
+  - **factual** — deepseek-r1:32b (78% gold-truth, best factual
+    accuracy measured; ~24 GB)
+  - **light** — llama3.2:3b + nomic + compression ON (best sub-4 GB
+    quality; compression halves KV-cache where VRAM hurts most)
+  - **deep-context** — top_k 16 + neighbor windows + compression
+    (wide-evidence questions over long documents)
+  Each preset carries a detailed "more info" explanation (CLI:
+  `ez-rag preset <id>`; GUI: More info expander) covering why, the
+  measured numbers, and the trade-offs. Applying only fills config
+  fields — review + Save in the GUI, `--apply` in the CLI; missing
+  models are listed with their `ollama pull` commands.
+
 **New (experimental option):**
 
 - **Selectable PDF backend** (`pdf_backend = "auto" | "marker" | "docling"`,
