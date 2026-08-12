@@ -216,6 +216,40 @@ def main():
         P._parse_pdf_marker = saved_marker
         P.set_pdf_backend("auto")
 
+    print("\n[10] pptx parser")
+    try:
+        from pptx import Presentation
+        from pptx.util import Inches
+        from ez_rag.parsers import parse_pptx, get_parser
+        prs = Presentation()
+        s1 = prs.slides.add_slide(prs.slide_layouts[1])
+        s1.shapes.title.text = "Ohio Geology"
+        s1.placeholders[1].text = "Limestone dominates"
+        s1.notes_slide.notes_text_frame.text = "Founded 1837 under Mather."
+        s2 = prs.slides.add_slide(prs.slide_layouts[5])
+        s2.shapes.title.text = "Data"
+        tb = s2.shapes.add_table(2, 2, Inches(1), Inches(2),
+                                  Inches(4), Inches(1)).table
+        tb.cell(0, 0).text = "commodity"; tb.cell(0, 1).text = "value"
+        tb.cell(1, 0).text = "limestone"; tb.cell(1, 1).text = "$890M"
+        import tempfile as _tf
+        deck = Path(_tf.mkdtemp(prefix="ezrag_pptx_")) / "d.pptx"
+        prs.save(str(deck))
+        secs = parse_pptx(deck)
+        check("pptx registered", get_parser(deck) is not None)
+        check("slide sections with page numbers",
+              all(s.page in (1, 2) for s in secs) and len(secs) == 3,
+              f"{[(s.page, s.section) for s in secs]}")
+        check("table emitted as kind=table",
+              any((s.meta or {}).get("kind") == "table"
+                  and "limestone | $890M" in s.text for s in secs))
+        check("speaker notes captured",
+              any("1837" in s.text for s in secs))
+        check("slide title becomes section label",
+              any(s.section == "Slide 1: Ohio Geology" for s in secs))
+    except ImportError:
+        check("pptx test skipped (python-pptx missing)", True)
+
     print(f"\n=== ingest-quality summary: {len(PASS)} pass, {len(FAIL)} fail ===")
     for name, det in FAIL:
         print(f"  FAIL  {name} :: {det}")

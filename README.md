@@ -46,7 +46,7 @@ ez-rag chat                       # or interactive
 
 ## Supported file types
 
-PDF (text + scanned with OCR fallback) · DOCX · XLSX · CSV · HTML · MD · TXT / RST / LOG · EPUB · EML · PNG / JPG / WEBP / TIFF / BMP (OCR'd).
+PDF (text + scanned with OCR fallback) · DOCX · **PPTX** (slides, tables, speaker notes) · XLSX / XLSM · CSV / TSV · HTML · MD · TXT / RST / LOG · EPUB · EML · PNG / JPG / WEBP / TIFF / BMP (OCR'd).
 
 ## Terminology
 

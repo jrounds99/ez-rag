@@ -568,6 +568,68 @@ def parse_docx(path: Path) -> list[ParsedSection]:
     return sections
 
 
+# ----- PPTX ------------------------------------------------------------------
+
+@register(".pptx")
+def parse_pptx(path: Path) -> list[ParsedSection]:
+    """One section per slide: title becomes the section label, body text
+    frames in order, tables emitted as their own `kind=table` sections
+    (so the chunker keeps rows atomic), speaker notes appended last —
+    they often carry the sentence that explains the bullet points."""
+    try:
+        from pptx import Presentation  # type: ignore  (python-pptx)
+    except ImportError as e:
+        raise RuntimeError(
+            "python-pptx not installed; required for PPTX") from e
+    prs = Presentation(str(path))
+    sections: list[ParsedSection] = []
+    for i, slide in enumerate(prs.slides, start=1):
+        title = ""
+        try:
+            if slide.shapes.title is not None:
+                title = (slide.shapes.title.text or "").strip()
+        except Exception:
+            pass
+        label = f"Slide {i}" + (f": {title}" if title else "")
+
+        body: list[str] = []
+        tables: list[list[str]] = []
+        for shape in slide.shapes:
+            if getattr(shape, "has_table", False):
+                rows = []
+                for row in shape.table.rows:
+                    rows.append(" | ".join(
+                        (cell.text or "").strip() for cell in row.cells))
+                if rows:
+                    tables.append(rows)
+                continue
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            for para in shape.text_frame.paragraphs:
+                text = "".join(run.text for run in para.runs).strip()
+                if text and text != title:
+                    body.append(text)
+
+        notes = ""
+        try:
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                notes = (slide.notes_slide.notes_text_frame.text or "").strip()
+        except Exception:
+            pass
+        if notes:
+            body.append(f"[Speaker notes] {notes}")
+
+        text = _normalize("\n".join(([f"# {title}"] if title else []) + body))
+        if text:
+            sections.append(ParsedSection(
+                text=text, page=i, section=label))
+        for rows in tables:
+            sections.append(ParsedSection(
+                text=_normalize("\n".join(rows)), page=i,
+                section=label, meta={"kind": "table"}))
+    return sections
+
+
 # ----- XLSX / CSV ------------------------------------------------------------
 
 @register(".xlsx", ".xlsm")

@@ -28,6 +28,17 @@ chunker version so toggling re-ingests affected files):**
   skipped at ingest. Within-file only, so deleting one file can never
   orphan another file's content. Original ords preserved.
 
+**New — PPTX ingestion:**
+
+- PowerPoint (`.pptx`) parser via `python-pptx` (MIT, new core
+  dependency alongside python-docx/openpyxl). One section per slide
+  with the title as the section label and the slide number as the
+  page (so citations read "Slide 4: Production Data"); tables emitted
+  as `kind=table` sections (row-atomic chunking, header carry);
+  speaker notes captured — they often hold the sentence that explains
+  the bullets. Verified end-to-end: deck → ingest → retrieval finds
+  notes-only facts.
+
 **New — presets (benchmark-backed setting bundles):**
 
 - `src/ez_rag/presets.py` + `ez-rag preset` CLI + a Settings-tab card
