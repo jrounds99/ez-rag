@@ -211,6 +211,15 @@ def _ingest_impl(
     if getattr(cfg, "dedup_chunks", True):
         eff_chunker_version += "+dedup"
 
+    # Experimental PDF backend (marker / docling). Folded into the
+    # effective parser version so switching backends re-ingests PDFs.
+    from .parsers import pop_pdf_backend_fallbacks, set_pdf_backend
+    pdf_backend = (getattr(cfg, "pdf_backend", "auto") or "auto").lower()
+    set_pdf_backend(pdf_backend)
+    eff_parser_version = PARSER_VERSION
+    if pdf_backend != "auto":
+        eff_parser_version += f"+{pdf_backend}"
+
 
     bytes_done = 0
     files_done = 0
@@ -465,7 +474,7 @@ def _ingest_impl(
                 and (not existing.embedder
                      or existing.embedder == embedder.name)
                 and (not existing.parser_version
-                     or existing.parser_version == PARSER_VERSION)
+                     or existing.parser_version == eff_parser_version)
                 and (not existing.chunker_version
                      or existing.chunker_version == eff_chunker_version)
             )
@@ -499,7 +508,7 @@ def _ingest_impl(
                 index.replace_file(
                     path=rel, sha256=sha, bytes_=file_size,
                     mtime=path.stat().st_mtime,
-                    parser_version=PARSER_VERSION,
+                    parser_version=eff_parser_version,
                     chunker_version=eff_chunker_version,
                     embedder=embedder.name,
                     chunks=[],
@@ -603,6 +612,12 @@ def _ingest_impl(
             # After parse completes, give the user a "what we got" line so
             # they can see the file actually had content before chunking
             # starts. Useful for big PDFs that took minutes to parse.
+            for _fb_path, _fb_reason in pop_pdf_backend_fallbacks():
+                _emit(progress, snapshot(
+                    current_path=rel,
+                    status=(f"{pdf_backend} backend failed "
+                            f"({_fb_reason[:80]}) — used built-in parser"),
+                ))
             sec_summary = f"{len(sections)} section(s)"
             if any(s.page is not None for s in sections):
                 pages = sorted({s.page for s in sections if s.page is not None})
@@ -987,7 +1002,7 @@ def _ingest_impl(
                 sha256=sha,
                 bytes_=file_size,
                 mtime=path.stat().st_mtime,
-                parser_version=PARSER_VERSION,
+                parser_version=eff_parser_version,
                 chunker_version=eff_chunker_version,
                 embedder=embedder.name,
                 chunks=rows,

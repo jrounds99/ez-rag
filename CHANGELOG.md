@@ -28,6 +28,19 @@ chunker version so toggling re-ingests affected files):**
   skipped at ingest. Within-file only, so deleting one file can never
   orphan another file's content. Original ords preserved.
 
+**New (experimental option):**
+
+- **Selectable PDF backend** (`pdf_backend = "auto" | "marker" | "docling"`,
+  default `"auto"` = built-in pypdf + OCR). Routes PDFs through an ML
+  layout parser — much stronger on scanned/tabular documents. Libraries
+  are user-installed (`pip install marker-pdf` / `pip install docling`);
+  fail-open per file with a status line when the backend is missing or
+  errors. The backend is folded into parser provenance, so switching
+  re-ingests PDFs automatically. **License note:** marker's model
+  weights are OpenRAIL-M — free for personal research, revenue-capped
+  for commercial use; acceptable per the project's personal-use license
+  policy (see docs/INGEST_RESEARCH.md), never shipped as a dependency.
+
 **Fixed (audit findings):**
 
 - **S1 — mixed-embedder index**: the skip logic compared only sha256, so

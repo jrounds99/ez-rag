@@ -207,6 +207,87 @@ def _text_looks_garbled(text: str) -> bool:
     return False
 
 
+# ----- optional ML PDF backends (experimental) ------------------------------
+# `pdf_backend = "marker" | "docling"` in config routes PDFs through an
+# ML layout parser instead of the built-in pypdf+OCR pipeline. Both are
+# heavy, user-installed extras (see docs/INGEST_RESEARCH.md, including
+# the license note — marker's weights are OpenRAIL-M, free for personal
+# research but revenue-capped commercially). Fail-open: missing library
+# or a conversion error falls back to the built-in parser, and ingest
+# surfaces the reason via pop_pdf_backend_fallbacks().
+
+_PDF_BACKEND = "auto"
+_BACKEND_FALLBACKS: list[tuple[str, str]] = []   # (path, reason)
+_MARKER_CONVERTER = None
+_DOCLING_CONVERTER = None
+
+
+def set_pdf_backend(name: str) -> None:
+    """Select the PDF backend: 'auto' (built-in), 'marker', 'docling'."""
+    global _PDF_BACKEND
+    _PDF_BACKEND = (name or "auto").strip().lower()
+
+
+def get_pdf_backend() -> str:
+    return _PDF_BACKEND
+
+
+def pop_pdf_backend_fallbacks() -> list[tuple[str, str]]:
+    """Drain (path, reason) pairs for files where the selected ML backend
+    failed and the built-in parser was used instead."""
+    out = list(_BACKEND_FALLBACKS)
+    _BACKEND_FALLBACKS.clear()
+    return out
+
+
+def _markdown_to_sections(md: str, parser_name: str) -> list[ParsedSection]:
+    """Split backend markdown into sections at headings so chunk headers
+    and chapter detection keep working."""
+    sections: list[ParsedSection] = []
+    cur_title = ""
+    cur_lines: list[str] = []
+
+    def flush():
+        text = "\n".join(cur_lines).strip()
+        if text:
+            sections.append(ParsedSection(
+                text=text, section=cur_title,
+                meta={"parser": parser_name},
+            ))
+
+    for line in md.splitlines():
+        if line.lstrip().startswith("#"):
+            flush()
+            cur_title = line.lstrip("# ").strip()
+            cur_lines = [line]
+        else:
+            cur_lines.append(line)
+    flush()
+    return sections
+
+
+def _parse_pdf_marker(path: Path) -> list[ParsedSection]:
+    global _MARKER_CONVERTER
+    if _MARKER_CONVERTER is None:
+        from marker.converters.pdf import PdfConverter    # type: ignore
+        from marker.models import create_model_dict       # type: ignore
+        _MARKER_CONVERTER = PdfConverter(artifact_dict=create_model_dict())
+    from marker.output import text_from_rendered          # type: ignore
+    rendered = _MARKER_CONVERTER(str(path))
+    text, _, _ = text_from_rendered(rendered)
+    return _markdown_to_sections(text, "marker")
+
+
+def _parse_pdf_docling(path: Path) -> list[ParsedSection]:
+    global _DOCLING_CONVERTER
+    if _DOCLING_CONVERTER is None:
+        from docling.document_converter import DocumentConverter  # type: ignore
+        _DOCLING_CONVERTER = DocumentConverter()
+    result = _DOCLING_CONVERTER.convert(str(path))
+    md = result.document.export_to_markdown()
+    return _markdown_to_sections(md, "docling")
+
+
 @register(".pdf")
 def parse_pdf(path: Path, on_progress=None, on_recovery=None,
               permissive: bool = False) -> list[ParsedSection]:
@@ -230,6 +311,21 @@ def parse_pdf(path: Path, on_progress=None, on_recovery=None,
     pass and drop them only if the LLM also fails. Default False
     preserves the original "drop poison upstream" behavior.
     """
+    # Experimental ML backend dispatch (see set_pdf_backend above).
+    if _PDF_BACKEND in ("marker", "docling"):
+        try:
+            if _PDF_BACKEND == "marker":
+                sections = _parse_pdf_marker(path)
+            else:
+                sections = _parse_pdf_docling(path)
+            if sections:
+                return sections
+            _BACKEND_FALLBACKS.append(
+                (str(path), f"{_PDF_BACKEND} produced no text"))
+        except Exception as ex:
+            _BACKEND_FALLBACKS.append(
+                (str(path), f"{type(ex).__name__}: {ex}"))
+        # fall through to the built-in pipeline
     try:
         from pypdf import PdfReader  # type: ignore
     except ImportError as e:

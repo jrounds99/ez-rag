@@ -181,6 +181,41 @@ def main():
              for c in chunk_sections(secs, chunk_tokens=128, overlap_tokens=0))
     check("no forced overlap floor", w0 == 300, f"{w0} words")
 
+    print("\n[9] pdf_backend dispatch + fail-open")
+    from ez_rag import parsers as P
+    sentinel = [ParsedSection(text="from-marker", meta={"parser": "marker"})]
+    saved_marker = P._parse_pdf_marker
+    try:
+        # Backend selected + working -> its sections come back verbatim
+        # (nonexistent path proves the built-in pipeline was never touched).
+        P._parse_pdf_marker = lambda path: sentinel
+        P.set_pdf_backend("marker")
+        out = P.parse_pdf(Path("Z:/definitely/not/a/real.pdf"))
+        check("selected backend short-circuits", out is sentinel)
+        # Backend raising (e.g. library not installed) -> falls back to the
+        # built-in parser, which raises on the missing file — and the
+        # failure is recorded for ingest to surface.
+        P._parse_pdf_marker = saved_marker   # real impl: marker not installed
+        P.pop_pdf_backend_fallbacks()
+        try:
+            P.parse_pdf(Path("Z:/definitely/not/a/real.pdf"))
+            builtin_reached = True   # (unlikely: builtin returned something)
+        except Exception:
+            builtin_reached = True   # builtin raised on missing file = reached
+        fallbacks = P.pop_pdf_backend_fallbacks()
+        check("missing library -> fail-open to built-in",
+              builtin_reached and len(fallbacks) == 1,
+              f"fallbacks={fallbacks}")
+        # markdown -> sections splitter keeps headings as section labels
+        md = "# Title\nintro\n## Sub\nbody text"
+        secs_md = P._markdown_to_sections(md, "docling")
+        check("markdown split keeps headings",
+              [s.section for s in secs_md] == ["Title", "Sub"],
+              f"{[s.section for s in secs_md]}")
+    finally:
+        P._parse_pdf_marker = saved_marker
+        P.set_pdf_backend("auto")
+
     print(f"\n=== ingest-quality summary: {len(PASS)} pass, {len(FAIL)} fail ===")
     for name, det in FAIL:
         print(f"  FAIL  {name} :: {det}")

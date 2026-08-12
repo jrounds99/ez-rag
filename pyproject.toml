@@ -44,6 +44,11 @@ dev = ["pytest>=8", "pytest-timeout>=2"]
 # transformers for the relevance model) so it's strictly opt-in. ez-rag
 # fails open without it. See src/ez_rag/compression.py and docs/COMPRESSION.md.
 compress = ["headroom-ai>=0.20"]
+# Experimental ML PDF parsers (select with `pdf_backend` in config).
+# docling: MIT/permissive. marker: OpenRAIL-M weights — free for personal
+# research, revenue-capped commercially; see docs/INGEST_RESEARCH.md.
+docling = ["docling>=2"]
+marker = ["marker-pdf>=1.2"]
 all = ["ez-rag[ocr,gui,llm]"]
 
 [tool.pytest.ini_options]

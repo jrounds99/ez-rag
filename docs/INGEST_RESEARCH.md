@@ -26,12 +26,31 @@ retrieval stacks.
 
 ## Document parsing
 
+> **License policy note (project owner decision, 2026-08):** ez-rag is a
+> personal research tool, not a commercial product. License conditions
+> that only bite on commercial use or redistribution (revenue-capped
+> weights, copyleft) are **acceptable for optional, user-installed
+> extras** and are documented here rather than treated as
+> disqualifying. Two boundaries still hold: everything must be free to
+> use at this project's scale, and nothing non-permissive ships as a
+> hard dependency of the Apache-2.0 core — these tools are only ever
+> installed explicitly by the user, keeping the repo itself cleanly
+> licensed.
+
 | Tool | Verdict | Why |
 |---|---|---|
-| **Docling** (IBM) | **TRIAL** | MIT, CPU-capable layout + TableFormer models, RapidOCR backend ([arXiv 2501.17887](https://arxiv.org/pdf/2501.17887)). Clearly stronger than pypdf on tabular/scanned PDFs; heavy (PyTorch) → belongs behind an `ez-rag[docling]` extra. Bench on your worst PDFs before adopting. |
-| marker | SKIP | Fastest/most accurate in [2026 comparisons](https://themenonlab.blog/blog/best-open-source-pdf-to-markdown-tools-2026), but OpenRAIL-M weights with a commercial cap — fails the permissive-license constraint. |
-| MinerU | SKIP | Custom license + heavy. |
-| surya | SKIP | GPL-3. |
+| **marker** | **TRIAL** (available: `pdf_backend = "marker"`) | Fastest/most accurate in [2026 comparisons](https://themenonlab.blog/blog/best-open-source-pdf-to-markdown-tools-2026). Weights are OpenRAIL-M with a commercial revenue cap — free for personal research per the policy note; review only if output ever feeds a commercial product. Heavy (PyTorch). `pip install marker-pdf`, then set `pdf_backend = "marker"`. |
+| **Docling** (IBM) | **TRIAL** (available: `pdf_backend = "docling"`) | MIT code, permissive models, CPU-capable layout + TableFormer, RapidOCR backend ([arXiv 2501.17887](https://arxiv.org/pdf/2501.17887)). Clearly stronger than pypdf on tabular/scanned PDFs; the cleanest-licensed of the ML parsers. `pip install docling`, then set `pdf_backend = "docling"`. |
+| surya | possible | GPL-3 — fine for personal use as a user-installed extra. It's the engine underneath marker, so trial marker instead of using it directly. |
+| MinerU | SKIP | Custom license + heavy, with no evidence it beats marker/Docling on our document types. |
+
+Both alternative backends are wired into ez-rag as **experimental
+options** (config `pdf_backend = "auto" | "marker" | "docling"`,
+default `"auto"` = the built-in pypdf + OCR pipeline). They fail open:
+if the library isn't installed or a conversion errors, the file falls
+back to the built-in parser and a status line says so. Switching
+backends re-ingests PDFs automatically (backend is part of parser
+provenance).
 
 ## Embedding & indexing
 

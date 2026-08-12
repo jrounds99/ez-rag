@@ -147,6 +147,15 @@ class Config:
     # changes the effective chunker version, so affected files re-ingest
     # on the next run.
     chunk_headers: bool = True
+    # Experimental PDF parsing backend: "auto" = built-in pypdf + OCR
+    # pipeline; "marker" or "docling" route PDFs through an ML layout
+    # parser (much better on scanned/tabular PDFs; heavy — install the
+    # library yourself: `pip install marker-pdf` or `pip install docling`).
+    # Fail-open: missing library or a conversion error falls back to the
+    # built-in parser per file. NOTE marker's model weights are OpenRAIL-M
+    # (free for personal research, revenue-capped commercially) — see the
+    # license note in docs/INGEST_RESEARCH.md.
+    pdf_backend: str = "auto"
     # Within-file duplicate-chunk removal (normalized exact match). Kills
     # repeated page headers/footers and boilerplate that poison top-k
     # diversity. Within-file only — cross-file dedup could lose content
