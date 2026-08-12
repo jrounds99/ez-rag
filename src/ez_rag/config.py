@@ -138,6 +138,21 @@ class Config:
     # are applied post-retrieval.
     use_file_metadata: bool = True
 
+    # --- Ingest quality (2026-08 research adoptions; see
+    # docs/INGEST_RESEARCH.md) -------------------------------------------
+    # Contextual chunk headers: prepend "[<doc> › <section>]" (+ sidecar
+    # title/topics when a .ezrag-meta.toml exists) to every chunk before
+    # embedding. The cheap variant of contextual retrieval — most of the
+    # measured failure reduction at zero per-chunk LLM cost. Toggling
+    # changes the effective chunker version, so affected files re-ingest
+    # on the next run.
+    chunk_headers: bool = True
+    # Within-file duplicate-chunk removal (normalized exact match). Kills
+    # repeated page headers/footers and boilerplate that poison top-k
+    # diversity. Within-file only — cross-file dedup could lose content
+    # when the file holding the surviving copy is later deleted.
+    dedup_chunks: bool = True
+
     # Context compression (optional, off by default) — when True and the
     # `headroom-ai` package is installed, retrieved context is compressed
     # before it is sent to the LLM. Fail-open: if headroom is missing or

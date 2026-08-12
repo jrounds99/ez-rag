@@ -493,6 +493,7 @@ def parse_xlsx(path: Path) -> list[ParsedSection]:
             sections.append(ParsedSection(
                 text=_normalize("\n".join(rows)),
                 section=sheet_name,
+                meta={"kind": "table"},   # chunker keeps rows atomic
             ))
     return sections
 
@@ -505,7 +506,8 @@ def parse_csv(path: Path) -> list[ParsedSection]:
         reader = csv.reader(f, delimiter=delim)
         for row in reader:
             rows.append(" | ".join(row))
-    return [ParsedSection(text=_normalize("\n".join(rows)))]
+    return [ParsedSection(text=_normalize("\n".join(rows)),
+                          meta={"kind": "table"})]
 
 
 # ----- HTML ------------------------------------------------------------------

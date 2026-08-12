@@ -68,6 +68,12 @@ class FileRow:
     bytes: int
     mtime: float
     n_chunks: int
+    # Provenance — lets ingest's skip logic detect that a file was indexed
+    # with a different embedder or parser/chunker version and re-ingest it
+    # instead of silently serving incompatible vectors.
+    embedder: str = ""
+    parser_version: str = ""
+    chunker_version: str = ""
 
 
 @dataclass
@@ -140,7 +146,10 @@ class Index:
 
     def file_state(self, path: str) -> FileRow | None:
         row = self.conn.execute(
-            "SELECT id, path, sha256, bytes, mtime, n_chunks FROM files WHERE path = ?",
+            "SELECT id, path, sha256, bytes, mtime, n_chunks, "
+            "COALESCE(embedder, ''), COALESCE(parser_version, ''), "
+            "COALESCE(chunker_version, '') "
+            "FROM files WHERE path = ?",
             (path,),
         ).fetchone()
         if not row:

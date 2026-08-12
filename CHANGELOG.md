@@ -7,6 +7,59 @@ versions follow nothing yet because this is alpha.
 
 ## [Unreleased]
 
+### Ingest quality + robustness (2026-08)
+
+Pre-ingest hardening pass: a correctness audit of the ingest path plus a
+survey of current ingestion techniques ([docs/INGEST_RESEARCH.md](docs/INGEST_RESEARCH.md)).
+
+**New (research adoptions — all default ON, folded into the effective
+chunker version so toggling re-ingests affected files):**
+
+- **Contextual chunk headers** (`chunk_headers`) — every chunk gets a
+  `[document › section]` breadcrumb (+ sidecar title/description when a
+  `.ezrag-meta.toml` exists) prepended before embedding. The cheap
+  variant of contextual retrieval: most of the measured failure
+  reduction at zero per-chunk LLM cost. Flows into embeddings and FTS.
+- **Structure-aware table chunking** — XLSX/CSV sections are marked
+  `kind=table`; the chunker packs whole rows (never splits mid-row) and
+  repeats the header row on every continuation chunk.
+- **Within-file chunk dedup** (`dedup_chunks`) — normalized-exact
+  duplicate chunks (repeated page headers/footers, boilerplate) are
+  skipped at ingest. Within-file only, so deleting one file can never
+  orphan another file's content. Original ords preserved.
+
+**Fixed (audit findings):**
+
+- **S1 — mixed-embedder index**: the skip logic compared only sha256, so
+  files embedded under a different embedder (e.g. fastembed fallback
+  while Ollama was down) were silently served with incompatible
+  vectors. Skip now requires matching embedder + parser/chunker
+  provenance; mismatches re-ingest with a status line.
+- **S2 — empty-parse stale chunks**: a changed file that now parses to
+  nothing kept serving its OLD chunks and re-parsed forever. All four
+  bail-out paths now record the file (sha updated, stale chunks purged).
+- **S2 — empty-docs wipe**: an unmounted/moved docs dir no longer
+  deletes the entire index; deletion is skipped with a warning when the
+  walk finds zero files (`reindex` remains the explicit clear).
+- **S2 — mid-run stat() crash**: a file deleted or cloud-sync-locked
+  during the run now skips that file instead of aborting the ingest.
+- **S2 — concurrent-ingest race**: watch-mode + manual ingest could
+  delete each other's freshly indexed files via `delete_missing`. A
+  per-workspace pid lock (`.ezrag/ingest.lock`) now serializes ingest;
+  stale locks (dead pid) are reclaimed automatically.
+- **S3 — `chunk_overlap` floor**: overlap=0 previously still produced 64
+  words of overlap; whitespace-only chunks are no longer indexed;
+  Ollama embed inputs are capped at 32k chars so oversized chunks
+  degrade predictably instead of silently.
+- **Test-runner hardening**: manual scripts now write output to a file
+  (not pipes) and get tree-killed on timeout — a timed-out export test
+  previously leaked its spawned chatbot server, which squatted the test
+  port and wedged every subsequent suite run.
+
+Tests: new `tests/test_ingest_quality.py` (17 assertions across headers,
+dedup, provenance re-ingest, empty-docs guard, lock, empty-parse
+recording, table chunking, overlap). Suite: 30 files green.
+
 ### Performance — query hot path (2026-06)
 
 - **Embedding-matrix cache.** The dense half of hybrid search no longer

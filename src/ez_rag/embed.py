@@ -33,10 +33,17 @@ class OllamaEmbedder(Embedder):
         v = self._embed_one("test")
         return len(v)
 
+    # Ollama silently truncates inputs past the embed model's context —
+    # the vector then represents only the prefix. Cap inputs ourselves at
+    # a generous bound (~8k tokens) so pathological chunks (huge tables,
+    # contextualized text) degrade predictably instead of invisibly.
+    MAX_EMBED_CHARS = 32_000
+
     def _embed_one(self, text: str) -> list[float]:
         r = self._client.post(
             f"{self.url}/api/embeddings",
-            json={"model": self.model, "prompt": text},
+            json={"model": self.model,
+                  "prompt": text[:self.MAX_EMBED_CHARS]},
         )
         r.raise_for_status()
         return r.json()["embedding"]

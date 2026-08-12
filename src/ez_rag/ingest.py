@@ -142,6 +142,52 @@ def ingest(
     force: bool = False,
     progress: ProgressCb | None = None,
 ) -> IngestStats:
+    """Public entry point. Serializes ingest runs per workspace via a
+    pid lock file, then delegates to `_ingest_impl`.
+
+    Two concurrent ingests (watch mode + manual, GUI + CLI) race on
+    delete_missing's start-of-run file snapshot and can delete each
+    other's freshly indexed files — so a second ingest on the same
+    workspace fails fast instead. A lock owned by a dead pid is stale
+    and reclaimed silently."""
+    import os
+    lock_path = ws.meta_db_path.parent / "ingest.lock"
+    try:
+        if lock_path.is_file():
+            try:
+                other_pid = int(lock_path.read_text(encoding="utf-8").strip())
+            except (ValueError, OSError):
+                other_pid = -1
+            import psutil  # core dependency
+            if (other_pid > 0 and other_pid != os.getpid()
+                    and psutil.pid_exists(other_pid)):
+                raise RuntimeError(
+                    f"Another ingest is already running (pid {other_pid}). "
+                    f"Wait for it to finish, or delete {lock_path} if it "
+                    f"is stale."
+                )
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+    except RuntimeError:
+        raise
+    except Exception:
+        pass  # lock is best-effort; never block ingest on lock I/O
+    try:
+        return _ingest_impl(ws, cfg=cfg, force=force, progress=progress)
+    finally:
+        try:
+            lock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _ingest_impl(
+    ws: Workspace,
+    *,
+    cfg: Config | None = None,
+    force: bool = False,
+    progress: ProgressCb | None = None,
+) -> IngestStats:
     # ★ FIRST EMIT — happens within microseconds of the call so the UI's
     # "Starting…" placeholder never sits there for more than one frame.
     # We pass None for ws-derived size so it's truly cheap.
@@ -155,6 +201,16 @@ def ingest(
 
     cfg = cfg or ws.load_config()
     stats = IngestStats()
+
+    # Effective chunker version: quality features that change chunk
+    # COMPOSITION are folded into the version string, so toggling them
+    # re-ingests affected files (and leaving them alone doesn't).
+    eff_chunker_version = CHUNKER_VERSION
+    if getattr(cfg, "chunk_headers", True):
+        eff_chunker_version += "+hdr"
+    if getattr(cfg, "dedup_chunks", True):
+        eff_chunker_version += "+dedup"
+
 
     bytes_done = 0
     files_done = 0
@@ -328,7 +384,12 @@ def ingest(
     _emit(progress, _early_snap(_step_msg(
         "measuring file sizes & extension breakdown…"
     )))
-    bytes_total = sum(p.stat().st_size for p in files)
+    def _safe_size(p):
+        try:
+            return p.stat().st_size
+        except OSError:
+            return 0
+    bytes_total = sum(_safe_size(p) for p in files)
     # Quick ext breakdown so user knows what's coming
     ext_counts: dict[str, int] = {}
     for p in files:
@@ -387,20 +448,67 @@ def ingest(
     for path in files:
         rel = str(path.relative_to(ws.root))
         present_rel.add(rel)
-        file_size = path.stat().st_size
+        file_size = 0
         try:
+            # stat() inside the try: a file deleted or cloud-sync-locked
+            # mid-run must skip THIS file, not abort the whole ingest.
+            file_size = path.stat().st_size
             sha = file_sha256(path)
             existing = index.file_state(rel)
+            # Skip only when content AND pipeline provenance both match.
+            # sha alone is not enough: a file embedded by a different
+            # embedder (e.g. fastembed fallback while Ollama was down)
+            # or an older parser/chunker would be silently served with
+            # incompatible vectors.
+            provenance_ok = (
+                existing is not None
+                and (not existing.embedder
+                     or existing.embedder == embedder.name)
+                and (not existing.parser_version
+                     or existing.parser_version == PARSER_VERSION)
+                and (not existing.chunker_version
+                     or existing.chunker_version == eff_chunker_version)
+            )
             if (
                 not force
                 and existing is not None
                 and existing.sha256 == sha
+                and provenance_ok
             ):
                 stats.files_skipped_unchanged += 1
                 bytes_done += file_size
                 files_done += 1
                 _emit(progress, snapshot(current_path=rel, status="unchanged"))
                 continue
+            if (existing is not None and existing.sha256 == sha
+                    and not provenance_ok and not force):
+                _emit(progress, snapshot(
+                    current_path=rel,
+                    status=("re-ingesting — indexed with "
+                            f"{existing.embedder or 'unknown embedder'}/"
+                            f"chunker {existing.chunker_version or '?'}, "
+                            f"current is {embedder.name}/"
+                            f"{eff_chunker_version}"),
+                ))
+            def _record_empty() -> None:
+                # A file that used to have content but now parses to
+                # nothing must still be RECORDED: update its sha so we
+                # don't re-parse/re-OCR it on every future run, and purge
+                # its stale chunks so retrieval stops serving content the
+                # file no longer has.
+                index.replace_file(
+                    path=rel, sha256=sha, bytes_=file_size,
+                    mtime=path.stat().st_mtime,
+                    parser_version=PARSER_VERSION,
+                    chunker_version=eff_chunker_version,
+                    embedder=embedder.name,
+                    chunks=[],
+                )
+                if existing is None:
+                    stats.files_new += 1
+                else:
+                    stats.files_changed += 1
+
             _emit(progress, snapshot(current_path=rel, status="parsing"))
             parser = get_parser(path)
             if parser is None:
@@ -483,12 +591,13 @@ def ingest(
                     sections = parser(path)
             parse_s = time.perf_counter() - parse_t0
             if not sections:
+                _record_empty()
                 bytes_done += file_size
                 files_done += 1
                 _emit(progress, snapshot(
                     current_path=rel,
                     status=f"empty — parser found no extractable text "
-                           f"({parse_s:.1f}s)",
+                           f"({parse_s:.1f}s); stale chunks purged",
                 ))
                 continue
             # After parse completes, give the user a "what we got" line so
@@ -551,6 +660,7 @@ def ingest(
                             f"{garbled} garbled, flagged {partial} partial"),
                 ))
                 if not sections:
+                    _record_empty()
                     bytes_done += file_size
                     files_done += 1
                     _emit(progress, snapshot(
@@ -659,6 +769,7 @@ def ingest(
                                 f"questionable section(s)"),
                     ))
                     if not sections:
+                        _record_empty()
                         bytes_done += file_size
                         files_done += 1
                         _emit(progress, snapshot(
@@ -675,10 +786,62 @@ def ingest(
             )
             chunk_s = time.perf_counter() - chunk_t0
             if not chunks:
+                _record_empty()
                 bytes_done += file_size
                 files_done += 1
                 _emit(progress, snapshot(current_path=rel, status="no chunks"))
                 continue
+
+            # ---- Ingest-quality passes (docs/INGEST_RESEARCH.md) ----
+            # 1) Within-file dedup: normalized exact match. Repeated page
+            #    headers/footers and boilerplate produce identical chunks
+            #    that crowd top-k with copies of the same text. Original
+            #    ords are preserved (gaps are fine — neighbor expansion
+            #    and chapter ranges key on ord values, not density).
+            if getattr(cfg, "dedup_chunks", True) and len(chunks) > 1:
+                _seen_norm: set[str] = set()
+                _kept = []
+                for c in chunks:
+                    _n = " ".join((c.text or "").lower().split())
+                    if _n in _seen_norm:
+                        continue
+                    _seen_norm.add(_n)
+                    _kept.append(c)
+                _dropped = len(chunks) - len(_kept)
+                if _dropped:
+                    chunks = _kept
+                    _emit(progress, snapshot(
+                        current_path=rel,
+                        status=(f"deduped {_dropped} repeated chunk(s) "
+                                f"({len(chunks)} remain)"),
+                    ))
+
+            # 2) Contextual chunk headers: a "[doc › section]" breadcrumb
+            #    (+ sidecar title/description when a .ezrag-meta.toml
+            #    exists) prepended to each chunk before embedding — the
+            #    cheap variant of contextual retrieval. Flows into both
+            #    the embedding and the FTS tokens downstream.
+            if getattr(cfg, "chunk_headers", True):
+                _hdr_extra = ""
+                try:
+                    from .ingest_meta import load as _load_meta
+                    _md = _load_meta(path, workspace_root=ws.root)
+                    if _md is not None:
+                        _bits = []
+                        if _md.title:
+                            _bits.append(_md.title.strip())
+                        if _md.description:
+                            _bits.append(_md.description.strip()
+                                         .split(". ")[0][:200])
+                        _hdr_extra = " — ".join(b for b in _bits if b)
+                except Exception:
+                    _hdr_extra = ""
+                for c in chunks:
+                    _crumb = path.name + (f" › {c.section}"
+                                           if c.section else "")
+                    _header = f"[{_crumb}]" + (f" {_hdr_extra}"
+                                                if _hdr_extra else "")
+                    c.text = _header + "\n" + c.text
             _emit(progress, snapshot(
                 current_path=rel,
                 status=(f"chunked in {chunk_s:.2f}s — {len(chunks)} chunks "
@@ -825,7 +988,7 @@ def ingest(
                 bytes_=file_size,
                 mtime=path.stat().st_mtime,
                 parser_version=PARSER_VERSION,
-                chunker_version=CHUNKER_VERSION,
+                chunker_version=eff_chunker_version,
                 embedder=embedder.name,
                 chunks=rows,
                 chapters=chapters,
@@ -858,7 +1021,21 @@ def ingest(
             _emit(progress, snapshot(current_path=rel,
                                      status=f"ERROR: {e}"))
 
-    stats.files_removed = index.delete_missing(present_rel)
+    # Deletion guard: an empty walk usually means the docs dir is
+    # unmounted / moved / a cloud-sync placeholder tree — NOT that the
+    # user deleted every document. Wiping the index on that signal
+    # destroys hours of embedding work. `reindex` (force) remains the
+    # explicit way to clear an index.
+    if present_rel:
+        stats.files_removed = index.delete_missing(present_rel)
+    else:
+        stats.files_removed = 0
+        if index.conn.execute(
+                "SELECT COUNT(*) FROM files").fetchone()[0] > 0:
+            _emit(progress, snapshot(
+                status=("docs dir has no ingestible files — keeping the "
+                        "existing index (use reindex to clear it)"),
+            ))
     stats.seconds = time.perf_counter() - t0
     _emit(progress, snapshot(status="done"))
     return stats
