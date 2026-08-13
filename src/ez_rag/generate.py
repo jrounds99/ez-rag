@@ -697,7 +697,9 @@ def _classify_ollama_error(body: str) -> str:
 
 def _ollama_chat(cfg: Config, messages: list[dict]) -> str:
     from .multi_gpu import resolve_url
+    from .security import check_local_only
     url = resolve_url(cfg, cfg.llm_model, role="chat")
+    check_local_only(cfg, url, "LLM endpoint")
     try:
         r = httpx.post(
             url.rstrip("/") + "/api/chat",
@@ -739,7 +741,9 @@ def _ollama_chat_stream(cfg: Config, messages: list[dict]) -> Iterator[tuple[str
     actionable message instead of the raw httpx string.
     """
     from .multi_gpu import resolve_url
+    from .security import check_local_only
     url = resolve_url(cfg, cfg.llm_model, role="chat")
+    check_local_only(cfg, url, "LLM endpoint")
     try:
         with httpx.stream(
             "POST",
@@ -915,6 +919,8 @@ def agent_complete(cfg: Config, messages: list[dict], max_tokens: int = 300) -> 
 
 
 def _openai_complete(cfg: Config, messages: list[dict], max_tokens: int, model: str) -> str:
+    from .security import check_agent_provider
+    check_agent_provider(cfg)   # proprietary-data mode blocks cloud providers
     base = (getattr(cfg, "agent_base_url", "") or "https://api.openai.com/v1").rstrip("/")
     key = cfg.agent_api_key.strip()
     r = httpx.post(
@@ -935,6 +941,8 @@ def _openai_complete(cfg: Config, messages: list[dict], max_tokens: int, model: 
 
 
 def _anthropic_complete(cfg: Config, messages: list[dict], max_tokens: int, model: str) -> str:
+    from .security import check_agent_provider
+    check_agent_provider(cfg)   # proprietary-data mode blocks cloud providers
     # Anthropic wants the system prompt out-of-band.
     system_text = ""
     body_msgs: list[dict] = []
@@ -1260,7 +1268,7 @@ def contextualize_chunk(chunk_text: str, doc_summary: str, cfg: Config) -> str:
 
 def _no_llm_fallback(question: str, hits: list[Hit]) -> str:
     lines = [
-        f"(no LLM detected — install Ollama and `ollama pull qwen2.5:7b-instruct`)",
+        f"(no LLM detected — install Ollama and `ollama pull granite3.3:2b`)",
         "",
         f"Top passages for: {question!r}",
     ]

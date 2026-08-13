@@ -16,7 +16,9 @@ else:  # pragma: no cover
 class Config:
     # Models
     llm_provider: str = "auto"          # "auto" | "ollama" | "llama-cpp" | "none"
-    llm_model: str = "qwen2.5:7b-instruct"
+    # Default = the Ohio-bench winner: best measured answer quality of
+    # 23 models tested AND one of the smallest (10.95/12 at 2.5B).
+    llm_model: str = "granite3.3:2b"
     llm_url: str = "http://127.0.0.1:11434"  # Ollama default
     embedder_provider: str = "auto"     # "auto" | "ollama" | "fastembed"
     embedder_model: str = "BAAI/bge-small-en-v1.5"
@@ -51,7 +53,6 @@ class Config:
 
     # Ingest performance — flip these on for big corpora
     unload_llm_during_ingest: bool = True   # frees VRAM if contextual is OFF
-    parallel_workers: int = 1               # parser/chunker process pool (1 = sequential)
     embed_batch_size: int = 16              # bigger = faster on a strong GPU
 
     # Retrieval
@@ -175,6 +176,17 @@ class Config:
     # aim to keep ~50% of tokens. Higher pressure = more savings, more
     # risk of dropping relevant detail.
     compress_context_target_ratio: float = 0.0
+
+    # Proprietary-data mode — the "my documents must not leave this
+    # machine" flip. When True:
+    #   1. Every LLM/embedding endpoint must be localhost or private-LAN
+    #      (RFC-1918); public URLs raise instead of sending data.
+    #   2. Cloud agent providers (openai/anthropic) are refused; agentic
+    #      retrieval silently uses the local model instead.
+    #   3. Pairs with the workspace lock: `ez-rag lock` encrypts the
+    #      index (AES-256-GCM, scrypt-derived key) when you're away.
+    # See docs/PROPRIETARY_DATA.md for exactly what is and isn't covered.
+    proprietary_data: bool = False
 
     extra: dict[str, Any] = field(default_factory=dict)
 

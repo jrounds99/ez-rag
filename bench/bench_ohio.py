@@ -404,7 +404,6 @@ def build_workspace_for_embedder(
     cfg.chunk_size = 512
     cfg.chunk_overlap = 64
     cfg.embed_batch_size = 32
-    cfg.parallel_workers = 2
     cfg.enable_ocr = True
     cfg.enable_contextual = False
     cfg.llm_inspect_pages = False

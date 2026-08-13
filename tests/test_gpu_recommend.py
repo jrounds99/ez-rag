@@ -144,11 +144,14 @@ def main():
     check("5060 Mobile does NOT fit 14B",
           "qwen2.5:14b" not in fitting_tags,
           f"fitting: {fitting_tags}")
-    # The non-fitting peek should show 14B as the next-tier unlock.
+    # The non-fitting peek should show a bigger model as the next-tier
+    # unlock. Exact tag depends on the catalog (mistral-nemo:12b since
+    # the 2026-08 refresh) — assert the invariant, not the tag.
     not_fitting = [r for r in recs_5060m
                     if r.role == "chat" and not r.fits]
-    check("5060 Mobile peek shows 14B as unlock",
-          any("14b" in r.tag for r in not_fitting),
+    check("5060 Mobile peek shows a larger next-tier unlock",
+          len(not_fitting) >= 1
+          and any(x in r.tag for r in not_fitting for x in ("12b", "14b")),
           f"not-fitting: {[r.tag for r in not_fitting]}")
 
     print("\n[6] recommend_models for tiny GPU (4 GB)")
@@ -180,14 +183,14 @@ def main():
     req = estimate_required_vram(cfg)
     check("returns VramRequirement",
           isinstance(req, VramRequirement))
-    check("7B + embedder min ~7 GB",
-          5 <= req.min_vram_gb <= 9,
+    check("default (granite3.3:2b) + embedder min ~3 GB",
+          2 <= req.min_vram_gb <= 4,
           f"got {req.min_vram_gb}")
     check("recommended > min",
           req.recommended_vram_gb > req.min_vram_gb,
           f"min={req.min_vram_gb} rec={req.recommended_vram_gb}")
     check("manifest carries the LLM tag",
-          req.llm_model == "qwen2.5:7b-instruct")
+          req.llm_model == "granite3.3:2b")
 
     print("\n[9] estimate_required_vram with 32B model")
     cfg32 = Config()

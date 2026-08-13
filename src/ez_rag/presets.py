@@ -153,6 +153,49 @@ TRADE-OFFS
   measured vs 10.95 for 'balanced'. The gap is real but modest.""",
     ),
     Preset(
+        id="speed",
+        name="Speed (instant answers)",
+        tagline="Fastest measured pipeline — for rapid-fire Q&A and demos.",
+        settings={
+            "llm_model": "llama3.2:1b",
+            "ollama_embed_model": "nomic-embed-text",
+            "rerank": False,
+            "chunk_headers": True,
+            "dedup_chunks": True,
+            "compress_context": False,
+            "top_k": 6,
+        },
+        requires_vram_gb=2,
+        models_needed=("llama3.2:1b", "nomic-embed-text"),
+        details="""\
+WHY THIS PRESET
+llama3.2:1b generated at 578 tokens/sec in the bench — the fastest of
+all 23 models, roughly 2x the 'balanced' pick and 10x the 32B
+models — while still scoring 9.22/12. nomic-embed-text is the
+smallest embedder (0.4 GB) with retrieval within 0.1/12 of the best,
+so query embedding is near-instant too.
+
+WHAT'S DIFFERENT
+- Cross-encoder reranking is OFF. It's the biggest quality lift in
+  the retrieval matrix but costs ~1s per question — the single
+  largest fixed latency in the pipeline. With hybrid BM25+dense
+  retrieval still on, answers stay grounded; they're just picked from
+  the raw fusion ranking.
+- top_k lowered to 6 so the small model reads less context per
+  question (faster prompt eval, less distraction).
+
+WHEN TO USE IT
+Live demos, rapid exploratory Q&A over a corpus you know well, or
+hardware where every second matters. Total answer latency is
+typically under 2 seconds end to end.
+
+TRADE-OFF
+This is the speed corner of the quality/speed frontier: 9.22/12 vs
+10.95 for 'balanced', and without reranking the top hits are
+occasionally less precise. When a specific answer matters, ask again
+under 'balanced' — switching presets is two clicks.""",
+    ),
+    Preset(
         id="deep-context",
         name="Deep context (big documents)",
         tagline="Wide retrieval + compression — for long reports and manuals.",

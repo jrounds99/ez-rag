@@ -64,6 +64,35 @@ _MODELS: list[ModelEntry] = [
                "chat", "Q4_K_M", 2600),
     ModelEntry("gemma2:2b",              "Gemma 2 2B",
                "chat", "Q4_K_M", 2400),
+    ModelEntry("granite3.3:2b",          "Granite 3.3 2B",
+               "chat", "Q4_K_M", 2000,
+               "Ohio-bench winner — best measured quality per GB (10.95/12)."),
+    ModelEntry("granite3.3:8b",          "Granite 3.3 8B",
+               "chat", "Q4_K_M", 5500,
+               "Best factual accuracy under 10 GB (73% gold-truth)."),
+    ModelEntry("qwen3:0.6b",             "Qwen 3 0.6B",
+               "chat", "Q4_K_M", 800,
+               "Smallest model within 15% of the bench's best score."),
+    ModelEntry("qwen3:1.7b",             "Qwen 3 1.7B",
+               "chat", "Q4_K_M", 1500),
+    ModelEntry("qwen3:4b",               "Qwen 3 4B",
+               "chat", "Q4_K_M", 2800),
+    ModelEntry("qwen3:8b",               "Qwen 3 8B",
+               "chat", "Q4_K_M", 5600),
+    ModelEntry("qwen3:14b",              "Qwen 3 14B",
+               "chat", "Q4_K_M", 9800),
+    ModelEntry("gemma3:4b",              "Gemma 3 4B",
+               "chat", "Q4_K_M", 3300,
+               "Strong 4B-class (10.20/12 in the Ohio bench)."),
+    ModelEntry("mistral-nemo:12b",       "Mistral NeMo 12B",
+               "chat", "Q4_K_M", 7500,
+               "#2 overall in the Ohio bench (10.62/12)."),
+    ModelEntry("deepseek-r1:1.5b",       "DeepSeek-R1 1.5B",
+               "chat", "Q4_K_M", 1600,
+               "Reasoning distill — underperformed its size in our bench."),
+    ModelEntry("deepseek-r1:32b",        "DeepSeek-R1 32B",
+               "chat", "Q4_K_M", 21000,
+               "Best factual accuracy measured (78% gold-truth); slow."),
     ModelEntry("qwen2.5:7b-instruct",    "Qwen 2.5 7B Instruct",
                "chat", "Q4_K_M", 5500,
                "Best balance of quality + speed for 8–12 GB cards."),
@@ -94,6 +123,14 @@ _MODELS: list[ModelEntry] = [
                "Needs 48 GB+; great for professional cards."),
 
     # ----- Embedders -----
+    ModelEntry("bge-m3:567m",            "BGE-M3",
+               "embedder", "F16", 1200,
+               "Recommended embedder — tied for best retrieval in the "
+               "Ohio bench at 14× smaller than qwen3-embedding:8b."),
+    ModelEntry("qwen3-embedding:8b",     "Qwen 3 Embedding 8B",
+               "embedder", "Q4_K_M", 8500,
+               "Statistically tied with bge-m3; only worth it if VRAM "
+               "is no object."),
     ModelEntry("nomic-embed-text",       "Nomic Embed Text",
                "embedder", "Q4_K_M", 320,
                "Default Ollama embedder. Fast, GPU-accelerated."),
@@ -354,7 +391,7 @@ def estimate_required_vram(cfg) -> VramRequirement:
     in our table (better to over-warn than to silently ship a bundle that
     won't fit).
     """
-    llm_tag = getattr(cfg, "llm_model", "qwen2.5:7b-instruct")
+    llm_tag = getattr(cfg, "llm_model", "granite3.3:2b")
     embedder_tag = (
         getattr(cfg, "ollama_embed_model", None)
         or getattr(cfg, "embedder_model", None)

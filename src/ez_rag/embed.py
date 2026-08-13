@@ -22,7 +22,10 @@ class Embedder:
 
 
 class OllamaEmbedder(Embedder):
-    def __init__(self, url: str, model: str):
+    def __init__(self, url: str, model: str, cfg=None):
+        if cfg is not None:
+            from .security import check_local_only
+            check_local_only(cfg, url, "embedding endpoint")
         self.url = url.rstrip("/")
         self.model = model
         self.name = f"ollama:{model}"
@@ -114,7 +117,7 @@ def make_embedder(cfg: Config) -> Embedder:
     provider = cfg.embedder_provider
     if provider in ("auto", "ollama") and _ollama_alive(embed_url):
         try:
-            emb = OllamaEmbedder(embed_url, cfg.ollama_embed_model)
+            emb = OllamaEmbedder(embed_url, cfg.ollama_embed_model, cfg=cfg)
             _EMBEDDER_CACHE[key] = emb
             return emb
         except Exception as e:

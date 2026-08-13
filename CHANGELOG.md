@@ -7,6 +7,46 @@ versions follow nothing yet because this is alpha.
 
 ## [Unreleased]
 
+### Models, GPUs, presets, proprietary data (2026-08-13)
+
+- **Proprietary-data mode** (`proprietary_data`) — the "nothing leaves
+  this machine" flip. Non-local LLM/embedding endpoints raise instead
+  of sending text (loopback + RFC-1918 only; DNS names refused); cloud
+  agent providers refused. Plus a workspace lock: `ez-rag lock` /
+  `unlock` (and a GUI card) encrypt the index with AES-256-GCM
+  (scrypt-derived key, WAL folded first, round-trip verified before
+  plaintext deletion); while locked, ingest/ask/chat refuse cleanly.
+  Honest limits documented in docs/PROPRIETARY_DATA.md. 35 tests.
+  New core dep: `cryptography`.
+- **Curated model catalog** (`model_catalog.py`) — the trusted,
+  repo-maintained model list with measured bench numbers per model
+  (score /12, factual %, tok/s, VRAM, license). Serves as the offline/
+  backup source for the Ollama library browser (the ollama.com scrape
+  now falls back to it instead of erroring) and refreshes the
+  gpu_recommend tables with the current generation (granite3.3, qwen3,
+  gemma3, mistral-nemo, deepseek-r1, bge-m3).
+- **VRAM-fit gate** — saving a chat model that can't fit GPU memory
+  now prompts with the numbers ("needs ~21 GB, you have 12") and the
+  consequence (CPU spill, 10-50× slower) before letting you proceed;
+  tight fits get a heads-up toast. Uses catalog estimates first.
+- **GPU visibility + explicit pick** — the Hardware card now leads
+  with "Chat model X → GPU N (url) — why", resolved through the
+  routing table exactly like a live call, plus a "Run Ollama on"
+  dropdown (auto / specific GPU) that writes the routing default.
+- **Presets**: new `speed` preset (llama3.2:1b, 578 tok/s measured,
+  rerank off — sub-2s answers); the card now uses the space to the
+  right to ALWAYS show what the selected preset writes (friendly
+  field names, ON/OFF coloring, models + VRAM) before you apply.
+- **Expanded settings help** — new `ez-rag help settings` manual page
+  explaining every knob in plain language (also rendered by the GUI
+  help overlay).
+- **Settings evaluation (final pass)** — `ocr_provider` was documented
+  but never read: now implemented (auto / rapidocr / tesseract /
+  none). `parallel_workers` promised a worker pool that never existed:
+  removed. Default chat model switched `qwen2.5:7b-instruct` →
+  `granite3.3:2b` — our own bench's winner at a third the size (the
+  old default also wasn't installed by default, a first-run trap).
+
 ### Ingest quality + robustness (2026-08)
 
 Pre-ingest hardening pass: a correctness audit of the ingest path plus a

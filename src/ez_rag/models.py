@@ -350,8 +350,16 @@ def fetch_ollama_library(
         if cached and (time.time() - cached[0]) < _LIB_CACHE_TTL_S:
             return cached[1]
 
-    r = httpx.get(url, timeout=timeout, headers={"User-Agent": "ez-rag/0.1"})
-    r.raise_for_status()
+    try:
+        r = httpx.get(url, timeout=timeout,
+                      headers={"User-Agent": "ez-rag/0.1"})
+        r.raise_for_status()
+    except Exception:
+        # Offline / scrape broken — fall back to the curated catalog
+        # bundled with ez-rag (repo-maintained, carries benchmark
+        # annotations). Not cached so a later call retries the network.
+        from .model_catalog import as_library_models
+        return as_library_models()
     html = r.text
 
     # Slice into per-card chunks. Each card is an <li x-test-model …> wrapping

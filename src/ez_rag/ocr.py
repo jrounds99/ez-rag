@@ -29,9 +29,22 @@ def _has_tesseract() -> bool:
     return shutil.which("tesseract") is not None
 
 
+# Provider selection — set from cfg.ocr_provider by ingest. "auto" tries
+# RapidOCR then Tesseract; naming one engine uses only that engine;
+# "none" disables OCR entirely (fastest ingest for born-digital corpora).
+_OCR_PROVIDER = "auto"
+
+
+def set_ocr_provider(name: str) -> None:
+    global _OCR_PROVIDER
+    _OCR_PROVIDER = (name or "auto").strip().lower()
+
+
 def ocr_file(path: Path) -> str:
     """OCR an image file from disk."""
-    engine = _rapidocr()
+    if _OCR_PROVIDER == "none":
+        return ""
+    engine = _rapidocr() if _OCR_PROVIDER in ("auto", "rapidocr") else None
     if engine is not None:
         try:
             result, _ = engine(str(path))
@@ -39,7 +52,7 @@ def ocr_file(path: Path) -> str:
                 return _join_lines(result)
         except Exception:
             pass
-    if _has_tesseract():
+    if _OCR_PROVIDER in ("auto", "tesseract") and _has_tesseract():
         try:
             import pytesseract  # type: ignore
             from PIL import Image  # type: ignore
@@ -51,7 +64,9 @@ def ocr_file(path: Path) -> str:
 
 def ocr_image(image: Any) -> str:
     """OCR a PIL.Image. Used by the scanned-PDF code path."""
-    engine = _rapidocr()
+    if _OCR_PROVIDER == "none":
+        return ""
+    engine = _rapidocr() if _OCR_PROVIDER in ("auto", "rapidocr") else None
     if engine is not None:
         try:
             import numpy as np  # type: ignore
@@ -61,7 +76,7 @@ def ocr_image(image: Any) -> str:
                 return _join_lines(result)
         except Exception:
             pass
-    if _has_tesseract():
+    if _OCR_PROVIDER in ("auto", "tesseract") and _has_tesseract():
         try:
             import pytesseract  # type: ignore
             return pytesseract.image_to_string(image)

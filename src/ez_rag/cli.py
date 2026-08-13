@@ -224,6 +224,8 @@ def ask(
 ):
     """One-shot Q&A."""
     ws = require_workspace()
+    from .security import require_unlocked
+    require_unlocked(ws.root)
     cfg = ws.load_config()
     use_rag = cfg.use_rag and not no_rag
     effective_q = apply_query_modifiers(question, cfg)
@@ -318,6 +320,8 @@ def chat(
 ):
     """Interactive REPL. Type /exit to quit."""
     ws = require_workspace()
+    from .security import require_unlocked
+    require_unlocked(ws.root)
     cfg = ws.load_config()
     embedder = make_embedder(cfg)
     idx = Index(ws.meta_db_path, embed_dim=embedder.dim)
@@ -726,6 +730,48 @@ def preset_cmd(
             "pip install \"ez-rag[compress]\" (it no-ops safely if "
             "missing).[/dim]"
         )
+
+
+@app.command("lock")
+def lock_cmd():
+    """Encrypt this workspace's index (proprietary-data mode).
+
+    Encrypts .ezrag/meta.sqlite (every extracted chunk + embedding)
+    with AES-256-GCM; the key is derived from your passphrase via
+    scrypt. While locked, ingest/ask/chat refuse to run. Your original
+    documents in docs/ are not touched. There is NO passphrase
+    recovery — but the index is rebuildable by re-ingesting."""
+    from .security import is_locked, lock_workspace
+    ws = require_workspace()
+    if is_locked(ws.root):
+        console.print("[yellow]Already locked.[/yellow]")
+        raise typer.Exit(0)
+    pw = typer.prompt("Passphrase (min 8 chars)", hide_input=True)
+    pw2 = typer.prompt("Repeat passphrase", hide_input=True)
+    if pw != pw2:
+        console.print("[red]Passphrases don't match.[/red]")
+        raise typer.Exit(1)
+    enc = lock_workspace(ws.root, pw)
+    console.print(f"[green]Locked.[/green] Index encrypted at {enc.name}. "
+                  "Unlock with: ez-rag unlock")
+
+
+@app.command("unlock")
+def unlock_cmd():
+    """Decrypt this workspace's index (undo `ez-rag lock`)."""
+    from .security import WrongPassphraseError, is_locked, unlock_workspace
+    ws = require_workspace()
+    if not is_locked(ws.root):
+        console.print("[yellow]Not locked.[/yellow]")
+        raise typer.Exit(0)
+    pw = typer.prompt("Passphrase", hide_input=True)
+    try:
+        unlock_workspace(ws.root, pw)
+    except WrongPassphraseError as ex:
+        console.print(f"[red]{ex}[/red]")
+        raise typer.Exit(1)
+    console.print("[green]Unlocked.[/green] Chat and ingest are available "
+                  "again. Re-lock with: ez-rag lock")
 
 
 def main():  # pragma: no cover

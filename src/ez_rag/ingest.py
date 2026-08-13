@@ -150,6 +150,8 @@ def ingest(
     other's freshly indexed files — so a second ingest on the same
     workspace fails fast instead. A lock owned by a dead pid is stale
     and reclaimed silently."""
+    from .security import require_unlocked
+    require_unlocked(ws.root)   # encrypted workspace -> clear refusal
     import os
     lock_path = ws.meta_db_path.parent / "ingest.lock"
     try:
@@ -216,6 +218,11 @@ def _ingest_impl(
     from .parsers import pop_pdf_backend_fallbacks, set_pdf_backend
     pdf_backend = (getattr(cfg, "pdf_backend", "auto") or "auto").lower()
     set_pdf_backend(pdf_backend)
+    # Honor cfg.ocr_provider (auto | rapidocr | tesseract | none).
+    from .ocr import set_ocr_provider
+    set_ocr_provider(
+        "none" if not getattr(cfg, "enable_ocr", True)
+        else getattr(cfg, "ocr_provider", "auto"))
     eff_parser_version = PARSER_VERSION
     if pdf_backend != "auto":
         eff_parser_version += f"+{pdf_backend}"

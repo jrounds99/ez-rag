@@ -25,7 +25,7 @@ pipx install "ez-rag[ocr,gui]"
 pip install --user "ez-rag[ocr,gui]"
 
 # 2) (recommended) Ollama for the LLM and embeddings — https://ollama.com/download
-ollama pull qwen2.5:7b-instruct
+ollama pull granite3.3:2b
 ollama pull nomic-embed-text
 ```
 
@@ -89,9 +89,11 @@ ez-rag reindex                re-chunk/re-embed without re-parsing
 ez-rag help <topic>           offline manual pages
 ez-rag preset                 benchmark-backed setting bundles
                               (preset <id> for details, --apply to use)
+ez-rag lock / unlock          encrypt / decrypt the index (proprietary
+                              data mode — docs/PROPRIETARY_DATA.md)
 ```
 
-Topics for `ez-rag help`: `getting-started`, `workflow`, `ingestion`, `retrieval`, `models`, `chat`, `gui`, `ocr`, `cli`.
+Topics for `ez-rag help`: `getting-started`, `workflow`, `ingestion`, `retrieval`, `models`, `chat`, `gui`, `ocr`, `cli`, `settings` (the expanded every-knob guide).
 
 ## GUI
 
@@ -146,6 +148,7 @@ question → [HyDE]? → [multi-query]? → hybrid (BM25 + dense, RRF)
 | **Agentic mode** | ☐ | LLM iteratively reflects + re-searches when initial hits look weak. Uses your chat model by default; OpenAI / Anthropic / OpenAI-compat supported as upgrades |
 | **Query modifiers** *(prefix · suffix · negatives)* | ☐ | persistent persona / formatting / "avoid X" wrappers around every question. Per-query checkbox in the chat composer |
 | **Use RAG** | ✅ | toggle OFF in the Chat tab to A/B compare model-only vs RAG-augmented |
+| **Proprietary data mode** | ☐ | blocks all non-local endpoints + cloud providers; pairs with `ez-rag lock` (AES-256-GCM index encryption). See [docs/PROPRIETARY_DATA.md](docs/PROPRIETARY_DATA.md) |
 | **Context compression** *(optional)* | ☐ | shrink the retrieved context ~49% before it hits the LLM via [headroom-ai](https://github.com/chopratejas/headroom). Off by default; opt in with `pip install "ez-rag[compress]"` + `compress_context = true`. Fail-open. See [docs/COMPRESSION.md](docs/COMPRESSION.md) |
 
 Defaults are tuned for "drop docs, get good answers." See `ez-rag help retrieval` or the GUI's Help (?) for the empirical config matrix and when to flip what.

@@ -229,8 +229,6 @@ TIP = {
                       "0 = let Ollama pick the model's default. Larger = "
                       "more VRAM upfront but no per-token speed cost when "
                       "actual sequences are short.",
-    "parallel_workers": "Reserved for future parallel parsing. Currently "
-                      "no effect; leave at 1.",
     "default_rags_dir": "Where 'New RAG' creates workspaces by default. "
                       "Each RAG you create here also shows up in the RAG "
                       "dropdown automatically.",
@@ -4044,6 +4042,124 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
             ),
         )
 
+    def _build_proprietary_card(_state: AppState) -> ft.Control:
+        """Proprietary-data mode: the switch (form-managed, saved with
+        Save settings) + the workspace lock (immediate actions)."""
+        from ez_rag.security import (
+            WrongPassphraseError, is_locked, lock_workspace,
+            unlock_workspace,
+        )
+
+        lock_status = ft.Text("", size=12, weight=ft.FontWeight.W_600)
+        pw_field = ft.TextField(
+            label="Passphrase (min 8 chars)", password=True,
+            can_reveal_password=True, width=280, dense=True,
+            tooltip="Never stored anywhere. There is NO recovery — but "
+                    "the index can always be rebuilt by re-ingesting "
+                    "your documents.",
+        )
+        action_status = ft.Text("", size=11, color=ON_SURFACE_DIM,
+                                italic=True)
+
+        def _refresh_lock_ui(_=None):
+            if _state.ws is None:
+                lock_status.value = "Open a workspace first."
+                lock_status.color = ON_SURFACE_DIM
+            elif is_locked(_state.ws.root):
+                lock_status.value = ("🔒 LOCKED — index is encrypted; "
+                                     "chat and ingest are disabled")
+                lock_status.color = WARNING
+            else:
+                lock_status.value = "🔓 Unlocked — index readable on disk"
+                lock_status.color = ON_SURFACE_DIM
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        def _do_lock(_):
+            if _state.ws is None:
+                return
+            pw = pw_field.value or ""
+            if len(pw) < 8:
+                action_status.value = "Passphrase must be at least 8 chars."
+                page.update()
+                return
+            def _bg():
+                try:
+                    lock_workspace(_state.ws.root, pw)
+                    pw_field.value = ""
+                    action_status.value = (
+                        "Locked. The index is now AES-256-GCM encrypted. "
+                        "Unlock here (or `ez-rag unlock`) to use it again.")
+                except Exception as ex:
+                    action_status.value = f"Lock failed: {ex}"
+                _refresh_lock_ui()
+            page.run_thread(_bg)
+
+        def _do_unlock(_):
+            if _state.ws is None:
+                return
+            pw = pw_field.value or ""
+            def _bg():
+                try:
+                    unlock_workspace(_state.ws.root, pw)
+                    pw_field.value = ""
+                    action_status.value = "Unlocked — ready to chat/ingest."
+                except WrongPassphraseError as ex:
+                    action_status.value = str(ex)
+                except Exception as ex:
+                    action_status.value = f"Unlock failed: {ex}"
+                _refresh_lock_ui()
+            page.run_thread(_bg)
+
+        _refresh_lock_ui()
+
+        return section_card(
+            "PROPRIETARY DATA",
+            proprietary_sw,
+            ft.Text(
+                "What the switch does (after Save settings): every LLM and "
+                "embedding endpoint must be on this machine or your private "
+                "LAN — anything else raises an error instead of sending "
+                "text. Cloud agent providers are refused. Your documents, "
+                "chunks, and questions cannot leave hardware you control, "
+                "even by misconfiguration.",
+                size=11.5, color=ON_SURFACE_DIM,
+            ),
+            ft.Divider(height=1, color="#262938"),
+            ft.Row([
+                ft.Text("Workspace lock", size=12,
+                        weight=ft.FontWeight.W_700, color=ON_SURFACE),
+                ft.Container(expand=True),
+                lock_status,
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Text(
+                "Encrypts the index (.ezrag/meta.sqlite — every extracted "
+                "chunk of your documents plus embeddings) with AES-256-GCM; "
+                "the key comes from your passphrase via scrypt, so offline "
+                "brute-force is expensive. Lock it when you step away. "
+                "Honest limits: while UNLOCKED the index is plaintext "
+                "(SQLite can't search ciphertext) — pair with BitLocker / "
+                "FileVault for full coverage — and your original files in "
+                "docs/ are yours to protect separately.",
+                size=11, color=ON_SURFACE_DIM,
+            ),
+            ft.Row([
+                pw_field,
+                ft.FilledButton("Lock", icon=ft.Icons.LOCK_OUTLINE,
+                                on_click=_do_lock, bgcolor=ACCENT,
+                                color="#FFFFFF",
+                                tooltip="Encrypt the index now. Chat and "
+                                        "ingest refuse until unlocked."),
+                ft.OutlinedButton("Unlock", icon=ft.Icons.LOCK_OPEN,
+                                  on_click=_do_unlock,
+                                  tooltip="Decrypt the index with your "
+                                          "passphrase."),
+            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            action_status,
+        )
+
     def _build_presets_card(_state: AppState) -> ft.Control:
         """Benchmark-backed setting bundles. Applying a preset fills the
         form fields (via load_from_cfg) but does NOT save — the user
@@ -4126,15 +4242,62 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                 status_text.value = f"Config already matches '{p.id}'."
             page.update()
 
-        dd.on_change = _sync
+        # Right column: the preset's exact settings, ALWAYS visible —
+        # uses the space to the right of the picker so you can see what
+        # a preset writes before applying it.
+        settings_panel = ft.Column(spacing=2, tight=True)
 
-        return section_card(
-            "PRESETS — BENCHMARK-BACKED BUNDLES",
-            ft.Row([
-                ft.Icon(ft.Icons.TUNE, size=16, color=ACCENT),
-                ft.Text("One choice instead of twenty knobs", size=11,
-                        color=ON_SURFACE_DIM, weight=ft.FontWeight.W_700),
-            ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        def _fill_settings_panel(p):
+            settings_panel.controls.clear()
+            settings_panel.controls.append(ft.Text(
+                "WHAT THIS PRESET WRITES", size=10,
+                color=ON_SURFACE_DIM, weight=ft.FontWeight.W_700))
+            friendly = {
+                "llm_model": "Chat model",
+                "ollama_embed_model": "Embedder",
+                "rerank": "Cross-encoder rerank",
+                "top_k": "Retrieved chunks (top-k)",
+                "context_window": "Neighbor window",
+                "chunk_headers": "Chunk headers",
+                "dedup_chunks": "Chunk dedup",
+                "compress_context": "Context compression",
+                "compress_context_min_tokens": "Compression min tokens",
+            }
+            for k, v in p.settings.items():
+                label = friendly.get(k, k)
+                if isinstance(v, bool):
+                    vs = "ON" if v else "OFF"
+                    vc = SUCCESS if v else ON_SURFACE_DIM
+                else:
+                    vs, vc = str(v), ON_SURFACE
+                settings_panel.controls.append(ft.Row([
+                    ft.Text(label, size=11.5, color=ON_SURFACE_DIM,
+                            expand=True),
+                    ft.Text(vs, size=11.5, color=vc,
+                            weight=ft.FontWeight.W_600),
+                ], spacing=8))
+            settings_panel.controls.append(ft.Container(height=6))
+            settings_panel.controls.append(ft.Text(
+                f"Models: {', '.join(p.models_needed)}",
+                size=10.5, color=ON_SURFACE_DIM))
+            settings_panel.controls.append(ft.Text(
+                f"Approx. VRAM: {p.requires_vram_gb} GB",
+                size=10.5, color=ON_SURFACE_DIM))
+
+        def _sync_all(_=None):
+            _sync()
+            p = get_preset(dd.value or "")
+            if p:
+                _fill_settings_panel(p)
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        dd.on_change = _sync_all
+        _fill_settings_panel(PRESETS[0])
+
+        left_col = ft.Column([
             dd,
             tagline,
             ft.Row([
@@ -4150,8 +4313,25 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                                       "produced these numbers, what's "
                                       "on/off, and the trade-offs."),
             ], spacing=8),
-            details_box,
             status_text,
+        ], spacing=10, tight=True, expand=True)
+
+        right_col = ft.Container(
+            content=settings_panel,
+            padding=12, border_radius=8, bgcolor="#00000022",
+            width=280,
+        )
+
+        return section_card(
+            "PRESETS — BENCHMARK-BACKED BUNDLES",
+            ft.Row([
+                ft.Icon(ft.Icons.TUNE, size=16, color=ACCENT),
+                ft.Text("One choice instead of twenty knobs", size=11,
+                        color=ON_SURFACE_DIM, weight=ft.FontWeight.W_700),
+            ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row([left_col, right_col], spacing=14,
+                   vertical_alignment=ft.CrossAxisAlignment.START),
+            details_box,
         )
 
     def _build_storage_card(_state: AppState) -> ft.Control:
@@ -5070,8 +5250,25 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
     # open_gguf_picker (above) — Flet 0.84 file pickers are async.
     # Dropdowns no longer trigger pull/picker actions; explicit buttons do.
 
+    proprietary_sw = ft.Switch(
+        label="Proprietary data mode",
+        tooltip=(
+            """The 'my documents must never leave this machine' flip.
+
+ON enforces:
+- LLM + embedding endpoints must be localhost or private LAN - a
+  public URL raises an error instead of sending your text.
+- Cloud agent providers (OpenAI / Anthropic) are refused; agentic
+  retrieval uses your local model instead.
+
+Pair it with the workspace lock below to encrypt the index when
+you're away. Details: docs/PROPRIETARY_DATA.md"""
+        ),
+    )
+
     def load_from_cfg():
         c = state.cfg
+        proprietary_sw.value = bool(getattr(c, "proprietary_data", False))
         chunk_size.value = str(c.chunk_size)
         chunk_overlap.value = str(c.chunk_overlap)
         top_k.value = str(c.top_k)
@@ -5154,10 +5351,107 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
 
         page.update()
 
+    # ----- VRAM-fit gate ---------------------------------------------------
+    # Saving a chat model that can't fit in GPU memory means Ollama spills
+    # layers to system RAM — generation gets 10-50x slower with no visible
+    # error. Gate the save with an explicit prompt instead.
+    _fit_ack = {"tag": None}      # user clicked "Save anyway" for this tag
+
+    def _model_fit_check(tag: str):
+        """Returns (fit, needed_gb, have_gb): fit in fits|tight|over|unknown."""
+        try:
+            from ez_rag.model_catalog import catalog_lookup
+            cm = catalog_lookup(tag)
+            if cm is not None:
+                needed = cm.est_vram_gb
+            else:
+                size = tag.split(":")[1] if ":" in tag else tag
+                needed = estimate_vram_gb(size)
+            have = detect_total_vram_gb()
+            return vram_fit(needed, have), needed, have
+        except Exception:
+            return "unknown", None, None
+
+    def _show_fit_warning(tag: str, needed, have):
+        overlay = ft.Container(
+            expand=True, bgcolor="#000000AA", alignment=ft.alignment.center,
+        )
+
+        def _dismiss(_=None):
+            overlay.visible = False
+            try:
+                if overlay in state.page.overlay:
+                    state.page.overlay.remove(overlay)
+            except Exception:
+                pass
+            state.page.update()
+
+        def _save_anyway(_=None):
+            _fit_ack["tag"] = tag
+            _dismiss()
+            save(None)
+
+        overlay.content = ft.Container(
+            width=520, bgcolor=SURFACE_DARK, border_radius=14, padding=22,
+            border=ft.border.all(1, DANGER),
+            content=ft.Column([
+                ft.Row([
+                    ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED,
+                            color=DANGER, size=22),
+                    ft.Text("This model won't fit in GPU memory",
+                            size=15, weight=ft.FontWeight.W_700,
+                            color=ON_SURFACE),
+                ], spacing=8),
+                ft.Text(
+                    (f"{tag} needs roughly {needed:.1f} GB of VRAM but "
+                     f"this machine has {have:.1f} GB. "
+                     if needed and have else f"{tag} looks too large for "
+                     "the detected GPU. ")
+                    + "Ollama will still run it by spilling layers to "
+                    "system RAM — expect generation to be 10–50× slower. "
+                    "For a model this size the answer usually isn't worth "
+                    "the wait.",
+                    size=12.5, color=ON_SURFACE,
+                ),
+                ft.Text(
+                    "Better options: pick a preset (Settings → Presets), "
+                    "or a smaller variant of the same family — the "
+                    "benchmark showed small models are closer than you'd "
+                    "think (granite3.3:2b beat every model up to 32B).",
+                    size=12, color=ON_SURFACE_DIM,
+                ),
+                ft.Row([
+                    ft.OutlinedButton("Cancel — keep current model",
+                                      on_click=_dismiss),
+                    ft.TextButton("Save anyway (I understand it'll be slow)",
+                                  on_click=_save_anyway,
+                                  style=ft.ButtonStyle(color=DANGER)),
+                ], alignment=ft.MainAxisAlignment.END, spacing=8),
+            ], spacing=14, tight=True),
+        )
+        state.page.overlay.append(overlay)
+        overlay.visible = True
+        state.page.update()
+
     def save(_):
         if state.ws is None:
             _toast(state.page, "Open a workspace first")
             return
+        # VRAM-fit gate — only when the chat model actually changed, only
+        # for Ollama tags (GGUF paths bypass), and only until acknowledged.
+        _new_tag = (llm_model.value or "").strip()
+        if (_new_tag and _new_tag != state.cfg.llm_model
+                and "/" not in _new_tag and "\\" not in _new_tag
+                and _fit_ack["tag"] != _new_tag):
+            _fit, _needed, _have = _model_fit_check(_new_tag)
+            if _fit == "over":
+                _show_fit_warning(_new_tag, _needed, _have)
+                return
+            if _fit == "tight":
+                _toast(state.page,
+                       f"Heads-up: {_new_tag} is a tight fit "
+                       f"(~{_needed:.1f} GB of {_have:.1f} GB) — close "
+                       "other GPU apps for best speed")
         try:
             c = state.cfg
             # Snapshot the model fields BEFORE we mutate them so we can
@@ -5199,6 +5493,7 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
             c.query_suffix = query_suffix_field.value or ""
             c.query_negatives = query_negatives_field.value or ""
             c.use_file_metadata = bool(use_file_metadata_sw.value)
+            c.proprietary_data = bool(proprietary_sw.value)
             c.unload_llm_during_ingest = bool(unload_llm_sw.value)
             try:
                 c.embed_batch_size = max(1, int(embed_batch_field.value or 16))
@@ -5301,6 +5596,24 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
     # ----- Containers we'll re-render into -----
     hw_gpu_list = ft.Column(spacing=4, tight=True)
     hw_daemon_list = ft.Column(spacing=4, tight=True)
+    # Prominent "which GPU is Ollama actually using" banner + explicit
+    # default-GPU picker. The banner resolves the CURRENT chat model
+    # through the routing table exactly like a live chat call would.
+    hw_active_gpu_text = ft.Text("", size=12.5, color=ON_SURFACE,
+                                  weight=ft.FontWeight.W_600)
+    hw_default_gpu_dd = ft.Dropdown(
+        label="Run Ollama on", width=320, dense=True,
+        tooltip=(
+            "Which GPU handles models that have no per-model assignment "
+            "below.\n\n"
+            "• auto — ez-rag picks at call time: a GPU that already has "
+            "the model loaded wins (avoids a 5-30s reload), otherwise "
+            "the GPU with the most free VRAM.\n"
+            "• GPU N — always use that GPU's daemon. Spawn a daemon for "
+            "it first if it doesn't have one (button above).\n\n"
+            "Single-GPU machines can leave this on auto."
+        ),
+    )
     hw_assignment_list = ft.Column(spacing=4, tight=True)
     hw_status_text = ft.Text("", size=11, color=ON_SURFACE_DIM, italic=True)
 
@@ -5442,8 +5755,75 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
             tooltip="Stop this managed daemon",
         )
 
+    def _hw_resolve_chat_gpu() -> str:
+        """Human answer to 'which GPU will Ollama use for my chat model
+        right now?' — resolved through the routing table the same way a
+        live chat call resolves."""
+        model = (state.cfg.llm_model if state.cfg else "") or "?"
+        table = hw_state["table"]
+        gpus = {g.index: g for g in hw_state["detected_gpus"]}
+
+        def gpu_label(idx):
+            g = gpus.get(idx)
+            return f"GPU {idx}" + (f" · {g.name}" if g and g.name else "")
+
+        try:
+            a = table.assignment_for(model, "chat")
+        except Exception:
+            a = None
+        if a is not None and a.gpu_index >= 0:
+            d = table.daemon_for_gpu(a.gpu_index)
+            where = f" ({d.url})" if d else " (no daemon — will fall back!)"
+            return (f"Chat model {model} → {gpu_label(a.gpu_index)}"
+                    f"{where} — pinned below")
+        if table.default_gpu_index >= 0:
+            d = table.daemon_for_gpu(table.default_gpu_index)
+            where = f" ({d.url})" if d else " (no daemon — will fall back!)"
+            return (f"Chat model {model} → "
+                    f"{gpu_label(table.default_gpu_index)}{where} — "
+                    f"your explicit choice")
+        n = len(hw_state["detected_gpus"])
+        if n <= 1:
+            ext = hw_state["external"]
+            url = ext.url if ext and ext.reachable else "localhost:11434"
+            return (f"Chat model {model} → {gpu_label(0)} ({url}) — "
+                    f"only GPU")
+        return (f"Chat model {model} → auto: reuses a GPU that already "
+                f"has it loaded, else the one with most free VRAM "
+                f"({n} GPUs available)")
+
+    def _hw_default_gpu_changed(e):
+        val = (e.control.value or "auto")
+        try:
+            idx = -1 if val == "auto" else int(val)
+        except ValueError:
+            idx = -1
+        hw_state["table"].default_gpu_index = idx
+        hw_save_to_workspace()
+        if idx >= 0 and hw_state["table"].daemon_for_gpu(idx) is None:
+            _toast(state.page,
+                   f"GPU {idx} selected — spawn a daemon for it above or "
+                   "calls will fall back to the default Ollama")
+        hw_render()
+
+    hw_default_gpu_dd.on_change = _hw_default_gpu_changed
+
     def hw_render():
         """Re-render the Hardware card from hw_state."""
+        # ----- Which-GPU banner + default picker -----
+        hw_active_gpu_text.value = _hw_resolve_chat_gpu()
+        opts = [ft.dropdown.Option("auto", "auto (recommended)")]
+        for g in hw_state["detected_gpus"]:
+            vram_gb = (g.vram_total_mb or 0) / 1024.0
+            opts.append(ft.dropdown.Option(
+                str(g.index),
+                f"GPU {g.index} · {g.name or g.vendor.upper()} · "
+                f"{vram_gb:.0f} GB",
+            ))
+        hw_default_gpu_dd.options = opts
+        cur = hw_state["table"].default_gpu_index
+        hw_default_gpu_dd.value = "auto" if cur < 0 else str(cur)
+
         # ----- Detected GPUs -----
         hw_gpu_list.controls.clear()
         gpus = hw_state["detected_gpus"]
@@ -5941,6 +6321,15 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
 
     hardware_card = section_card(
         "HARDWARE / GPU ROUTING",
+        ft.Container(
+            padding=10, border_radius=8,
+            bgcolor="#00000022",
+            content=ft.Column([
+                hw_active_gpu_text,
+                hw_default_gpu_dd,
+            ], spacing=8, tight=True),
+        ),
+        ft.Divider(height=1, color="#262938"),
         ft.Row([
             ft.Text("Detected GPUs", size=12,
                     weight=ft.FontWeight.W_700,
@@ -6115,6 +6504,16 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                     ft.Container(
                         expand=1,
                         content=_build_presets_card(state),
+                    ),
+                ],
+                spacing=14,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            ),
+            ft.Row(
+                [
+                    ft.Container(
+                        expand=1,
+                        content=_build_proprietary_card(state),
                     ),
                 ],
                 spacing=14,
