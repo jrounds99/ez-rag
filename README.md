@@ -48,6 +48,12 @@ ez-rag chat                       # or interactive
 
 PDF (text + scanned with OCR fallback) · DOCX · **PPTX** (slides, tables, speaker notes) · XLSX / XLSM · CSV / TSV · HTML · MD · TXT / RST / LOG · EPUB · EML · PNG / JPG / WEBP / TIFF / BMP (OCR'd).
 
+Legacy binary Office files (**.doc / .xls / .ppt**) are converted
+automatically on ingest when [LibreOffice](https://www.libreoffice.org)
+(free) is installed — or MS Office + `pip install pywin32` as a
+fallback. Conversions are cached by content hash, and citations still
+point at the original file.
+
 ## Terminology
 
 The docs and the GUI use these three words deliberately — they're not interchangeable:

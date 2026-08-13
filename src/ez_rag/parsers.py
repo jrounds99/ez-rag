@@ -568,6 +568,35 @@ def parse_docx(path: Path) -> list[ParsedSection]:
     return sections
 
 
+# ----- Legacy Office (.doc / .xls / .ppt) ------------------------------------
+# Converted to the modern XML format via LibreOffice or MS Office COM
+# (see convert.py — cached by content hash), then parsed by the normal
+# modern-format parser. Citations attribute to the ORIGINAL file.
+
+def _parse_via_conversion(path: Path) -> list[ParsedSection]:
+    from .convert import convert_legacy
+    converted = convert_legacy(path)     # raises with guidance if no backend
+    parser = get_parser(converted)
+    if parser is None:                   # can't happen for TARGETS values
+        raise RuntimeError(f"No parser for converted file {converted.name}")
+    return parser(converted)
+
+
+@register(".doc")
+def parse_doc(path: Path) -> list[ParsedSection]:
+    return _parse_via_conversion(path)
+
+
+@register(".xls")
+def parse_xls(path: Path) -> list[ParsedSection]:
+    return _parse_via_conversion(path)
+
+
+@register(".ppt")
+def parse_ppt(path: Path) -> list[ParsedSection]:
+    return _parse_via_conversion(path)
+
+
 # ----- PPTX ------------------------------------------------------------------
 
 @register(".pptx")

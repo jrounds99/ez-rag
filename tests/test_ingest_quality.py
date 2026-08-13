@@ -250,6 +250,45 @@ def main():
     except ImportError:
         check("pptx test skipped (python-pptx missing)", True)
 
+    print("\n[11] legacy Office converter (.doc/.xls/.ppt)")
+    from ez_rag.convert import (
+        TARGETS, convert_legacy, converter_available, find_soffice,
+    )
+    from ez_rag.parsers import get_parser
+    check("legacy extensions registered",
+          all(get_parser(Path(f"x{e}")) is not None for e in TARGETS))
+    if converter_available() and find_soffice():
+        import subprocess as _sp
+        import tempfile as _tf
+        import docx as _docx
+        d = Path(_tf.mkdtemp(prefix="ezrag_leg_"))
+        doc = _docx.Document()
+        doc.add_paragraph("Marblehead limestone since 1834.")
+        doc.save(str(d / "r.docx"))
+        _sp.run([find_soffice(), "--headless", "--norestore",
+                 "--convert-to", "doc", "--outdir", str(d),
+                 str(d / "r.docx")], capture_output=True, timeout=180)
+        legacy = d / "r.doc"
+        if legacy.exists():
+            secs = get_parser(legacy)(legacy)
+            joined = "\n".join(s.text for s in secs)
+            check("doc converts + parses", "Marblehead" in joined,
+                  joined[:120])
+            import time as _t
+            t0 = _t.perf_counter()
+            convert_legacy(legacy)
+            check("conversion cached", _t.perf_counter() - t0 < 0.5)
+        else:
+            check("doc fixture built", False, "soffice reverse-convert failed")
+    else:
+        # No converter on this machine — the error must guide the user.
+        try:
+            convert_legacy(Path("nope.doc"))
+            check("no-backend raises with guidance", False)
+        except (RuntimeError, FileNotFoundError, ValueError) as e:
+            check("no-backend raises with guidance",
+                  "LibreOffice" in str(e) or isinstance(e, FileNotFoundError))
+
     print(f"\n=== ingest-quality summary: {len(PASS)} pass, {len(FAIL)} fail ===")
     for name, det in FAIL:
         print(f"  FAIL  {name} :: {det}")

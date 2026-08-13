@@ -28,6 +28,19 @@ chunker version so toggling re-ingests affected files):**
   skipped at ingest. Within-file only, so deleting one file can never
   orphan another file's content. Original ords preserved.
 
+**New — legacy Office converter (.doc / .xls / .ppt):**
+
+- Pre-2007 binary Office files now ingest via automatic conversion to
+  their modern equivalents (`src/ez_rag/convert.py`): LibreOffice
+  headless preferred (free, no Python deps), MS Office COM fallback
+  (Windows + `pip install pywin32`). Conversions cached under
+  `~/.ezrag/convert_cache/` by content sha — a legacy file converts
+  once ever. Registered parsers delegate to the modern-format parser,
+  so chunking/citations/provenance all attribute to the ORIGINAL
+  file. With neither backend installed the file errors with install
+  guidance instead of being silently skipped. Verified end-to-end on
+  real soffice-produced .doc/.xls/.ppt fixtures.
+
 **New — PPTX ingestion:**
 
 - PowerPoint (`.pptx`) parser via `python-pptx` (MIT, new core
