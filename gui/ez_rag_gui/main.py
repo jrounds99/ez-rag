@@ -3950,7 +3950,7 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
                                "finish before wiping")
             return
         overlay = ft.Container(expand=True, bgcolor="#000000AA",
-                                alignment=ft.alignment.center)
+                                alignment=ft.Alignment.CENTER)
 
         def _dismiss(_=None):
             overlay.visible = False
