@@ -212,6 +212,16 @@ def _ingest_impl(
         eff_chunker_version += "+hdr"
     if getattr(cfg, "dedup_chunks", True):
         eff_chunker_version += "+dedup"
+    _redact_terms = [t for t in (getattr(cfg, "redact_terms", []) or [])
+                     if (t or "").strip()]
+    if _redact_terms:
+        from .redaction import compile_matchers, terms_fingerprint
+        _redact_matchers = compile_matchers(
+            _redact_terms, smart=getattr(cfg, "redact_smart", True))
+        eff_chunker_version += "+redact" + terms_fingerprint(
+            _redact_terms, getattr(cfg, "redact_smart", True))
+    else:
+        _redact_matchers = []
 
     # Experimental PDF backend (marker / docling). Folded into the
     # effective parser version so switching backends re-ingests PDFs.
@@ -391,6 +401,12 @@ def _ingest_impl(
     docs_dir.mkdir(parents=True, exist_ok=True)
     files = _walk_docs(docs_dir)
     stats.files_seen = len(files)
+    if _redact_terms:
+        from .redaction import filename_warnings
+        for w in filename_warnings(
+                [str(p.relative_to(ws.root)) for p in files],
+                _redact_terms):
+            _emit(progress, _early_snap(f"[redaction warning] {w}"))
     _emit(progress, _early_snap(
         f"   ↪ done in {time.perf_counter() - t:.1f}s — "
         f"found {len(files)} ingestible file(s)"
@@ -864,6 +880,27 @@ def _ingest_impl(
                     _header = f"[{_crumb}]" + (f" {_hdr_extra}"
                                                 if _hdr_extra else "")
                     c.text = _header + "\n" + c.text
+
+            # 3) Context-aware redaction (docs/PROPRIETARY_DATA.md):
+            #    configured terms are removed from chunk text BEFORE
+            #    tokenization and embedding, so they never exist in the
+            #    index, the FTS tokens, or the vectors. Applied after
+            #    headers so a document title carrying the term is
+            #    covered too.
+            if _redact_matchers:
+                from .redaction import redact_text
+                _n_red = 0
+                for c in chunks:
+                    _r = redact_text(
+                        c.text, _redact_matchers,
+                        getattr(cfg, "redact_replacement", "[REDACTED]"))
+                    c.text = _r.text
+                    _n_red += _r.n_redacted
+                if _n_red:
+                    _emit(progress, snapshot(
+                        current_path=rel,
+                        status=f"redacted {_n_red} occurrence(s)",
+                    ))
             _emit(progress, snapshot(
                 current_path=rel,
                 status=(f"chunked in {chunk_s:.2f}s — {len(chunks)} chunks "
@@ -1001,6 +1038,15 @@ def _ingest_impl(
             # parser cache. Failures here must not block ingest.
             try:
                 chapters = detect_chapters(path, chunks)
+                # Chapter titles come from document headings — redact too.
+                if _redact_matchers and chapters:
+                    from .redaction import redact_text
+                    for _ch in chapters:
+                        _r = redact_text(
+                            _ch.get("title") or "", _redact_matchers,
+                            getattr(cfg, "redact_replacement", "[REDACTED]"))
+                        if _r.n_redacted:
+                            _ch["title"] = _r.text
             except Exception:
                 chapters = []
 

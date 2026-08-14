@@ -91,6 +91,11 @@ ez-rag preset                 benchmark-backed setting bundles
                               (preset <id> for details, --apply to use)
 ez-rag lock / unlock          encrypt / decrypt the index (proprietary
                               data mode — docs/PROPRIETARY_DATA.md)
+ez-rag redact-check           verify redacted terms are absent from
+                              the index
+ez-rag glossary               acronym/term/SKU index with sources —
+                              in-corpus definitions, Wikipedia links
+                              for the rest, HTML report
 ```
 
 Topics for `ez-rag help`: `getting-started`, `workflow`, `ingestion`, `retrieval`, `models`, `chat`, `gui`, `ocr`, `cli`, `settings` (the expanded every-knob guide).

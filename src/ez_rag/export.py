@@ -104,11 +104,43 @@ def export_chatbot(
     `progress(label, done, total)` is an optional callback fired during
     source copying so the GUI can show real progress for big workspaces.
 
+    REDACTION SAFETY: when `cfg.redact_terms` is configured, the export
+    verifies the index text is actually clean (terms added AFTER the
+    last ingest would still be present — the error tells you to
+    re-ingest), and refuses `include_sources` outright: the original
+    documents contain the redacted data by definition, so bundling
+    them would defeat the point of redacting.
+
     Returns the written archive path. `dest` is created or overwritten.
     `palette` should be one of the dicts loaded from `themes.toml`; if None
     the dark default is used. `title` is shown in the page <title> and H1
     (defaults to the workspace folder name).
     """
+    # ----- Redaction safety gate -------------------------------------
+    _cfg = ws.load_config()
+    _terms = [t for t in (getattr(_cfg, "redact_terms", []) or [])
+              if (t or "").strip()]
+    if _terms:
+        if include_sources:
+            raise RuntimeError(
+                "Redaction is configured (redact_terms) but "
+                "include_sources=True would bundle the ORIGINAL "
+                "documents, which still contain the redacted data. "
+                "Export without sources, or clear redact_terms if you "
+                "really intend to distribute the originals."
+            )
+        from .redaction import scan_index_for_terms
+        leaks = scan_index_for_terms(
+            ws.meta_db_path, _terms,
+            smart=getattr(_cfg, "redact_smart", True))
+        if leaks:
+            detail = ", ".join(f"'{t}' x{n}" for t, n in leaks.items())
+            raise RuntimeError(
+                f"Redacted terms still present in the index: {detail}. "
+                f"This happens when terms were added after the last "
+                f"ingest. Run `ez-rag ingest` (redaction re-ingests "
+                f"affected files automatically), then export again."
+            )
     dest = Path(dest)
     if not dest.suffix:
         dest = dest.with_suffix(".zip")

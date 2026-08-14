@@ -732,6 +732,92 @@ def preset_cmd(
         )
 
 
+@app.command("glossary")
+def glossary_cmd(
+    min_occurrences: int = typer.Option(
+        2, "--min-occurrences",
+        help="Only include acronyms/SKUs seen at least this many times "
+             "(in-corpus definitions are always included)."),
+    no_web: bool = typer.Option(
+        False, "--no-web",
+        help="Skip Wikipedia verification — external links are "
+             "constructed offline and labeled unverified. Forced ON "
+             "when proprietary_data is enabled."),
+    add_to_corpus: bool = typer.Option(
+        False, "--add-to-corpus",
+        help="Also write docs/_glossary.md so the next ingest makes "
+             "the glossary itself retrievable in chat."),
+    open_report: bool = typer.Option(
+        False, "--open", help="Open the HTML report when done."),
+):
+    """Build the corpus glossary: acronyms, definitions, and SKUs.
+
+    Finds every acronym in the indexed corpus, pairs it with its
+    in-corpus definition when the documents contain one ("Full Name
+    (ACRO)" patterns, initials-validated), attaches a Wikipedia
+    reference when they don't, and links vendor searches for product
+    model codes. Produces a self-contained HTML report showing every
+    entry and WHERE it came from, plus .ezrag/glossary.json."""
+    from .glossary import build_glossary
+    from .security import require_unlocked
+    ws = require_workspace()
+    require_unlocked(ws.root)
+    cfg = ws.load_config()
+    allow_web = not no_web and not getattr(cfg, "proprietary_data", False)
+    if not allow_web and not no_web:
+        console.print("[dim]proprietary_data is on — building offline "
+                      "(no web verification).[/dim]")
+
+    with console.status("scanning corpus…"):
+        summary = build_glossary(
+            ws.root, allow_web=allow_web,
+            min_occurrences=min_occurrences,
+            add_to_corpus=add_to_corpus,
+        )
+    t = Table(show_header=False, box=None)
+    t.add_row("entries", str(summary["entries"]))
+    t.add_row("defined in corpus", str(summary["defined_in_corpus"]))
+    t.add_row("external references", str(summary["external"]))
+    t.add_row("product codes (SKUs)", str(summary["skus"]))
+    t.add_row("HTML report", summary["html"])
+    t.add_row("JSON", summary["json"])
+    if summary["markdown"]:
+        t.add_row("corpus glossary", summary["markdown"]
+                  + "  (re-run ingest to index it)")
+    console.print(Panel(t, title="glossary built", border_style="green"))
+    if open_report:
+        import webbrowser
+        webbrowser.open(Path(summary["html"]).as_uri())
+
+
+@app.command("redact-check")
+def redact_check_cmd():
+    """Verify the index contains none of the configured redact terms.
+
+    Uses aggressive matching (case-insensitive + name variants) — a hit
+    on a common-noun usage is possible and is yours to judge. Zero hits
+    means the index, FTS, and (by construction) the vectors are clean."""
+    from .redaction import scan_index_for_terms
+    ws = require_workspace()
+    cfg = ws.load_config()
+    terms = [t for t in (getattr(cfg, "redact_terms", []) or []) if t.strip()]
+    if not terms:
+        console.print("[yellow]No redact_terms configured.[/yellow] Add "
+                      "them in config.toml or Settings → Proprietary data.")
+        raise typer.Exit(0)
+    hits = scan_index_for_terms(ws.meta_db_path, terms, smart=False)
+    if not hits:
+        console.print(f"[green]Clean.[/green] None of the {len(terms)} "
+                      "configured term(s) appear in the index.")
+        raise typer.Exit(0)
+    t = Table(title="redacted terms still present (re-run ez-rag ingest)")
+    t.add_column("term"); t.add_column("occurrences", justify="right")
+    for term, n in hits.items():
+        t.add_row(term, str(n))
+    console.print(t)
+    raise typer.Exit(1)
+
+
 @app.command("lock")
 def lock_cmd():
     """Encrypt this workspace's index (proprietary-data mode).

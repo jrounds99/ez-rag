@@ -130,6 +130,14 @@ into benchmark-backed choices.
   `ez-rag lock` / `unlock` (AES-256-GCM index encryption). Full
   explanation: docs/PROPRIETARY_DATA.md.
 
+- **redact_terms / redact_replacement / redact_smart** —
+  context-aware removal at ingest: listed terms (names, emails, IDs)
+  never reach the index, FTS, or vectors. Two-word names match their
+  variants; ambiguous single words use smart casing ("Stone" the
+  name redacted, "crushed stone" kept). Exports verify the index is
+  clean and refuse include_sources while set. `ez-rag redact-check`
+  audits anytime.
+
 ## Query modifiers & metadata
 
 - **apply_query_modifiers / query_prefix / query_suffix /

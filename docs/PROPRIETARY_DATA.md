@@ -70,6 +70,50 @@ Passphrase (min 8 chars): ********
 Locked. Index encrypted at meta.sqlite.enc. Unlock with: ez-rag unlock
 ```
 
+## Context-aware redaction (remove data at ingest)
+
+For data that shouldn't exist in the index at all — your name, an
+email, an account number — list it in config and it is removed from
+every chunk BEFORE tokenization and embedding:
+
+```toml
+redact_terms = ["Casey Stone", "casey@example.com"]
+redact_replacement = "[REDACTED]"   # default
+redact_smart = true                  # default
+```
+
+Because redaction happens before anything derived from the text
+exists, the terms never reach the index text, the FTS search tokens,
+or the embedding vectors — so they can't surface in answers and can't
+ship in a distributed export.
+
+**Context-aware means the ambiguity is handled.** A surname like
+"Stone" is also an ordinary word; blind replacement would mangle
+"the crew hauled crushed stone". The rules:
+
+- Multi-word names are redacted case-insensitively everywhere, and
+  their real-world variants match too: `Stone, Casey` · `C. Stone`
+  · `Casey S.`
+- Terms with `@` or digits (emails, IDs, phone numbers) are
+  unambiguous → redacted in any case.
+- A lone ambiguous token uses **smart casing**: `Rounds` (capitalized,
+  how names appear) is redacted; `crushed stone` (lowercase common
+  noun) is preserved. Set `redact_smart = false` to redact every
+  occurrence regardless.
+
+**Distribution protection.** `export_chatbot` verifies the index is
+actually clean with the same matching rules (terms added after the
+last ingest are caught with a "re-ingest first" error), and refuses
+`include_sources` while redaction is configured — the original
+documents contain the data by definition. Editing the term list
+re-ingests affected files automatically on the next ingest.
+Verify anytime with `ez-rag redact-check` (aggressive scan — flags
+even common-noun occurrences for your review).
+
+**Limits:** filenames containing a term are warned about at ingest
+(paths are stored and shown in citations — rename the file); the
+original documents in docs/ keep the term, by definition.
+
 ## Honest limits — read this part
 
 Security features that overpromise are worse than none, so:

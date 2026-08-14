@@ -187,6 +187,17 @@ class Config:
     #      index (AES-256-GCM, scrypt-derived key) when you're away.
     # See docs/PROPRIETARY_DATA.md for exactly what is and isn't covered.
     proprietary_data: bool = False
+    # Context-aware redaction at ingest. Terms listed here (names,
+    # emails, IDs) are removed from chunk text BEFORE embedding and
+    # indexing, so they never reach the index, the FTS tokens, the
+    # vectors, or a distributed export. Multi-word names also match
+    # their common variants ("Stone, Casey", "C. Stone"); ambiguous
+    # single tokens use smart casing (capitalized occurrences redacted,
+    # lowercase common-noun usage kept — see redaction.py). Editing
+    # this list re-ingests affected files automatically.
+    redact_terms: list[str] = field(default_factory=list)
+    redact_replacement: str = "[REDACTED]"
+    redact_smart: bool = True     # False = redact every occurrence, any case
 
     extra: dict[str, Any] = field(default_factory=dict)
 

@@ -4128,6 +4128,20 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
                 size=11.5, color=ON_SURFACE_DIM,
             ),
             ft.Divider(height=1, color="#262938"),
+            ft.Text("Context-aware redaction", size=12,
+                    weight=ft.FontWeight.W_700, color=ON_SURFACE),
+            ft.Text(
+                "Terms listed here are removed from every chunk BEFORE "
+                "embedding and indexing — they never exist in the index, "
+                "the search tokens, or the vectors, so they can't leak "
+                "into answers or a distributed export (which also "
+                "verifies the index is clean and refuses to bundle "
+                "original documents while redaction is set). Save, then "
+                "re-run ingest to apply to existing files.",
+                size=11, color=ON_SURFACE_DIM,
+            ),
+            redact_terms_field,
+            ft.Divider(height=1, color="#262938"),
             ft.Row([
                 ft.Text("Workspace lock", size=12,
                         weight=ft.FontWeight.W_700, color=ON_SURFACE),
@@ -5266,8 +5280,26 @@ you're away. Details: docs/PROPRIETARY_DATA.md"""
         ),
     )
 
+    redact_terms_field = ft.TextField(
+        label="Redact at ingest (one term per line)",
+        multiline=True, min_lines=2, max_lines=5, dense=True,
+        hint_text="Casey Stone\ncasey@example.com",
+        tooltip=(
+            "Context-aware removal BEFORE indexing: these terms never "
+            "reach the index text, the search tokens, or the embedding "
+            "vectors — so they can't appear in answers or exports. "
+            "Two-word names also match variants (Stone, Casey / "
+            "C. Stone). Ambiguous single words use smart casing: "
+            "'Stone' (capitalized) is redacted, 'crushed stone' is "
+            "kept. Editing this re-ingests affected files on the next "
+            "ingest run."
+        ),
+    )
+
     def load_from_cfg():
         c = state.cfg
+        redact_terms_field.value = "\n".join(
+            getattr(c, "redact_terms", []) or [])
         proprietary_sw.value = bool(getattr(c, "proprietary_data", False))
         chunk_size.value = str(c.chunk_size)
         chunk_overlap.value = str(c.chunk_overlap)
@@ -5494,6 +5526,10 @@ you're away. Details: docs/PROPRIETARY_DATA.md"""
             c.query_negatives = query_negatives_field.value or ""
             c.use_file_metadata = bool(use_file_metadata_sw.value)
             c.proprietary_data = bool(proprietary_sw.value)
+            c.redact_terms = [
+                t.strip() for t in
+                (redact_terms_field.value or "").splitlines() if t.strip()
+            ]
             c.unload_llm_during_ingest = bool(unload_llm_sw.value)
             try:
                 c.embed_batch_size = max(1, int(embed_batch_field.value or 16))

@@ -9,6 +9,39 @@ versions follow nothing yet because this is alpha.
 
 ### Models, GPUs, presets, proprietary data (2026-08-13)
 
+- **Corpus glossary** (`ez-rag glossary`) — builds a defined-terms
+  index from the ingested corpus: every acronym is paired with its
+  in-corpus definition when the documents contain one ("Full Name
+  (ACRO)" patterns, validated by initials incl. stopword skipping);
+  undefined acronyms get a Wikipedia reference (verified via the
+  Wikimedia API with a policy-compliant UA + throttle; constructed
+  offline links under proprietary_data/--no-web); product model codes
+  (SKUs) are detected with vendor-adjacent attribution and
+  vendor-scoped search links (always labeled unverified). Outputs a
+  self-contained HTML report — every entry, its definition, and WHERE
+  it came from (file:page or external URL) — plus
+  .ezrag/glossary.json, and optionally docs/_glossary.md
+  (--add-to-corpus) so chat can answer "what does X stand for".
+  Validated on the Ohio corpus: 246 entries, 42 defined in-corpus
+  (CPRAS, CRBG, DEM…), 193 Wikipedia-verified. 26 tests.
+
+- **Context-aware redaction at ingest** (`redact_terms`) — listed
+  terms (names, emails, IDs) are removed from chunk text BEFORE
+  tokenization and embedding, so they never exist in the index text,
+  the FTS tokens, or the vectors — and therefore can't leak into
+  answers or exports. Handles the ambiguity problem: two-word names
+  match their document variants (`Stone, Casey` / `C. Stone` /
+  `Casey S.`); ambiguous lone tokens use smart casing ("Stone"
+  redacted, "crushed stone" preserved; `redact_smart=false` for
+  scorched-earth). Chunk headers and chapter titles covered; filenames
+  containing a term are warned about. Term edits re-ingest affected
+  files automatically (version fold). `export_chatbot` verifies the
+  index is clean (same smart rules) and refuses `include_sources`
+  while redaction is configured; `ez-rag redact-check` is the
+  aggressive human-review audit. GUI: term list in Settings →
+  Proprietary data. 27 tests, including the "crushed stone"
+  disambiguation and both export gates.
+
 - **Proprietary-data mode** (`proprietary_data`) — the "nothing leaves
   this machine" flip. Non-local LLM/embedding endpoints raise instead
   of sending text (loopback + RFC-1918 only; DNS names refused); cloud
