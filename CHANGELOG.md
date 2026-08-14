@@ -9,6 +9,14 @@ versions follow nothing yet because this is alpha.
 
 ### Settings UI overhaul (2026-08-14)
 
+- **Missing-model pre-flight in chat** — sending a question when the
+  configured chat model isn't installed now pops a dialog *before*
+  the query runs: "Pull & ask" downloads the model with live progress
+  in the chat bubble, then answers the original question
+  automatically. (Previously you got an error card after the fact.)
+  Fails open when Ollama is unreachable so the server-down card still
+  does its job; skipped when a cloud agent provider will answer.
+
 - **Sticky save bar** — Save / Reset moved out of the scrolling
   settings list into an always-visible footer. No more scrolling to
   the bottom to save.

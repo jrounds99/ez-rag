@@ -1850,6 +1850,152 @@ def build_chat_view(state: AppState, *, refresh_status,
 
     stop_btn.on_click = stop_clicked
 
+    # ----- Missing-model pre-flight -----------------------------------
+    # Instead of running the question into a guaranteed "model not
+    # found" error card, check Ollama's installed tags first and OFFER
+    # to pull — then answer the original question automatically.
+    _installed_cache: dict = {"t": 0.0, "tags": set()}
+    _pull_gate = {"bypass": False}
+
+    def _missing_llm_tag():
+        """Configured chat-model tag if NOT installed, else None.
+
+        Returns None (= don't prompt) when the model is installed, when
+        Ollama is unreachable (the server-down error card is the right
+        message there), or when the answer won't come from local Ollama
+        (cloud agent provider)."""
+        cfg = state.cfg
+        if cfg.agentic and getattr(cfg, "agent_provider", "same") != "same":
+            return None
+        tag = (cfg.llm_model or "").strip()
+        if not tag:
+            return None
+        now = time.time()
+        if now - _installed_cache["t"] > 20:
+            try:
+                import httpx as _hx
+                r = _hx.get(cfg.llm_url.rstrip("/") + "/api/tags",
+                            timeout=2.0)
+                r.raise_for_status()
+                _installed_cache["tags"] = {
+                    m.get("name", "")
+                    for m in r.json().get("models", []) or []}
+                _installed_cache["t"] = now
+            except Exception:
+                return None
+        tags = _installed_cache["tags"]
+        if tag in tags or f"{tag}:latest" in tags:
+            return None
+        if ":" not in tag and any(t.split(":")[0] == tag for t in tags):
+            return None
+        return tag
+
+    def _offer_pull(tag: str, question: str):
+        overlay = ft.Container(expand=True, bgcolor="#000000AA",
+                                alignment=ft.Alignment.CENTER)
+
+        def _close(_=None):
+            try:
+                if overlay in state.page.overlay:
+                    state.page.overlay.remove(overlay)
+            except Exception:
+                pass
+            state.page.update()
+
+        def _cancel(_=None):
+            _close()
+            input_field.value = question
+            state.page.update()
+
+        def _ask_anyway(_=None):
+            _close()
+            _pull_gate["bypass"] = True
+            try:
+                input_field.value = question
+                send_clicked()
+            finally:
+                _pull_gate["bypass"] = False
+
+        def _pull_and_ask(_=None):
+            _close()
+            note = ChatTurn(role="assistant",
+                            text=f"_Pulling **{tag}**…_", streaming=True)
+            state.turns.append(note)
+            render_chat(force_scroll=True)
+            set_busy(True)
+
+            def worker():
+                err = None
+                try:
+                    for evt in pull_ollama_model(state.cfg.llm_url, tag):
+                        if evt.get("error"):
+                            err = evt["error"]
+                            break
+                        status = evt.get("status", "")
+                        total = evt.get("total") or 0
+                        done = evt.get("completed") or 0
+                        if total:
+                            note.text = (
+                                f"_Pulling **{tag}** — {status} "
+                                f"{done * 100 // total}% "
+                                f"({done / 1e9:.1f} / "
+                                f"{total / 1e9:.1f} GB)_")
+                        else:
+                            note.text = f"_Pulling **{tag}** — {status}_"
+                        update_streaming_assistant(note)
+                        if state.stop_flag:
+                            err = "cancelled"
+                            break
+                except Exception as ex:
+                    err = str(ex)
+                state.stop_flag = False
+                note.streaming = False
+                _installed_cache["t"] = 0.0
+                if err:
+                    note.text = (f"Pull of {tag} didn't finish: {err} — "
+                                 f"ask again to retry.")
+                    set_busy(False)
+                    render_chat()
+                    return
+                note.text = f"✓ Pulled **{tag}** — answering your question…"
+                set_busy(False)
+                render_chat()
+                input_field.value = question
+                send_clicked()
+
+            state.page.run_thread(worker)
+
+        overlay.content = ft.Container(
+            width=520, bgcolor=SURFACE_DARK, border_radius=14, padding=22,
+            border=ft.border.all(1, ACCENT),
+            content=ft.Column([
+                ft.Row([
+                    ft.Icon(ft.Icons.CLOUD_DOWNLOAD, color=ACCENT, size=22),
+                    ft.Text("Chat model not installed", size=15,
+                            weight=ft.FontWeight.W_700, color=ON_SURFACE),
+                ], spacing=8),
+                ft.Text(
+                    f"'{tag}' is set as your chat model but isn't in "
+                    f"Ollama yet. Pull it now (one-time download) and "
+                    f"then answer your question automatically?",
+                    size=12.5, color=ON_SURFACE,
+                ),
+                ft.Row([
+                    ft.OutlinedButton("Cancel", on_click=_cancel),
+                    ft.TextButton("Ask anyway", on_click=_ask_anyway,
+                                  tooltip="Send the question without "
+                                          "pulling — it will fail with "
+                                          "the model-not-found card."),
+                    ft.FilledButton("Pull & ask",
+                                    icon=ft.Icons.CLOUD_DOWNLOAD,
+                                    on_click=_pull_and_ask,
+                                    bgcolor=ACCENT, color="#FFFFFF"),
+                ], alignment=ft.MainAxisAlignment.END, spacing=8),
+            ], spacing=14, tight=True),
+        )
+        state.page.overlay.append(overlay)
+        state.page.update()
+
     def send_clicked(_=None):
         if state.streaming:
             return
@@ -1859,6 +2005,12 @@ def build_chat_view(state: AppState, *, refresh_status,
         text = (input_field.value or "").strip()
         if not text:
             return
+        if not _pull_gate["bypass"]:
+            missing = _missing_llm_tag()
+            if missing:
+                input_field.value = ""
+                _offer_pull(missing, text)
+                return
         input_field.value = ""
         state.turns.append(ChatTurn(role="user", text=text))
         assistant = ChatTurn(role="assistant", text="", streaming=True)
