@@ -4751,8 +4751,47 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         label="Chapter cap (chars)", value="16000", width=180, dense=True,
         tooltip=TIP["chapter_max_chars"],
     )
+    crag_filter_sw = ft.Switch(
+        label="CRAG relevance filter", value=False, active_color=ACCENT,
+        tooltip="After retrieval, one batched LLM call asks which "
+                "retrieved chunks are actually relevant and drops the "
+                "rest. +1 small LLM call per question. Useful for noisy "
+                "mixed corpora; unnecessary on clean ones.",
+    )
+    reorder_attention_sw = ft.Switch(
+        label="Reorder for attention", value=False, active_color=ACCENT,
+        tooltip="Places the best hits at the START and END of the "
+                "prompt (anti lost-in-the-middle). Our bench measured "
+                "this slightly WORSE on normal contexts — consider only "
+                "for very long (>32 KB) prompts.",
+    )
+
+    adv_retrieval_box = ft.Column([], spacing=8, tight=True, visible=False)
+
+    def _toggle_adv_retrieval(_):
+        adv_retrieval_box.visible = not adv_retrieval_box.visible
+        adv_retrieval_btn.text = (
+            "Hide advanced retrieval"
+            if adv_retrieval_box.visible
+            else "Advanced retrieval (HyDE, MMR, chapters…)")
+        try:
+            state.page.update()
+        except Exception:
+            pass
+
+    adv_retrieval_btn = ft.TextButton(
+        "Advanced retrieval (HyDE, MMR, chapters…)",
+        icon=ft.Icons.EXPAND_MORE, on_click=_toggle_adv_retrieval,
+        tooltip="Options that benchmarked neutral-to-negative on typical "
+                "corpora and stay OFF by default: HyDE, multi-query, "
+                "MMR, context windows, chapter expansion, CRAG, "
+                "attention reorder, agentic mode. Open when your corpus "
+                "has a specific problem these solve.",
+    )
+
     use_corpus = ft.Switch(label="Use RAG", value=True,
                            active_color=ACCENT, tooltip=TIP["use_corpus"])
+
     unload_llm_sw = ft.Switch(
         label="Unload LLM during ingest",
         value=True, active_color=ACCENT, tooltip=TIP["unload_llm"],
@@ -4790,6 +4829,26 @@ def build_settings_view(state: AppState, *, refresh_status, on_pick_workspace):
         label="Base URL (OpenAI-compat)", value="https://api.openai.com/v1",
         width=400, dense=True, tooltip=TIP["agent_base_url"],
     )
+    agent_cloud_hint = ft.Text(
+        "Cloud agent providers are disabled while Proprietary data "
+        "mode is on — agentic retrieval uses your local model.",
+        size=11, color=WARNING, italic=True, visible=False,
+    )
+
+    adv_retrieval_box.controls = [
+        ft.Row([use_hyde_sw, multi_query_sw, agentic_sw],
+               spacing=14, wrap=True,
+               vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        ft.Row([context_window_field, use_mmr_sw, mmr_lambda_field],
+               spacing=14, wrap=True,
+               vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        ft.Row([expand_chapter_sw, chapter_max_chars_field],
+               spacing=14, wrap=True,
+               vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        ft.Row([crag_filter_sw, reorder_attention_sw],
+               spacing=14, wrap=True,
+               vertical_alignment=ft.CrossAxisAlignment.CENTER),
+    ]
 
     # Query modifiers
     query_prefix_field = ft.TextField(
@@ -5466,6 +5525,18 @@ you're away. Details: docs/PROPRIETARY_DATA.md"""
         ),
     )
 
+    def _sync_agent_fields(_=None):
+        is_prop = bool(proprietary_sw.value)
+        agent_api_key_field.visible = not is_prop
+        agent_base_url_field.visible = not is_prop
+        agent_cloud_hint.visible = is_prop
+        try:
+            state.page.update()
+        except Exception:
+            pass
+
+    proprietary_sw.on_change = _sync_agent_fields
+
     def load_from_cfg():
         c = state.cfg
         redact_terms_field.value = "\n".join(
@@ -5482,6 +5553,10 @@ you're away. Details: docs/PROPRIETARY_DATA.md"""
         use_mmr_sw.value = c.use_mmr
         mmr_lambda_field.value = str(c.mmr_lambda)
         expand_chapter_sw.value = getattr(c, "expand_to_chapter", False)
+        crag_filter_sw.value = getattr(c, "crag_filter", False)
+        reorder_attention_sw.value = getattr(
+            c, "reorder_for_attention", False)
+        _sync_agent_fields()
         chapter_max_chars_field.value = str(getattr(c, "chapter_max_chars", 16000))
         agentic_sw.value = c.agentic
         agent_provider_dd.value = c.agent_provider
@@ -5680,6 +5755,8 @@ you're away. Details: docs/PROPRIETARY_DATA.md"""
             except ValueError:
                 pass
             c.expand_to_chapter = bool(expand_chapter_sw.value)
+            c.crag_filter = bool(crag_filter_sw.value)
+            c.reorder_for_attention = bool(reorder_attention_sw.value)
             try:
                 c.chapter_max_chars = max(
                     1000, int(chapter_max_chars_field.value or 16000)
@@ -6525,16 +6602,7 @@ you're away. Details: docs/PROPRIETARY_DATA.md"""
     def stop_health_watchdog():
         hw_health_state["running"] = False
 
-    hardware_card = section_card(
-        "HARDWARE / GPU ROUTING",
-        ft.Container(
-            padding=10, border_radius=8,
-            bgcolor="#00000022",
-            content=ft.Column([
-                hw_active_gpu_text,
-                hw_default_gpu_dd,
-            ], spacing=8, tight=True),
-        ),
+    hw_advanced_box = ft.Column([
         ft.Divider(height=1, color="#262938"),
         ft.Row([
             ft.Text("Detected GPUs", size=12,
@@ -6567,6 +6635,40 @@ you're away. Details: docs/PROPRIETARY_DATA.md"""
         ft.Divider(height=1, color="#262938"),
         hw_spawn_managed_sw,
         hw_sched_spread_sw,
+    ], spacing=8, tight=True, visible=False)
+
+    def _toggle_hw_advanced(_):
+        hw_advanced_box.visible = not hw_advanced_box.visible
+        hw_adv_btn.text = (
+            "Hide advanced GPU controls"
+            if hw_advanced_box.visible
+            else "Advanced GPU controls (daemons, per-model pinning)")
+        try:
+            state.page.update()
+        except Exception:
+            pass
+
+    hw_adv_btn = ft.TextButton(
+        "Advanced GPU controls (daemons, per-model pinning)",
+        icon=ft.Icons.EXPAND_MORE, on_click=_toggle_hw_advanced,
+        tooltip="Spawn per-GPU Ollama daemons, pin specific models to "
+                "specific GPUs, watch live placement. Single-GPU "
+                "machines rarely need any of this — the banner above "
+                "already answers 'which GPU am I using'.",
+    )
+
+    hardware_card = section_card(
+        "HARDWARE / GPU ROUTING",
+        ft.Container(
+            padding=10, border_radius=8,
+            bgcolor="#00000022",
+            content=ft.Column([
+                hw_active_gpu_text,
+                hw_default_gpu_dd,
+            ], spacing=8, tight=True),
+        ),
+        hw_adv_btn,
+        hw_advanced_box,
     )
 
     # Initial population — done lazily on the first Settings open via
@@ -6605,17 +6707,8 @@ you're away. Details: docs/PROPRIETARY_DATA.md"""
                             ft.Row([top_k, hybrid, rerank], spacing=14,
                                    wrap=True,
                                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                            ft.Row([use_hyde_sw, multi_query_sw, agentic_sw],
-                                   spacing=14, wrap=True,
-                                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                            ft.Row([context_window_field, use_mmr_sw,
-                                    mmr_lambda_field], spacing=14,
-                                   wrap=True,
-                                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                            ft.Row([expand_chapter_sw,
-                                    chapter_max_chars_field], spacing=14,
-                                   wrap=True,
-                                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                            adv_retrieval_btn,
+                            adv_retrieval_box,
                         ),
                     ),
                 ],
@@ -6660,6 +6753,7 @@ you're away. Details: docs/PROPRIETARY_DATA.md"""
                             agent_model_field,
                             agent_api_key_field,
                             agent_base_url_field,
+                            agent_cloud_hint,
                         ),
                     ),
                     ft.Container(
@@ -6728,22 +6822,37 @@ you're away. Details: docs/PROPRIETARY_DATA.md"""
                 spacing=14,
                 vertical_alignment=ft.CrossAxisAlignment.START,
             ),
-            ft.Row(
-                [
-                    ft.FilledButton("Save settings", icon=ft.Icons.CHECK,
-                                    on_click=save, bgcolor=ACCENT, color="#FFFFFF",
-                                    tooltip=TIP["save_btn"]),
-                    ft.TextButton("Reset", icon=ft.Icons.UNDO,
-                                  on_click=lambda _: load_from_cfg(),
-                                  tooltip=TIP["reset_btn"]),
-                ],
-                spacing=10,
-            ),
             ft.Container(height=24),
         ],
     )
 
-    container = ft.Container(bgcolor=BG_DARK, expand=True, content=body)
+    # Sticky save bar — always visible, no scroll-to-save.
+    save_bar = ft.Container(
+        bgcolor=SURFACE_DARK,
+        border=ft.border.only(top=ft.BorderSide(1, "#262938")),
+        padding=ft.padding.symmetric(horizontal=20, vertical=10),
+        content=ft.Row(
+            [
+                ft.FilledButton("Save settings", icon=ft.Icons.CHECK,
+                                on_click=save, bgcolor=ACCENT,
+                                color="#FFFFFF",
+                                tooltip=TIP["save_btn"]),
+                ft.TextButton("Reset", icon=ft.Icons.UNDO,
+                              on_click=lambda _: load_from_cfg(),
+                              tooltip=TIP["reset_btn"]),
+                ft.Container(expand=True),
+                ft.Text("Changes apply after Save", size=11,
+                        color=ON_SURFACE_DIM, italic=True),
+            ],
+            spacing=10,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+    )
+
+    container = ft.Container(
+        bgcolor=BG_DARK, expand=True,
+        content=ft.Column([body, save_bar], spacing=0, expand=True),
+    )
     # Expose open_pull_dialog so other views (e.g. the chat error
     # 'Re-pull this model' action) can trigger a pull without re-implementing
     # the whole dialog. The chat view captures this via a shared callback dict.

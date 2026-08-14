@@ -7,6 +7,29 @@ versions follow nothing yet because this is alpha.
 
 ## [Unreleased]
 
+### Settings UI overhaul (2026-08-14)
+
+- **Sticky save bar** — Save / Reset moved out of the scrolling
+  settings list into an always-visible footer. No more scrolling to
+  the bottom to save.
+- **Hardware card collapsed** — the "Chat model → GPU" banner and the
+  "Run Ollama on" picker stay visible; daemons, per-model pinning,
+  live placement, and scheduler switches now sit behind an
+  "Advanced GPU controls" expander. Single-GPU machines see two
+  controls instead of twenty.
+- **Advanced retrieval expander** — HyDE, multi-query, MMR + λ,
+  context windows, chapter expansion, and agentic mode (options that
+  benchmarked neutral-to-negative on typical corpora and default
+  OFF) collapse behind one button. Use RAG / top-k / hybrid / rerank
+  stay front and center.
+- **CRAG filter + attention reorder in Settings** — both retrieval
+  flags previously reachable only via Files-tab workflow chips now
+  have persistent switches (with honest tooltips: attention reorder
+  measured slightly worse on normal-size contexts).
+- **Proprietary mode hides cloud agent fields** — when Proprietary
+  data is ON, the agent API-key and base-URL fields disappear and a
+  notice explains that agentic retrieval runs on your local model.
+
 ### Models, GPUs, presets, proprietary data (2026-08-13)
 
 - **Ingest log manifest** (`ez-rag ingest-log`, auto-refreshed after
