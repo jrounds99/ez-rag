@@ -3877,6 +3877,174 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
 
     update_arrow_state()
 
+    # ----- Reports & maintenance toolbar --------------------------------
+    def _ingest_running() -> bool:
+        try:
+            import psutil
+            lock = state.ws.meta_db_path.parent / "ingest.lock"
+            if lock.is_file():
+                pid = int(lock.read_text(encoding="utf-8").strip())
+                return psutil.pid_exists(pid)
+        except Exception:
+            pass
+        return False
+
+    def open_ingest_log(_):
+        if state.ws is None:
+            _toast(state.page, "Open a workspace first")
+            return
+        def _bg():
+            try:
+                from ez_rag.ingest_log import write_ingest_log
+                out = write_ingest_log(state.ws.root, cfg=state.cfg)
+                import webbrowser
+                webbrowser.open(out.as_uri())
+            except FileNotFoundError:
+                _toast(state.page,
+                       "Nothing ingested yet — run an ingest first")
+            except Exception as ex:
+                _toast(state.page, f"Ingest log failed: {ex}")
+        state.page.run_thread(_bg)
+
+    def open_glossary(_):
+        if state.ws is None:
+            _toast(state.page, "Open a workspace first")
+            return
+        _toast(state.page,
+               "Building glossary… opens in your browser when ready")
+        def _bg():
+            try:
+                from ez_rag.glossary import build_glossary
+                allow_web = not getattr(state.cfg, "proprietary_data",
+                                        False)
+                summary = build_glossary(state.ws.root,
+                                          allow_web=allow_web)
+                import webbrowser
+                webbrowser.open(Path(summary["html"]).as_uri())
+            except FileNotFoundError:
+                _toast(state.page,
+                       "Nothing ingested yet — run an ingest first")
+            except Exception as ex:
+                _toast(state.page, f"Glossary failed: {ex}")
+        state.page.run_thread(_bg)
+
+    def open_reports_folder(_):
+        if state.ws is None:
+            _toast(state.page, "Open a workspace first")
+            return
+        d = state.ws.meta_db_path.parent / "reports"
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            import os as _os
+            _os.startfile(str(d))          # Windows
+        except Exception:
+            import webbrowser
+            webbrowser.open(d.as_uri())
+
+    def wipe_clicked(_):
+        if state.ws is None:
+            _toast(state.page, "Open a workspace first")
+            return
+        if _ingest_running():
+            _toast(state.page, "An ingest is running — wait for it to "
+                               "finish before wiping")
+            return
+        overlay = ft.Container(expand=True, bgcolor="#000000AA",
+                                alignment=ft.alignment.center)
+
+        def _dismiss(_=None):
+            overlay.visible = False
+            try:
+                if overlay in state.page.overlay:
+                    state.page.overlay.remove(overlay)
+            except Exception:
+                pass
+            state.page.update()
+
+        def _confirm(_=None):
+            _dismiss()
+            def _bg():
+                try:
+                    # Release our own SQLite handles first — Windows
+                    # can't delete files we still hold open.
+                    for _idx in list(state._idx_cache.values()):
+                        try:
+                            _idx.conn.close()
+                        except Exception:
+                            pass
+                    state._idx_cache.clear()
+                    from ez_rag.ingest_log import wipe_index
+                    deleted = wipe_index(state.ws.root)
+                    _toast(state.page,
+                           f"Index wiped ({len(deleted)} file(s) "
+                           f"deleted). Run ingest to rebuild.")
+                except Exception as ex:
+                    _toast(state.page, f"Wipe failed: {ex}")
+                try:
+                    refresh_files()
+                    refresh_status()
+                except Exception:
+                    pass
+            state.page.run_thread(_bg)
+
+        overlay.content = ft.Container(
+            width=480, bgcolor=SURFACE_DARK, border_radius=14, padding=22,
+            border=ft.border.all(1, DANGER),
+            content=ft.Column([
+                ft.Row([
+                    ft.Icon(ft.Icons.DELETE_FOREVER, color=DANGER,
+                            size=22),
+                    ft.Text("Wipe this RAG's index?", size=15,
+                            weight=ft.FontWeight.W_700, color=ON_SURFACE),
+                ], spacing=8),
+                ft.Text(
+                    "Deletes the vector database (embeddings + search "
+                    "data) for this workspace. Your documents in docs/ "
+                    "and any metadata sidecars are NOT touched — the "
+                    "index is fully rebuildable by running ingest again "
+                    "(which will take as long as the original ingest "
+                    "did).",
+                    size=12.5, color=ON_SURFACE,
+                ),
+                ft.Row([
+                    ft.OutlinedButton("Cancel", on_click=_dismiss),
+                    ft.FilledButton("Wipe index",
+                                    icon=ft.Icons.DELETE_FOREVER,
+                                    on_click=_confirm,
+                                    bgcolor=DANGER, color="#FFFFFF"),
+                ], alignment=ft.MainAxisAlignment.END, spacing=8),
+            ], spacing=14, tight=True),
+        )
+        state.page.overlay.append(overlay)
+        overlay.visible = True
+        state.page.update()
+
+    reports_bar = ft.Row([
+        ft.OutlinedButton("Ingest log", icon=ft.Icons.RECEIPT_LONG,
+                          on_click=open_ingest_log,
+                          tooltip="Open the HTML manifest: every "
+                                  "document, when it was embedded, and "
+                                  "the exact pipeline that processed "
+                                  "it. Auto-refreshed after every "
+                                  "ingest."),
+        ft.OutlinedButton("Glossary", icon=ft.Icons.MENU_BOOK,
+                          on_click=open_glossary,
+                          tooltip="Build + open the acronym/term/SKU "
+                                  "index with sourced definitions "
+                                  "(Wikipedia links for terms your "
+                                  "corpus does not define)."),
+        ft.OutlinedButton("Reports folder", icon=ft.Icons.FOLDER_OPEN,
+                          on_click=open_reports_folder,
+                          tooltip="Open .ezrag/reports/ in Explorer."),
+        ft.Container(expand=True),
+        ft.TextButton("Wipe index…", icon=ft.Icons.DELETE_FOREVER,
+                      on_click=wipe_clicked,
+                      style=ft.ButtonStyle(color=DANGER),
+                      tooltip="Delete this RAG's vector database. "
+                              "Documents stay; rebuild with ingest. "
+                              "Confirmation required."),
+    ], spacing=8)
+
     container = ft.Container(
         bgcolor=BG_DARK,
         expand=True,
@@ -3885,7 +4053,9 @@ def build_files_view(state: AppState, *, refresh_status, refresh_files_cb):
             [
                 ft.Text("Files", size=18, weight=ft.FontWeight.W_700,
                         color=ON_SURFACE),
-                ft.Container(height=12),
+                ft.Container(height=6),
+                reports_bar,
+                ft.Container(height=8),
                 split_row,
             ],
             expand=True,
@@ -6409,6 +6579,9 @@ you're away. Details: docs/PROPRIETARY_DATA.md"""
         controls=[
             ft.Text("Settings", size=18, weight=ft.FontWeight.W_700,
                     color=ON_SURFACE),
+            ft.Container(
+                content=_build_presets_card(state),
+            ),
             hardware_card,
             ft.Row(
                 [
@@ -6530,16 +6703,6 @@ you're away. Details: docs/PROPRIETARY_DATA.md"""
                     ft.Container(
                         expand=1,
                         content=_build_storage_card(state),
-                    ),
-                ],
-                spacing=14,
-                vertical_alignment=ft.CrossAxisAlignment.START,
-            ),
-            ft.Row(
-                [
-                    ft.Container(
-                        expand=1,
-                        content=_build_presets_card(state),
                     ),
                 ],
                 spacing=14,

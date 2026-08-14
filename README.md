@@ -96,6 +96,9 @@ ez-rag redact-check           verify redacted terms are absent from
 ez-rag glossary               acronym/term/SKU index with sources —
                               in-corpus definitions, Wikipedia links
                               for the rest, HTML report
+ez-rag ingest-log             HTML manifest: every document, when it
+                              was embedded, and the pipeline used
+ez-rag wipe                   delete the index (docs stay; rebuildable)
 ```
 
 Topics for `ez-rag help`: `getting-started`, `workflow`, `ingestion`, `retrieval`, `models`, `chat`, `gui`, `ocr`, `cli`, `settings` (the expanded every-knob guide).

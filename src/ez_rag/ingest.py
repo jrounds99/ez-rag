@@ -1105,5 +1105,12 @@ def _ingest_impl(
                         "existing index (use reindex to clear it)"),
             ))
     stats.seconds = time.perf_counter() - t0
+    # Refresh the ingest-log manifest (best-effort — never fail a run
+    # over a report).
+    try:
+        from .ingest_log import write_ingest_log
+        write_ingest_log(ws.root, cfg=cfg)
+    except Exception:
+        pass
     _emit(progress, snapshot(status="done"))
     return stats

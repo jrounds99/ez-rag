@@ -9,6 +9,23 @@ versions follow nothing yet because this is alpha.
 
 ### Models, GPUs, presets, proprietary data (2026-08-13)
 
+- **Ingest log manifest** (`ez-rag ingest-log`, auto-refreshed after
+  every ingest at `.ezrag/reports/ingest-log.html`) — every document
+  with its embed timestamp, chunk count, size, and the decoded
+  pipeline that built it (embedder, PDF backend, chunk headers /
+  dedup / redaction), plus a current-settings snapshot and a loud
+  warning banner when the index contains mixed embedders.
+- **Wipe** (`ez-rag wipe`, GUI Files tab → "Wipe index…") — deletes
+  the vector DB with confirmation; documents and sidecars untouched;
+  refused while the workspace is locked or an ingest is running;
+  Windows-safe (closes/GCs SQLite handles with retry).
+- **Reports toolbar** in the Files tab — one-click open for the
+  ingest log and glossary (built on demand, opens in the browser)
+  plus the reports folder. HTML reports are no longer buried in
+  `.ezrag/reports/`.
+- **Settings reorganized** — Presets card moved to the top of the
+  Settings tab: the "start here" control now IS the start.
+
 - **Corpus glossary** (`ez-rag glossary`) — builds a defined-terms
   index from the ingested corpus: every acronym is paired with its
   in-corpus definition when the documents contain one ("Full Name

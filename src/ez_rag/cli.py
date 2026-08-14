@@ -732,6 +732,56 @@ def preset_cmd(
         )
 
 
+@app.command("ingest-log")
+def ingest_log_cmd(
+    open_report: bool = typer.Option(
+        False, "--open", help="Open the HTML report in your browser."),
+):
+    """Render the ingest manifest: every document, when it was
+    embedded, and the exact pipeline that processed it (embedder,
+    parser/PDF backend, chunk headers / dedup / redaction). Also
+    refreshed automatically after every ingest."""
+    from .ingest_log import write_ingest_log
+    ws = require_workspace()
+    from .security import require_unlocked
+    require_unlocked(ws.root)
+    out = write_ingest_log(ws.root, cfg=ws.load_config())
+    console.print(f"[green]Ingest log:[/green] {out}")
+    if open_report:
+        import webbrowser
+        webbrowser.open(Path(out).as_uri())
+
+
+@app.command("wipe")
+def wipe_cmd(
+    yes: bool = typer.Option(False, "--yes",
+                             help="Skip the confirmation prompt."),
+):
+    """Delete this workspace's index (the vector DB).
+
+    Your documents in docs/ and any .ezrag-meta.toml sidecars are NOT
+    touched — the index is fully rebuildable with `ez-rag ingest`.
+    Refused while the workspace is locked (unlock first)."""
+    from .ingest_log import wipe_index
+    ws = require_workspace()
+    if not yes:
+        confirmed = typer.confirm(
+            f"Delete the index for {ws.root}? Documents stay; "
+            f"embeddings and search data are destroyed (rebuildable "
+            f"via ingest).")
+        if not confirmed:
+            console.print("[dim]Cancelled.[/dim]")
+            raise typer.Exit(0)
+    deleted = wipe_index(ws.root)
+    if deleted:
+        for d in deleted:
+            console.print(f"  [red]deleted[/red] {d}")
+        console.print("[green]Index wiped.[/green] Rebuild with: "
+                      "ez-rag ingest")
+    else:
+        console.print("[yellow]Nothing to wipe — no index found.[/yellow]")
+
+
 @app.command("glossary")
 def glossary_cmd(
     min_occurrences: int = typer.Option(
